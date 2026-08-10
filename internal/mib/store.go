@@ -32,11 +32,19 @@ type Instance struct {
 type Operation string
 
 const (
-	OperationCreate Operation = "create"
-	OperationSet    Operation = "set"
-	OperationDelete Operation = "delete"
-	OperationReset  Operation = "reset"
+	OperationCreate   Operation = "create"
+	OperationSet      Operation = "set"
+	OperationSetTable Operation = "set-table"
+	OperationDelete   Operation = "delete"
+	OperationReset    Operation = "reset"
 )
+
+const defaultExtendedVLANTableSize = 64
+
+type Options struct {
+	Applier               Applier
+	ExtendedVLANTableSize uint16
+}
 
 // Change is the immutable candidate state passed to the platform backend.
 // The store commits it only after Apply returns successfully.
@@ -77,22 +85,35 @@ func (e *ResultError) Unwrap() error {
 }
 
 type Store struct {
-	mu       sync.RWMutex
-	factory  map[Key]Instance
-	current  map[Key]Instance
-	dataSync uint8
-	applier  Applier
+	mu                    sync.RWMutex
+	factory               map[Key]Instance
+	current               map[Key]Instance
+	dataSync              uint8
+	applier               Applier
+	extendedVLANTableSize uint16
 }
 
 func New(factory []Instance) (*Store, error) {
-	return NewWithApplier(factory, nil)
+	return NewWithOptions(factory, Options{})
 }
 
 func NewWithApplier(factory []Instance, applier Applier) (*Store, error) {
+	return NewWithOptions(factory, Options{Applier: applier})
+}
+
+func NewWithOptions(factory []Instance, options Options) (*Store, error) {
+	tableSize := options.ExtendedVLANTableSize
+	if tableSize == 0 {
+		tableSize = defaultExtendedVLANTableSize
+	}
+	if tableSize < 3 {
+		return nil, fmt.Errorf("extended VLAN table size %d cannot hold the three mandatory default rules", tableSize)
+	}
 	s := &Store{
-		factory: make(map[Key]Instance, len(factory)),
-		current: make(map[Key]Instance, len(factory)),
-		applier: applier,
+		factory:               make(map[Key]Instance, len(factory)),
+		current:               make(map[Key]Instance, len(factory)),
+		applier:               options.Applier,
+		extendedVLANTableSize: tableSize,
 	}
 
 	for _, instance := range factory {
@@ -177,15 +198,20 @@ func (s *Store) Create(classID me.ClassID, entityID uint16, attributes me.Attrib
 	if err := validateAccess(entity, attributes, me.SetByCreate); err != nil {
 		return err
 	}
+	createdAttributes := cloneAttributes(attributes)
+	if omciErr := me.MergeInDefaultValues(classID, createdAttributes); omciErr.StatusCode() != me.Success {
+		return &ResultError{Result: omciErr.StatusCode(), Cause: omciErr.GetError()}
+	}
 
 	instance, err := normalize(Instance{
 		Key:        key,
-		Attributes: attributes,
+		Attributes: createdAttributes,
 		Origin:     OriginOLT,
 	})
 	if err != nil {
 		return err
 	}
+	initializeCreatedInstance(&instance, s.extendedVLANTableSize)
 	next := cloneInstances(s.current)
 	next[key] = instance
 	return s.commitLocked(OperationCreate, nil, &instance, next, s.nextDataSyncLocked())

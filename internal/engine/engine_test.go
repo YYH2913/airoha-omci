@@ -243,6 +243,73 @@ func TestGetNextUsesStableTableSnapshot(t *testing.T) {
 	}
 }
 
+func TestExtendedSetTableCommitsRowsOnceAcrossRetransmission(t *testing.T) {
+	key := mib.Key{ClassID: me.ExtendedVlanTaggingOperationConfigurationDataClassID, EntityID: 1}
+	store, err := mib.New([]mib.Instance{
+		{
+			Key:        mib.Key{ClassID: me.OnuDataClassID, EntityID: 0},
+			Attributes: me.AttributeValueMap{me.OnuData_MibDataSync: uint8(0)},
+		},
+		{
+			Key: key,
+			Attributes: me.AttributeValueMap{
+				me.ExtendedVlanTaggingOperationConfigurationData_AssociationType:                               uint8(2),
+				me.ExtendedVlanTaggingOperationConfigurationData_ReceivedFrameVlanTaggingOperationTableMaxSize: uint16(8),
+				me.ExtendedVlanTaggingOperationConfigurationData_ReceivedFrameVlanTaggingOperationTable:        me.TableRows{},
+				me.ExtendedVlanTaggingOperationConfigurationData_AssociatedMePointer:                           uint16(0x101),
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("mib.New() error = %v", err)
+	}
+	protocol := New(store)
+	row := make([]byte, 16)
+	row[7] = 1
+	row[15] = 2
+	request := encodeRequestForDevice(t, 11, omci.SetTableRequestType, &omci.SetTableRequest{
+		MeBasePacket: omci.MeBasePacket{
+			EntityClass:    key.ClassID,
+			EntityInstance: key.EntityID,
+			Extended:       true,
+		},
+		AttributeMask: 0x0400,
+		Attributes: me.AttributeValueMap{
+			me.ExtendedVlanTaggingOperationConfigurationData_ReceivedFrameVlanTaggingOperationTable: me.TableRows{
+				NumRows: 1,
+				Rows:    row,
+			},
+		},
+	}, omci.ExtendedIdent)
+
+	first, err := protocol.Handle(request)
+	if err != nil {
+		t.Fatalf("Handle(first SetTable) error = %v", err)
+	}
+	second, err := protocol.Handle(request)
+	if err != nil {
+		t.Fatalf("Handle(retransmitted SetTable) error = %v", err)
+	}
+	if string(first) != string(second) {
+		t.Fatal("retransmitted SetTable response differs from original")
+	}
+	response := decodeResponse(t, first).Layer(omci.LayerTypeSetTableResponse).(*omci.SetTableResponse)
+	if response.Result != me.Success {
+		t.Fatalf("SetTable result = %v, want Success", response.Result)
+	}
+	if store.DataSync() != 1 {
+		t.Fatalf("DataSync() = %d, want one mutation", store.DataSync())
+	}
+	instance, err := store.Get(key, 0x0400)
+	if err != nil {
+		t.Fatalf("Get(table) error = %v", err)
+	}
+	rows := instance.Attributes[me.ExtendedVlanTaggingOperationConfigurationData_ReceivedFrameVlanTaggingOperationTable].(me.TableRows)
+	if rows.NumRows != 1 || string(rows.Rows) != string(row) {
+		t.Fatalf("stored rows = %#v, want one transmitted row", rows)
+	}
+}
+
 func TestExtendedMibUploadPacksMultipleManagedEntities(t *testing.T) {
 	snapshot := make([]mib.Instance, 12)
 	for index := range snapshot {

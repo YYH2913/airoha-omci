@@ -43,7 +43,7 @@ func main() {
 	flag.StringVar(&opts.serialNumber, "serial", "", "ONU serial: four vendor characters and eight hex digits")
 	flag.StringVar(&opts.equipmentID, "equipment-id", "XG2010G", "ONU equipment identifier")
 	flag.StringVar(&opts.statusPath, "status", "/var/run/airoha-omcid/status.json", "atomic JSON status path")
-	flag.StringVar(&opts.applyHelper, "apply-helper", "", "fixed executable receiving candidate MIB snapshots as JSON")
+	flag.StringVar(&opts.applyHelper, "apply-helper", "", "fixed executable receiving candidate service graphs as JSON")
 	flag.StringVar(&opts.controlHelper, "control-helper", "", "fixed executable handling time sync and scheduled reboot")
 	flag.StringVar(&opts.eventHelper, "event-helper", "", "fixed executable streaming platform events as JSON lines")
 	flag.StringVar(&opts.softwareHelper, "software-helper", "", "fixed executable handling software image lifecycle")

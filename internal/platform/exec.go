@@ -16,8 +16,21 @@ import (
 
 const defaultApplyTimeout = 10 * time.Second
 
-// ExecApplier sends one complete candidate MIB snapshot to a fixed helper.
-// No shell is involved. A non-zero helper exit rejects the OMCI mutation.
+const ApplyABIVersion = 1
+
+// ApplyRequest is the versioned boundary between the G.988 engine and a
+// privileged platform helper. The helper consumes resolved connectivity, not
+// raw managed-entity attributes.
+type ApplyRequest struct {
+	Version     uint8         `json:"version"`
+	Operation   mib.Operation `json:"operation"`
+	MIBDataSync uint8         `json:"mib_data_sync"`
+	Service     ServiceGraph  `json:"service_graph"`
+}
+
+// ExecApplier resolves and sends one complete candidate service graph to a
+// fixed helper. No shell is involved. A non-zero helper exit rejects the OMCI
+// mutation.
 type ExecApplier struct {
 	Path    string
 	Timeout time.Duration
@@ -27,14 +40,20 @@ func (a ExecApplier) Apply(change mib.Change) error {
 	if a.Path == "" {
 		return fmt.Errorf("platform apply helper is empty")
 	}
-	if err := ValidateServiceGraph(change.Snapshot); err != nil {
+	graph, err := BuildServiceGraph(change.Snapshot)
+	if err != nil {
 		return err
 	}
 	timeout := a.Timeout
 	if timeout <= 0 {
 		timeout = defaultApplyTimeout
 	}
-	payload, err := json.Marshal(change)
+	payload, err := json.Marshal(ApplyRequest{
+		Version:     ApplyABIVersion,
+		Operation:   change.Operation,
+		MIBDataSync: change.MIBDataSync,
+		Service:     graph,
+	})
 	if err != nil {
 		return fmt.Errorf("encode platform change: %w", err)
 	}

@@ -9,13 +9,13 @@ and extended messages.  A successful build or reaching GPON O5 is not enough.
 | Transactions | duplicate replay, TCI validation, bounded response cache | in progress |
 | MIB | ONU defaults, platform-gated create/delete/set, reset, data sync | in progress |
 | MIB upload | baseline fragmentation and extended multi-ME packing | in progress |
-| Tables | stable Get/Get Next cache and extended Set Table | in progress |
+| Tables | stable Get/Get Next cache and baseline/enhanced extended Set Table | implemented; OLT verification pending |
 | Notifications | alarm audit/sequence, event-driven Alarm/AVC, requested optical tests and ARC | in progress |
 | Equipment | ONU-G, ONU2-G, ANI-G, four speed-specific Ethernet UNIs, software images | in progress |
 | Traffic | 8 T-CONTs/schedulers, 96 queues, GEM CTP/IW validation and hardware apply | in progress |
-| Ethernet service | bridge, mapper, VLAN and extended VLAN rules | pending |
+| Ethernet service | resolved bridge, mapper, VLAN and extended VLAN graph | implemented; Linux rule application pending |
 | Lifecycle | reboot, time sync, software download/activate/commit | implemented; OLT verification pending |
-| Platform | multi-T-CONT/GEM Airoha ABI and transactional Linux backend | in progress |
+| Platform | multi-T-CONT/GEM Airoha ABI and transactional Linux backend | GEM ABI implemented; bridge/VLAN/tc pending |
 | OpenWrt | package, procd, UCI, rpcd/ubus and LuCI | in progress |
 | Verification | unit/fuzz/race/cross-build plus physical OLT traces | pending |
 
@@ -40,8 +40,15 @@ backend stages an OpenWrt FIT in an inactive UBI volume and uses a boot guard
 to roll back an activated but uncommitted image. Physical OLT software
 download and deliberate power-loss testing remain required.
 
-The current Airoha Ethernet metadata ABI exposes only one data GEM to Linux.
-The OpenWrt backend records all OLT-provisioned GEM CTPs but selects one
-bidirectional GEM for the `pon` netdev and reports the limitation through
-ubus/LuCI. Multi-GEM representors and physical baseline/extended OLT
-interoperability remain completion blockers.
+The Airoha Ethernet metadata ABI now exposes an atomic GEM/channel/direction
+table. Receive packets carry a reserved skb mark containing the GEM Port-ID;
+transmit uses the same mark to select the upstream GEM and T-CONT channel. An
+unmarked transmit packet is accepted only when exactly one upstream GEM is
+configured, preventing ambiguous service selection.
+
+The OpenWrt backend can program all OLT-provisioned GEM CTPs and LuCI exposes
+the resolved GEM, P-bit, bridge and VLAN relationships. It does not yet install
+the complete Linux bridge/VLAN/tc desired state. In particular, multiple
+upstream GEMs still require classifier rules that set the reserved skb mark.
+Transactional rollback, daemon crash recovery and physical baseline/extended
+OLT interoperability remain completion blockers.

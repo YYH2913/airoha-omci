@@ -40,11 +40,37 @@ an OLT may retransmit a request.
 
 ## Other helpers
 
-The apply helper receives a complete candidate service state on stdin and must
-apply it transactionally. The control helper handles validated time and reboot
-operations. The event helper streams bounded JSON lines for platform alarms
-and AVCs. Their schemas are intentionally separate from the software helper so
-software-slot privileges can be audited independently.
+The apply helper receives a complete, resolved candidate service graph on
+stdin and must apply it transactionally. ABI version 1 has this top-level
+shape:
+
+```json
+{
+  "version": 1,
+  "operation": "set-table",
+  "mib_data_sync": 17,
+  "service_graph": {
+    "unis": [],
+    "tconts": [],
+    "gem_ports": [],
+    "gem_interworking": [],
+    "pbit_mappers": [],
+    "bridges": [],
+    "vlan_filters": [],
+    "extended_vlans": []
+  }
+}
+```
+
+The graph contains validated and deterministically ordered references. Raw
+managed-entity attributes are not part of this ABI; interpreting G.988 remains
+the daemon's responsibility. Unknown ABI versions must be rejected before any
+platform state is changed.
+
+The control helper handles validated time and reboot operations. The event
+helper streams bounded JSON lines for platform alarms and AVCs. Their schemas
+are intentionally separate from the software helper so software-slot
+privileges can be audited independently.
 
 The control helper also accepts an `optical-line-supervision` action and returns
 one strict JSON object containing an SFF-8472-compatible EN7572 sample:

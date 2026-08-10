@@ -447,10 +447,10 @@ func (e *Engine) dispatch(packet gopacket.Packet, header *omci.OMCI) ([]byte, er
 		if err != nil {
 			return nil, err
 		}
-		result, _, _ := operationResult(e.mib.Set(mib.Key{
+		result, _, _ := operationResult(e.mib.SetTable(mib.Key{
 			ClassID:  request.EntityClass,
 			EntityID: request.EntityInstance,
-		}, request.Attributes))
+		}, request.AttributeMask, request.Attributes))
 		if result == me.Success {
 			e.tables = make(map[tableKey][]byte)
 		}
