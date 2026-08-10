@@ -247,9 +247,24 @@ func (s *Store) Set(key Key, attributes me.AttributeValueMap) error {
 	if err != nil {
 		return err
 	}
+	dataSync := s.nextDataSyncLocked()
+	if key.ClassID == me.OnuDataClassID && key.EntityID == 0 {
+		if requested, present := attributes[me.OnuData_MibDataSync]; present {
+			value, ok := requested.(uint8)
+			if !ok {
+				return &ResultError{Result: me.ParameterError,
+					Cause: fmt.Errorf("MIB data sync has invalid type %T", requested)}
+			}
+			dataSync = incrementDataSync(value)
+			normalized.Attributes[me.OnuData_MibDataSync] = dataSync
+		}
+	}
+	if reflect.DeepEqual(current.Attributes, normalized.Attributes) {
+		return nil
+	}
 	proposed := cloneInstances(s.current)
 	proposed[key] = normalized
-	return s.commitLocked(OperationSet, &current, &normalized, proposed, s.nextDataSyncLocked())
+	return s.commitLocked(OperationSet, &current, &normalized, proposed, dataSync)
 }
 
 // UpdateAutonomous records attributes changed by the ONU itself. Autonomous
@@ -316,6 +331,75 @@ func (s *Store) UpdateAutonomous(key Key, attributes me.AttributeValueMap) (me.A
 	}
 	s.current[key] = normalized
 	return changed, nil
+}
+
+// UpdateByCommand atomically records read-only state changed as the result of
+// one OLT action. Multiple MEs can change, but MIB data sync advances only once
+// for the command. The action's dedicated controller has already applied the
+// platform operation, so the service-graph applier is not invoked here.
+func (s *Store) UpdateByCommand(updates map[Key]me.AttributeValueMap) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	proposed := cloneInstances(s.current)
+	changed := false
+	for key, attributes := range updates {
+		current, exists := s.current[key]
+		if !exists {
+			return unknownKeyError(key)
+		}
+		entity, result := loadDefinition(key.ClassID, key.EntityID, current.Attributes)
+		if result != nil {
+			return result
+		}
+		definitions := entity.GetAttributeDefinitions()
+		var failed uint16
+		var unsupported uint16
+		for name := range attributes {
+			if name == me.ManagedEntityID ||
+				(key.ClassID == me.OnuDataClassID && name == me.OnuData_MibDataSync) {
+				unsupported = 0xffff
+				continue
+			}
+			definition, err := me.GetAttributeDefinitionByName(definitions, name)
+			if err != nil {
+				unsupported = 0xffff
+				continue
+			}
+			if !me.SupportsAttributeAccess(*definition, me.Read) {
+				failed |= definition.Mask
+			}
+		}
+		if failed != 0 || unsupported != 0 {
+			return &ResultError{
+				Result:          me.AttributeFailure,
+				FailedMask:      failed,
+				UnsupportedMask: unsupported,
+			}
+		}
+
+		next := cloneInstance(current)
+		for name, value := range attributes {
+			next.Attributes[name] = cloneValue(value)
+		}
+		normalized, err := normalize(next)
+		if err != nil {
+			return err
+		}
+		if !reflect.DeepEqual(current.Attributes, normalized.Attributes) {
+			proposed[key] = normalized
+			changed = true
+		}
+	}
+	if !changed {
+		return nil
+	}
+
+	dataSync := s.nextDataSyncLocked()
+	setDataSync(proposed, dataSync)
+	s.current = proposed
+	s.dataSync = dataSync
+	return nil
 }
 
 func (s *Store) Delete(key Key) error {
@@ -543,14 +627,14 @@ func unknownKeyError(key Key) error {
 }
 
 func (s *Store) nextDataSyncLocked() uint8 {
-	if s.dataSync == 255 {
+	return incrementDataSync(s.dataSync)
+}
+
+func incrementDataSync(value uint8) uint8 {
+	if value == 255 {
 		return 1
 	}
-	next := s.dataSync + 1
-	if next == 0 {
-		return 1
-	}
-	return next
+	return value + 1
 }
 
 func (s *Store) setDataSyncLocked(value uint8) {

@@ -786,6 +786,9 @@ func (e *Engine) synchronizeTime(year uint16, month, day, hour, minute, second u
 func buildUpload(snapshot []mib.Instance, device omci.DeviceIdent) ([]uploadCommand, error) {
 	entities := make([]me.ManagedEntity, 0, len(snapshot))
 	for _, instance := range snapshot {
+		if instance.ClassID == me.ManagedEntityMeClassID || instance.ClassID == me.AttributeMeClassID {
+			continue
+		}
 		definition, omciErr := me.LoadManagedEntityDefinition(instance.ClassID, me.ParamData{EntityID: instance.EntityID})
 		if omciErr.StatusCode() != me.Success {
 			return nil, fmt.Errorf("load MIB upload definition %v: %w", instance.ClassID, omciErr.GetError())

@@ -44,8 +44,14 @@ MIB upload uses an immutable per-message-set snapshot with the G.988 one-minute
 inactivity limit. Each valid MIB upload next request, including a retransmission,
 refreshes the deadline. An expired or out-of-range baseline request receives a
 zero class/entity/mask body, while its extended equivalent receives a zero-length
-message contents field. Table attributes and PM measurement counters are omitted
-from the snapshot.
+message contents field. Managed entity/attribute definition MEs, table attributes
+and PM measurement counters are omitted from the snapshot.
+
+MIB data sync follows the command outcome rather than the arrival of a command.
+Create, delete, Set and SetTable advance the counter only when the committed MIB
+changes. An OLT Set of ONU data MIB data sync to `N` atomically commits `N+1`,
+with 255 wrapping to 1; a platform apply failure leaves both the MIB and counter
+unchanged.
 
 The fixed-path event helper now maps XG2010G BOSA LOS, GPON activation state,
 optical diagnostics and the four Ethernet carrier states into validated
@@ -56,10 +62,12 @@ ARC-aware alarm audits are implemented; physical OLT verification remains.
 
 Software download now implements baseline and extended sections, negotiated
 windows, duplicate no-response section replay, G.988 CRC-32A, MD5 ImageHash,
-and persistent activate/commit through the software helper. The XG2010G
-backend stages an OpenWrt FIT in an inactive UBI volume and uses a boot guard
-to roll back an activated but uncommitted image. Physical OLT software
-download and deliberate power-loss testing remain required.
+and persistent activate/commit through the software helper. Start, successful
+end, activate and commit update all affected software image MEs atomically and
+advance MIB data sync once per command when their state changes. The XG2010G
+backend stages an OpenWrt FIT in an inactive UBI volume and uses a boot guard to
+roll back an activated but uncommitted image. Physical OLT software download
+and deliberate power-loss testing remain required.
 
 The Airoha Ethernet metadata ABI now exposes an atomic GEM/channel/direction
 table. Receive packets carry a reserved skb mark containing the GEM Port-ID;

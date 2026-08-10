@@ -105,6 +105,27 @@ func TestSetTableExtendedVLANAddsReplacesDeletesAndSorts(t *testing.T) {
 	}
 }
 
+func TestSetTableWithoutTableChangeDoesNotAdvanceDataSyncOrApply(t *testing.T) {
+	applyCalls := 0
+	store := newExtendedVLANStore(t, Options{Applier: ApplyFunc(func(Change) error {
+		applyCalls++
+		return nil
+	})})
+	key := Key{ClassID: me.ExtendedVlanTaggingOperationConfigurationDataClassID, EntityID: extendedVLANEntityID}
+	row := classicVLANRow(0x20, 1)
+	setTable(t, store, key, 0x0400,
+		me.ExtendedVlanTaggingOperationConfigurationData_ReceivedFrameVlanTaggingOperationTable, row)
+	if store.DataSync() != 2 || applyCalls != 2 {
+		t.Fatalf("first SetTable state: sync=%d apply calls=%d, want 2/2", store.DataSync(), applyCalls)
+	}
+
+	setTable(t, store, key, 0x0400,
+		me.ExtendedVlanTaggingOperationConfigurationData_ReceivedFrameVlanTaggingOperationTable, row)
+	if store.DataSync() != 2 || applyCalls != 2 {
+		t.Fatalf("unchanged SetTable changed state: sync=%d apply calls=%d", store.DataSync(), applyCalls)
+	}
+}
+
 func TestSetTableExtendedVLANCapacityFailureIsAtomic(t *testing.T) {
 	applyCalls := 0
 	store := newExtendedVLANStore(t, Options{

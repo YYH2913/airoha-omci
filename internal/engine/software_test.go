@@ -65,6 +65,11 @@ func (d *recordingDownload) Abort() error {
 
 func TestSoftwareDownloadLifecycleAndNoResponseReplay(t *testing.T) {
 	protocol, store, controller := newSoftwareTestEngine(t)
+	if _, err := store.UpdateAutonomous(softwareKey(1), me.AttributeValueMap{
+		me.SoftwareImage_IsValid: uint8(1),
+	}); err != nil {
+		t.Fatalf("mark standby image valid: %v", err)
+	}
 	image := make([]byte, 35)
 	for index := range image {
 		image[index] = byte(index + 1)
@@ -82,6 +87,9 @@ func TestSoftwareDownloadLifecycleAndNoResponseReplay(t *testing.T) {
 	startResponse := decodeResponse(t, encoded).Layer(omci.LayerTypeStartSoftwareDownloadResponse).(*omci.StartSoftwareDownloadResponse)
 	if startResponse.Result != me.Success || controller.startedID != 1 || controller.startedSize != uint32(len(image)) {
 		t.Fatalf("start response/controller = %#v %#v", startResponse, controller)
+	}
+	if store.DataSync() != 1 {
+		t.Fatalf("MIB data sync after StartSoftwareDownload = %d, want 1", store.DataSync())
 	}
 
 	firstSection := encodeRequest(t, 21, omci.DownloadSectionRequestType, &omci.DownloadSectionRequest{
@@ -124,6 +132,9 @@ func TestSoftwareDownloadLifecycleAndNoResponseReplay(t *testing.T) {
 	if endResponse.Result != me.Success || !controller.download.finished {
 		t.Fatalf("end response/finished = %#v/%v", endResponse, controller.download.finished)
 	}
+	if store.DataSync() != 2 {
+		t.Fatalf("MIB data sync after EndSoftwareDownload = %d, want 2", store.DataSync())
+	}
 	instance, err := store.Get(softwareKey(1), 0xfc00)
 	if err != nil {
 		t.Fatalf("Get(software image) error = %v", err)
@@ -145,6 +156,9 @@ func TestSoftwareDownloadLifecycleAndNoResponseReplay(t *testing.T) {
 	if response := decodeResponse(t, encoded).Layer(omci.LayerTypeActivateSoftwareResponse).(*omci.ActivateSoftwareResponse); response.Result != me.Success || controller.activatedID != 1 || controller.activateFlags != 2 {
 		t.Fatalf("activate response/controller = %#v/%#v", response, controller)
 	}
+	if store.DataSync() != 3 {
+		t.Fatalf("MIB data sync after ActivateSoftware = %d, want 3", store.DataSync())
+	}
 
 	commit := encodeRequest(t, 25, omci.CommitSoftwareRequestType, &omci.CommitSoftwareRequest{
 		MeBasePacket: omci.MeBasePacket{EntityClass: me.SoftwareImageClassID, EntityInstance: 1},
@@ -155,6 +169,9 @@ func TestSoftwareDownloadLifecycleAndNoResponseReplay(t *testing.T) {
 	}
 	if response := decodeResponse(t, encoded).Layer(omci.LayerTypeCommitSoftwareResponse).(*omci.CommitSoftwareResponse); response.Result != me.Success || controller.committedID != 1 {
 		t.Fatalf("commit response/controller = %#v/%#v", response, controller)
+	}
+	if store.DataSync() != 4 {
+		t.Fatalf("MIB data sync after CommitSoftware = %d, want 4", store.DataSync())
 	}
 	assertSoftwareFlag(t, store, 0, me.SoftwareImage_IsActive, 0)
 	assertSoftwareFlag(t, store, 1, me.SoftwareImage_IsActive, 1)

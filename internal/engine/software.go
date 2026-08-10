@@ -121,8 +121,10 @@ func (e *Engine) startSoftwareDownload(request *omci.StartSoftwareDownloadReques
 	if err != nil {
 		return me.ProcessingError
 	}
-	if _, err := e.mib.UpdateAutonomous(softwareKey(request.EntityInstance), me.AttributeValueMap{
-		me.SoftwareImage_IsValid: uint8(0),
+	if err := e.mib.UpdateByCommand(map[mib.Key]me.AttributeValueMap{
+		softwareKey(request.EntityInstance): {
+			me.SoftwareImage_IsValid: uint8(0),
+		},
 	}); err != nil {
 		_ = sink.Abort()
 		return me.ProcessingError
@@ -199,11 +201,13 @@ func (e *Engine) endSoftwareDownload(request *omci.EndSoftwareDownloadRequest,
 		metadata.ProductCode = "XG2010G"
 	}
 	hashValue := download.md5.Sum(nil)
-	_, err = e.mib.UpdateAutonomous(softwareKey(download.entityID), me.AttributeValueMap{
-		me.SoftwareImage_Version:     fixedOctets(metadata.Version, 14),
-		me.SoftwareImage_IsValid:     uint8(1),
-		me.SoftwareImage_ProductCode: fixedOctets(metadata.ProductCode, 25),
-		me.SoftwareImage_ImageHash:   append([]byte(nil), hashValue...),
+	err = e.mib.UpdateByCommand(map[mib.Key]me.AttributeValueMap{
+		softwareKey(download.entityID): {
+			me.SoftwareImage_Version:     fixedOctets(metadata.Version, 14),
+			me.SoftwareImage_IsValid:     uint8(1),
+			me.SoftwareImage_ProductCode: fixedOctets(metadata.ProductCode, 25),
+			me.SoftwareImage_ImageHash:   append([]byte(nil), hashValue...),
+		},
 	})
 	e.download = nil
 	if err != nil {
@@ -308,18 +312,17 @@ func (e *Engine) softwareImage(entityID uint16) (imageFlags, me.Results) {
 }
 
 func (e *Engine) setExclusiveSoftwareFlag(selected uint16, attribute string) error {
+	updates := make(map[mib.Key]me.AttributeValueMap, 2)
 	for entityID := uint16(0); entityID <= 1; entityID++ {
 		value := uint8(0)
 		if entityID == selected {
 			value = 1
 		}
-		if _, err := e.mib.UpdateAutonomous(softwareKey(entityID), me.AttributeValueMap{
+		updates[softwareKey(entityID)] = me.AttributeValueMap{
 			attribute: value,
-		}); err != nil {
-			return err
 		}
 	}
-	return nil
+	return e.mib.UpdateByCommand(updates)
 }
 
 func softwareResults(instances []uint16, result me.Results) []omci.DownloadResults {

@@ -64,6 +64,93 @@ func TestCreateSetDeleteAdvancesDataSync(t *testing.T) {
 	}
 }
 
+func TestSetMibDataSyncUsesRequestedValueThenIncrements(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		requested uint8
+		want      uint8
+	}{
+		{name: "normal", requested: 42, want: 43},
+		{name: "wrap", requested: 255, want: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store := newTestStore(t)
+			if err := store.Set(Key{ClassID: me.OnuDataClassID, EntityID: 0},
+				me.AttributeValueMap{me.OnuData_MibDataSync: test.requested}); err != nil {
+				t.Fatalf("Set(MIB data sync) error = %v", err)
+			}
+			if got := store.DataSync(); got != test.want {
+				t.Fatalf("DataSync() = %d, want %d", got, test.want)
+			}
+			instance, err := store.Get(Key{ClassID: me.OnuDataClassID, EntityID: 0}, 0x8000)
+			if err != nil {
+				t.Fatalf("Get(ONU data) error = %v", err)
+			}
+			if got := instance.Attributes[me.OnuData_MibDataSync]; got != test.want {
+				t.Fatalf("MibDataSync = %#v, want %d", got, test.want)
+			}
+		})
+	}
+}
+
+func TestSetWithoutAttributeChangeDoesNotAdvanceDataSyncOrApply(t *testing.T) {
+	applyCalls := 0
+	store, err := NewWithApplier([]Instance{{
+		Key: Key{ClassID: me.OnuDataClassID, EntityID: 0},
+		Attributes: me.AttributeValueMap{
+			me.OnuData_MibDataSync: uint8(0),
+		},
+	}}, ApplyFunc(func(Change) error {
+		applyCalls++
+		return nil
+	}))
+	if err != nil {
+		t.Fatalf("NewWithApplier() error = %v", err)
+	}
+	key := Key{ClassID: me.GalEthernetProfileClassID, EntityID: 1}
+	attributes := me.AttributeValueMap{me.GalEthernetProfile_MaximumGemPayloadSize: uint16(48)}
+	if err := store.Create(key.ClassID, key.EntityID, attributes); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if err := store.Set(key, attributes); err != nil {
+		t.Fatalf("Set(unchanged) error = %v", err)
+	}
+	if store.DataSync() != 1 || applyCalls != 1 {
+		t.Fatalf("unchanged Set changed state: sync=%d apply calls=%d", store.DataSync(), applyCalls)
+	}
+}
+
+func TestRejectedMibDataSyncSetRollsBackRequestedCounter(t *testing.T) {
+	wantError := errors.New("platform rejected MIB sync")
+	store, err := NewWithApplier([]Instance{{
+		Key: Key{ClassID: me.OnuDataClassID, EntityID: 0},
+		Attributes: me.AttributeValueMap{
+			me.OnuData_MibDataSync: uint8(0),
+		},
+	}}, ApplyFunc(func(change Change) error {
+		if change.Operation != OperationSet || change.MIBDataSync != 8 ||
+			change.After.Attributes[me.OnuData_MibDataSync] != uint8(8) ||
+			change.Snapshot[0].Attributes[me.OnuData_MibDataSync] != uint8(8) {
+			t.Fatalf("candidate change = %#v, want atomic MIB data sync 8", change)
+		}
+		return wantError
+	}))
+	if err != nil {
+		t.Fatalf("NewWithApplier() error = %v", err)
+	}
+
+	err = store.Set(Key{ClassID: me.OnuDataClassID, EntityID: 0},
+		me.AttributeValueMap{me.OnuData_MibDataSync: uint8(7)})
+	var result *ResultError
+	if !errors.As(err, &result) || result.Result != me.ProcessingError ||
+		!errors.Is(err, wantError) {
+		t.Fatalf("Set(MIB data sync) error = %#v, want wrapped ProcessingError", err)
+	}
+	if store.DataSync() != 0 {
+		t.Fatalf("DataSync() = %d after rejected Set, want 0", store.DataSync())
+	}
+}
+
 func TestResetRetainsOnlyONUCreatedInstances(t *testing.T) {
 	store := newTestStore(t)
 	err := store.Create(me.GalEthernetProfileClassID, 1, me.AttributeValueMap{
@@ -228,6 +315,97 @@ func TestAutonomousUpdateCannotOverrideMibDataSync(t *testing.T) {
 	}
 	if store.DataSync() != 0 {
 		t.Fatalf("DataSync() = %d, want 0", store.DataSync())
+	}
+}
+
+func TestCommandUpdateChangesMultipleMEsAndAdvancesDataSyncOnce(t *testing.T) {
+	applyCalls := 0
+	store, err := NewWithApplier([]Instance{
+		{
+			Key: Key{ClassID: me.OnuDataClassID, EntityID: 0},
+			Attributes: me.AttributeValueMap{
+				me.OnuData_MibDataSync: uint8(0),
+			},
+		},
+		{
+			Key: Key{ClassID: me.SoftwareImageClassID, EntityID: 0},
+			Attributes: me.AttributeValueMap{
+				me.SoftwareImage_IsActive: uint8(1),
+			},
+		},
+		{
+			Key: Key{ClassID: me.SoftwareImageClassID, EntityID: 1},
+			Attributes: me.AttributeValueMap{
+				me.SoftwareImage_IsActive: uint8(0),
+			},
+		},
+	}, ApplyFunc(func(Change) error {
+		applyCalls++
+		return nil
+	}))
+	if err != nil {
+		t.Fatalf("NewWithApplier() error = %v", err)
+	}
+	updates := map[Key]me.AttributeValueMap{
+		{ClassID: me.SoftwareImageClassID, EntityID: 0}: {me.SoftwareImage_IsActive: uint8(0)},
+		{ClassID: me.SoftwareImageClassID, EntityID: 1}: {me.SoftwareImage_IsActive: uint8(1)},
+	}
+	if err := store.UpdateByCommand(updates); err != nil {
+		t.Fatalf("UpdateByCommand() error = %v", err)
+	}
+	if store.DataSync() != 1 || applyCalls != 0 {
+		t.Fatalf("command update state: sync=%d apply calls=%d, want 1/0", store.DataSync(), applyCalls)
+	}
+	for entityID, want := range map[uint16]uint8{0: 0, 1: 1} {
+		instance, err := store.Get(Key{ClassID: me.SoftwareImageClassID, EntityID: entityID}, 0x2000)
+		if err != nil {
+			t.Fatalf("Get(software image %#x) error = %v", entityID, err)
+		}
+		if got := instance.Attributes[me.SoftwareImage_IsActive]; got != want {
+			t.Fatalf("software image %#x active = %#v, want %d", entityID, got, want)
+		}
+	}
+
+	if err := store.UpdateByCommand(updates); err != nil {
+		t.Fatalf("UpdateByCommand(unchanged) error = %v", err)
+	}
+	if store.DataSync() != 1 {
+		t.Fatalf("unchanged command update advanced data sync to %d", store.DataSync())
+	}
+}
+
+func TestCommandUpdateValidationFailureIsAtomic(t *testing.T) {
+	store, err := New([]Instance{
+		{
+			Key: Key{ClassID: me.OnuDataClassID, EntityID: 0},
+			Attributes: me.AttributeValueMap{
+				me.OnuData_MibDataSync: uint8(0),
+			},
+		},
+		{
+			Key: Key{ClassID: me.SoftwareImageClassID, EntityID: 0},
+			Attributes: me.AttributeValueMap{
+				me.SoftwareImage_IsActive: uint8(1),
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	err = store.UpdateByCommand(map[Key]me.AttributeValueMap{
+		{ClassID: me.SoftwareImageClassID, EntityID: 0}: {me.SoftwareImage_IsActive: uint8(0)},
+		{ClassID: me.SoftwareImageClassID, EntityID: 1}: {me.SoftwareImage_IsActive: uint8(1)},
+	})
+	var result *ResultError
+	if !errors.As(err, &result) || result.Result != me.UnknownInstance {
+		t.Fatalf("UpdateByCommand() error = %#v, want UnknownInstance", err)
+	}
+	instance, getErr := store.Get(Key{ClassID: me.SoftwareImageClassID, EntityID: 0}, 0x2000)
+	if getErr != nil {
+		t.Fatalf("Get(software image) error = %v", getErr)
+	}
+	if store.DataSync() != 0 || instance.Attributes[me.SoftwareImage_IsActive] != uint8(1) {
+		t.Fatalf("rejected command update changed state: sync=%d image=%#v", store.DataSync(), instance)
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math/bits"
+	"reflect"
 	"sort"
 
 	me "github.com/opencord/omci-lib-go/v2/generated"
@@ -96,6 +97,9 @@ func (s *Store) SetTable(key Key, mask uint16, attributes me.AttributeValueMap) 
 	normalized, err := normalize(next)
 	if err != nil {
 		return err
+	}
+	if reflect.DeepEqual(current.Attributes, normalized.Attributes) {
+		return nil
 	}
 	proposed := cloneInstances(s.current)
 	proposed[key] = normalized
