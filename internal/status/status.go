@@ -1,0 +1,70 @@
+// SPDX-License-Identifier: Apache-2.0
+
+package status
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"time"
+)
+
+type Snapshot struct {
+	State             string    `json:"state"`
+	Interface         string    `json:"interface"`
+	StartedAt         time.Time `json:"started_at"`
+	UpdatedAt         time.Time `json:"updated_at"`
+	MIBDataSync       uint8     `json:"mib_data_sync"`
+	RXFrames          uint64    `json:"rx_frames"`
+	TXFrames          uint64    `json:"tx_frames"`
+	DecodeErrors      uint64    `json:"decode_errors"`
+	TransportErrors   uint64    `json:"transport_errors"`
+	LastTransactionID uint16    `json:"last_transaction_id"`
+	LastMessageType   uint8     `json:"last_message_type"`
+	LastError         string    `json:"last_error,omitempty"`
+}
+
+type Writer struct {
+	path string
+}
+
+func NewWriter(path string) *Writer {
+	return &Writer{path: path}
+}
+
+func (w *Writer) Write(snapshot Snapshot) error {
+	snapshot.UpdatedAt = time.Now().UTC()
+	encoded, err := json.Marshal(snapshot)
+	if err != nil {
+		return fmt.Errorf("encode OMCI status: %w", err)
+	}
+	encoded = append(encoded, '\n')
+
+	directory := filepath.Dir(w.path)
+	if err := os.MkdirAll(directory, 0o755); err != nil {
+		return fmt.Errorf("create OMCI status directory: %w", err)
+	}
+	temporary, err := os.CreateTemp(directory, ".omci-status-*")
+	if err != nil {
+		return fmt.Errorf("create OMCI status temporary file: %w", err)
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+
+	if err := temporary.Chmod(0o644); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if _, err := temporary.Write(encoded); err != nil {
+		_ = temporary.Close()
+		return fmt.Errorf("write OMCI status: %w", err)
+	}
+	if err := temporary.Close(); err != nil {
+		return fmt.Errorf("close OMCI status: %w", err)
+	}
+	if err := os.Rename(temporaryPath, w.path); err != nil {
+		return fmt.Errorf("publish OMCI status: %w", err)
+	}
+	return nil
+}

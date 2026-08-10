@@ -1,0 +1,184 @@
+// SPDX-License-Identifier: Apache-2.0
+
+package model
+
+import (
+	"fmt"
+	"strings"
+
+	me "github.com/opencord/omci-lib-go/v2/generated"
+	"github.com/xg2010g/airoha-omci/internal/mib"
+)
+
+const (
+	aniEntityID       = 0x8001
+	ethernetCardID    = 0x0101
+	aniCardID         = 0x0102
+	softwareImageAID  = 0
+	softwareImageBID  = 1
+	defaultTContCount = 8
+)
+
+type Identity struct {
+	SerialNumber string
+	Version      string
+	EquipmentID  string
+}
+
+func XG2010G(identity Identity) ([]mib.Instance, error) {
+	serial, err := serialOctets(identity.SerialNumber)
+	if err != nil {
+		return nil, err
+	}
+	if identity.Version == "" {
+		identity.Version = "OpenWrt"
+	}
+	if identity.EquipmentID == "" {
+		identity.EquipmentID = "XG2010G"
+	}
+
+	vendor := serial[:4]
+	instances := []mib.Instance{
+		instance(me.OnuDataClassID, 0, me.AttributeValueMap{
+			me.OnuData_MibDataSync: uint8(0),
+		}),
+		instance(me.OnuGClassID, 0, me.AttributeValueMap{
+			me.OnuG_VendorId:                cloneBytes(vendor),
+			me.OnuG_Version:                 octets(identity.Version, 14),
+			me.OnuG_SerialNumber:            serial,
+			me.OnuG_TrafficManagementOption: uint8(0),
+			me.OnuG_BatteryBackup:           uint8(0),
+			me.OnuG_AdministrativeState:     uint8(0),
+			me.OnuG_OperationalState:        uint8(0),
+		}),
+		instance(me.Onu2GClassID, 0, me.AttributeValueMap{
+			me.Onu2G_EquipmentId: octets(identity.EquipmentID, 20),
+			me.Onu2G_OpticalNetworkUnitManagementAndControlChannelOmccVersion: uint8(0xb4),
+			me.Onu2G_VendorProductCode:                                        uint16(0x2010),
+			me.Onu2G_SecurityCapability:                                       uint8(1),
+			me.Onu2G_SecurityMode:                                             uint8(1),
+			me.Onu2G_TotalPriorityQueueNumber:                                 uint16(defaultTContCount * 8),
+			me.Onu2G_TotalTrafficSchedulerNumber:                              uint8(defaultTContCount),
+			me.Onu2G_Deprecated:                                               uint8(1),
+			me.Onu2G_TotalGemPortIdNumber:                                     uint16(256),
+			me.Onu2G_ConnectivityCapability:                                   uint16(0x007f),
+			me.Onu2G_CurrentConnectivityMode:                                  uint8(0),
+			me.Onu2G_QualityOfServiceQosConfigurationFlexibility:              uint16(0x003f),
+			me.Onu2G_PriorityQueueScaleFactor:                                 uint16(1),
+		}),
+		instance(me.AniGClassID, aniEntityID, me.AttributeValueMap{
+			me.AniG_SrIndication:           uint8(1),
+			me.AniG_TotalTcontNumber:       uint16(defaultTContCount),
+			me.AniG_GemBlockLength:         uint16(48),
+			me.AniG_PiggybackDbaReporting:  uint8(0),
+			me.AniG_SignalFailThreshold:    uint8(5),
+			me.AniG_SignalDegradeThreshold: uint8(9),
+		}),
+		instance(me.CircuitPackClassID, ethernetCardID, me.AttributeValueMap{
+			me.CircuitPack_Type:                        uint8(0x2f),
+			me.CircuitPack_NumberOfPorts:               uint8(4),
+			me.CircuitPack_SerialNumber:                cloneBytes(serial),
+			me.CircuitPack_Version:                     octets(identity.Version, 14),
+			me.CircuitPack_VendorId:                    cloneBytes(vendor),
+			me.CircuitPack_AdministrativeState:         uint8(0),
+			me.CircuitPack_OperationalState:            uint8(0),
+			me.CircuitPack_BridgedOrIpInd:              uint8(0),
+			me.CircuitPack_EquipmentId:                 octets(identity.EquipmentID+" Ethernet", 20),
+			me.CircuitPack_TotalPriorityQueueNumber:    uint8(32),
+			me.CircuitPack_TotalTrafficSchedulerNumber: uint8(0),
+		}),
+		instance(me.CircuitPackClassID, aniCardID, me.AttributeValueMap{
+			me.CircuitPack_Type:                     uint8(0xf5),
+			me.CircuitPack_NumberOfPorts:            uint8(1),
+			me.CircuitPack_SerialNumber:             cloneBytes(serial),
+			me.CircuitPack_Version:                  octets(identity.Version, 14),
+			me.CircuitPack_VendorId:                 cloneBytes(vendor),
+			me.CircuitPack_AdministrativeState:      uint8(0),
+			me.CircuitPack_OperationalState:         uint8(0),
+			me.CircuitPack_EquipmentId:              octets(identity.EquipmentID+" GPON", 20),
+			me.CircuitPack_TotalTContBufferNumber:   uint8(defaultTContCount),
+			me.CircuitPack_TotalPriorityQueueNumber: uint8(defaultTContCount * 8),
+		}),
+		softwareImage(softwareImageAID, identity.Version, true),
+		softwareImage(softwareImageBID, "standby", false),
+	}
+
+	for index := 0; index < defaultTContCount; index++ {
+		entityID := uint16(0x8001 + index)
+		instances = append(instances, instance(me.TContClassID, entityID, me.AttributeValueMap{
+			me.TCont_AllocId: uint16(0xffff),
+			me.TCont_Policy:  uint8(0),
+		}))
+	}
+
+	for port := 1; port <= 4; port++ {
+		entityID := uint16(ethernetCardID + port - 1)
+		instances = append(instances,
+			instance(me.PhysicalPathTerminationPointEthernetUniClassID, entityID, me.AttributeValueMap{
+				me.PhysicalPathTerminationPointEthernetUni_ExpectedType:               uint8(0),
+				me.PhysicalPathTerminationPointEthernetUni_SensedType:                 uint8(0x2f),
+				me.PhysicalPathTerminationPointEthernetUni_AutoDetectionConfiguration: uint8(0),
+				me.PhysicalPathTerminationPointEthernetUni_AdministrativeState:        uint8(0),
+				me.PhysicalPathTerminationPointEthernetUni_OperationalState:           uint8(1),
+				me.PhysicalPathTerminationPointEthernetUni_ConfigurationInd:           uint8(0),
+				me.PhysicalPathTerminationPointEthernetUni_MaxFrameSize:               uint16(2000),
+				me.PhysicalPathTerminationPointEthernetUni_BridgedOrIpInd:             uint8(0),
+			}),
+			instance(me.UniGClassID, entityID, me.AttributeValueMap{
+				me.UniG_Deprecated:           uint8(0),
+				me.UniG_AdministrativeState:  uint8(0),
+				me.UniG_ManagementCapability: uint8(1),
+			}),
+		)
+	}
+
+	return instances, nil
+}
+
+func instance(classID me.ClassID, entityID uint16, attributes me.AttributeValueMap) mib.Instance {
+	return mib.Instance{
+		Key:        mib.Key{ClassID: classID, EntityID: entityID},
+		Attributes: attributes,
+		Origin:     mib.OriginONU,
+	}
+}
+
+func softwareImage(entityID uint16, version string, active bool) mib.Instance {
+	flag := uint8(0)
+	if active {
+		flag = 1
+	}
+	return instance(me.SoftwareImageClassID, entityID, me.AttributeValueMap{
+		me.SoftwareImage_Version:     octets(version, 14),
+		me.SoftwareImage_IsCommitted: flag,
+		me.SoftwareImage_IsActive:    flag,
+		me.SoftwareImage_IsValid:     uint8(1),
+		me.SoftwareImage_ProductCode: octets("XG2010G", 25),
+	})
+}
+
+func serialOctets(value string) ([]byte, error) {
+	if len(value) != 12 {
+		return nil, fmt.Errorf("serial number must be four vendor characters followed by eight hexadecimal digits")
+	}
+	serial := make([]byte, 8)
+	copy(serial, value[:4])
+	for index := 0; index < 4; index++ {
+		var octet uint8
+		if _, err := fmt.Sscanf(value[4+index*2:6+index*2], "%02x", &octet); err != nil {
+			return nil, fmt.Errorf("invalid serial number %q: %w", value, err)
+		}
+		serial[4+index] = octet
+	}
+	return serial, nil
+}
+
+func octets(value string, size int) []byte {
+	result := make([]byte, size)
+	copy(result, []byte(strings.TrimSpace(value)))
+	return result
+}
+
+func cloneBytes(value []byte) []byte {
+	return append([]byte(nil), value...)
+}
