@@ -6,16 +6,28 @@ and extended messages.  A successful build or reaching GPON O5 is not enough.
 | Area | Required behavior | State |
 | --- | --- | --- |
 | OMCC transport | raw RX/TX, cancellation, frame bounds, counters | in progress |
-| Transactions | duplicate replay, TCI validation, bounded response cache | pending |
-| MIB | ONU defaults, atomic create/delete/set/get, reset, data sync | in progress |
-| MIB upload | baseline fragmentation and extended packing | pending |
-| Tables | Get Next and Set Table session caches | pending |
-| Notifications | alarm table, alarm sequence, AVC and test results | pending |
-| Equipment | ONU-G, ONU2-G, ANI-G, four Ethernet UNIs, software images | in progress |
-| Traffic | T-CONT, scheduler, priority queues, GEM CTP/IW | pending |
+| Transactions | duplicate replay, TCI validation, bounded response cache | in progress |
+| MIB | ONU defaults, platform-gated create/delete/set, reset, data sync | in progress |
+| MIB upload | baseline fragmentation and extended multi-ME packing | in progress |
+| Tables | stable Get/Get Next cache and extended Set Table | in progress |
+| Notifications | alarm table, alarm sequence, AVC and test results | in progress |
+| Equipment | ONU-G, ONU2-G, ANI-G, four speed-specific Ethernet UNIs, software images | in progress |
+| Traffic | 8 T-CONTs/schedulers, 96 queues, GEM CTP/IW validation and hardware apply | in progress |
 | Ethernet service | bridge, mapper, VLAN and extended VLAN rules | pending |
-| Lifecycle | reboot, time sync, software download/activate/commit | pending |
-| Platform | multi-T-CONT/GEM Airoha ABI and transactional Linux backend | pending |
-| OpenWrt | package, procd, UCI, ubus and LuCI | pending |
+| Lifecycle | reboot, time sync, software download/activate/commit | in progress |
+| Platform | multi-T-CONT/GEM Airoha ABI and transactional Linux backend | in progress |
+| OpenWrt | package, procd, UCI, rpcd/ubus and LuCI | in progress |
 | Verification | unit/fuzz/race/cross-build plus physical OLT traces | pending |
 
+## Current interoperability limits
+
+The daemon now provides valid error responses for unknown managed entities,
+transactional platform commits, baseline table transfer, extended MIB upload
+packing, alarm audits, time synchronization and scheduled reboot. The factory
+MIB advertises the two 10G, one 2.5G and one 1G Ethernet UNIs independently.
+
+The current Airoha Ethernet metadata ABI exposes only one data GEM to Linux.
+The OpenWrt backend records all OLT-provisioned GEM CTPs but selects one
+bidirectional GEM for the `pon` netdev and reports the limitation through
+ubus/LuCI. Multi-GEM representors, autonomous AVC/alarm transmission, test
+results and software image download/activation remain completion blockers.

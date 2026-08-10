@@ -18,14 +18,43 @@ const (
 )
 
 type Key struct {
-	ClassID  me.ClassID
-	EntityID uint16
+	ClassID  me.ClassID `json:"class_id"`
+	EntityID uint16     `json:"entity_id"`
 }
 
 type Instance struct {
 	Key
-	Attributes me.AttributeValueMap
-	Origin     Origin
+	Attributes me.AttributeValueMap `json:"attributes"`
+	Origin     Origin               `json:"origin"`
+}
+
+type Operation string
+
+const (
+	OperationCreate Operation = "create"
+	OperationSet    Operation = "set"
+	OperationDelete Operation = "delete"
+	OperationReset  Operation = "reset"
+)
+
+// Change is the immutable candidate state passed to the platform backend.
+// The store commits it only after Apply returns successfully.
+type Change struct {
+	Operation   Operation  `json:"operation"`
+	Before      *Instance  `json:"before,omitempty"`
+	After       *Instance  `json:"after,omitempty"`
+	Snapshot    []Instance `json:"snapshot"`
+	MIBDataSync uint8      `json:"mib_data_sync"`
+}
+
+type Applier interface {
+	Apply(Change) error
+}
+
+type ApplyFunc func(Change) error
+
+func (f ApplyFunc) Apply(change Change) error {
+	return f(change)
 }
 
 type ResultError struct {
@@ -51,12 +80,18 @@ type Store struct {
 	factory  map[Key]Instance
 	current  map[Key]Instance
 	dataSync uint8
+	applier  Applier
 }
 
 func New(factory []Instance) (*Store, error) {
+	return NewWithApplier(factory, nil)
+}
+
+func NewWithApplier(factory []Instance, applier Applier) (*Store, error) {
 	s := &Store{
 		factory: make(map[Key]Instance, len(factory)),
 		current: make(map[Key]Instance, len(factory)),
+		applier: applier,
 	}
 
 	for _, instance := range factory {
@@ -79,6 +114,13 @@ func (s *Store) DataSync() uint8 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.dataSync
+}
+
+func (s *Store) Exists(key Key) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	_, exists := s.current[key]
+	return exists
 }
 
 func (s *Store) Get(key Key, mask uint16) (Instance, error) {
@@ -143,9 +185,9 @@ func (s *Store) Create(classID me.ClassID, entityID uint16, attributes me.Attrib
 	if err != nil {
 		return err
 	}
-	s.current[key] = instance
-	s.bumpDataSyncLocked()
-	return nil
+	next := cloneInstances(s.current)
+	next[key] = instance
+	return s.commitLocked(OperationCreate, nil, &instance, next, s.nextDataSyncLocked())
 }
 
 func (s *Store) Set(key Key, attributes me.AttributeValueMap) error {
@@ -178,9 +220,9 @@ func (s *Store) Set(key Key, attributes me.AttributeValueMap) error {
 	if err != nil {
 		return err
 	}
-	s.current[key] = normalized
-	s.bumpDataSyncLocked()
-	return nil
+	proposed := cloneInstances(s.current)
+	proposed[key] = normalized
+	return s.commitLocked(OperationSet, &current, &normalized, proposed, s.nextDataSyncLocked())
 }
 
 func (s *Store) Delete(key Key) error {
@@ -201,28 +243,32 @@ func (s *Store) Delete(key Key) error {
 		return &ResultError{Result: me.NotSupported}
 	}
 
-	delete(s.current, key)
-	s.bumpDataSyncLocked()
-	return nil
+	next := cloneInstances(s.current)
+	delete(next, key)
+	return s.commitLocked(OperationDelete, &instance, nil, next, s.nextDataSyncLocked())
 }
 
-func (s *Store) Reset() {
+func (s *Store) Reset() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.current = make(map[Key]Instance, len(s.factory))
+	next := make(map[Key]Instance, len(s.factory))
 	for key, instance := range s.factory {
-		s.current[key] = cloneInstance(instance)
+		next[key] = cloneInstance(instance)
 	}
-	s.setDataSyncLocked(0)
+	return s.commitLocked(OperationReset, nil, nil, next, 0)
 }
 
 func (s *Store) Snapshot() []Instance {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	items := make([]Instance, 0, len(s.current))
-	for _, instance := range s.current {
+	return snapshotInstances(s.current)
+}
+
+func snapshotInstances(instances map[Key]Instance) []Instance {
+	items := make([]Instance, 0, len(instances))
+	for _, instance := range instances {
 		items = append(items, cloneInstance(instance))
 	}
 	sort.Slice(items, func(i, j int) bool {
@@ -232,6 +278,26 @@ func (s *Store) Snapshot() []Instance {
 		return items[i].ClassID < items[j].ClassID
 	})
 	return items
+}
+
+func (s *Store) commitLocked(operation Operation, before, after *Instance,
+	next map[Key]Instance, dataSync uint8) error {
+	setDataSync(next, dataSync)
+	change := Change{
+		Operation:   operation,
+		Before:      cloneInstancePointer(before),
+		After:       cloneInstancePointer(after),
+		Snapshot:    snapshotInstances(next),
+		MIBDataSync: dataSync,
+	}
+	if s.applier != nil {
+		if err := s.applier.Apply(change); err != nil {
+			return &ResultError{Result: me.ProcessingError, Cause: fmt.Errorf("apply platform state: %w", err)}
+		}
+	}
+	s.current = next
+	s.dataSync = dataSync
+	return nil
 }
 
 func normalize(instance Instance) (Instance, error) {
@@ -254,6 +320,12 @@ func loadDefinition(classID me.ClassID, entityID uint16, attributes me.Attribute
 			result = me.UnknownEntity
 		}
 		return nil, &ResultError{Result: result, Cause: omciErr.GetError()}
+	}
+	classSupport := entity.GetManagedEntityDefinition().GetClassSupport()
+	if classSupport == me.UnsupportedManagedEntity ||
+		classSupport == me.UnsupportedVendorSpecificManagedEntity {
+		return nil, &ResultError{Result: me.UnknownEntity,
+			Cause: fmt.Errorf("managed entity class %#x is unknown", classID)}
 	}
 	return entity, nil
 }
@@ -299,27 +371,46 @@ func unknownKeyError(key Key) error {
 	return &ResultError{Result: me.UnknownInstance}
 }
 
-func (s *Store) bumpDataSyncLocked() {
+func (s *Store) nextDataSyncLocked() uint8 {
 	if s.dataSync == 255 {
-		s.dataSync = 1
-	} else {
-		s.dataSync++
-		if s.dataSync == 0 {
-			s.dataSync = 1
-		}
+		return 1
 	}
-	s.setDataSyncLocked(s.dataSync)
+	next := s.dataSync + 1
+	if next == 0 {
+		return 1
+	}
+	return next
 }
 
 func (s *Store) setDataSyncLocked(value uint8) {
 	s.dataSync = value
+	setDataSync(s.current, value)
+}
+
+func setDataSync(instances map[Key]Instance, value uint8) {
 	key := Key{ClassID: me.OnuDataClassID, EntityID: 0}
-	instance, exists := s.current[key]
+	instance, exists := instances[key]
 	if !exists {
 		return
 	}
 	instance.Attributes[me.OnuData_MibDataSync] = value
-	s.current[key] = instance
+	instances[key] = instance
+}
+
+func cloneInstances(instances map[Key]Instance) map[Key]Instance {
+	cloned := make(map[Key]Instance, len(instances))
+	for key, instance := range instances {
+		cloned[key] = cloneInstance(instance)
+	}
+	return cloned
+}
+
+func cloneInstancePointer(instance *Instance) *Instance {
+	if instance == nil {
+		return nil
+	}
+	cloned := cloneInstance(*instance)
+	return &cloned
 }
 
 func cloneInstance(instance Instance) Instance {
@@ -343,6 +434,8 @@ func cloneValue(value interface{}) interface{} {
 		return append([]uint16(nil), typed...)
 	case []uint32:
 		return append([]uint32(nil), typed...)
+	case me.TableRows:
+		return me.TableRows{NumRows: typed.NumRows, Rows: append([]byte(nil), typed.Rows...)}
 	default:
 		return value
 	}

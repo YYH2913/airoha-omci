@@ -41,6 +41,9 @@ func OpenPacket(interfaceName string) (*PacketConn, error) {
 		_ = unix.Close(fd)
 		return nil, fmt.Errorf("bind OMCI packet socket to %q: %w", interfaceName, err)
 	}
+	// The receive path also checks sll_pkttype for kernels that do not support
+	// PACKET_IGNORE_OUTGOING.
+	_ = unix.SetsockoptInt(fd, unix.SOL_PACKET, unix.PACKET_IGNORE_OUTGOING, 1)
 
 	return &PacketConn{fd: fd, ifindex: ifc.Index}, nil
 }
@@ -68,7 +71,8 @@ func (c *PacketConn) ReadFrame(ctx context.Context) ([]byte, error) {
 			return nil, syscall.EBADF
 		}
 
-		n, _, err = unix.Recvfrom(c.fd, buf, 0)
+		var source unix.Sockaddr
+		n, source, err = unix.Recvfrom(c.fd, buf, 0)
 		if err != nil {
 			if errors.Is(err, unix.EINTR) || errors.Is(err, unix.EAGAIN) {
 				continue
@@ -76,6 +80,9 @@ func (c *PacketConn) ReadFrame(ctx context.Context) ([]byte, error) {
 			return nil, fmt.Errorf("receive OMCI frame: %w", err)
 		}
 		if n == 0 {
+			continue
+		}
+		if link, ok := source.(*unix.SockaddrLinklayer); ok && link.Pkttype == unix.PACKET_OUTGOING {
 			continue
 		}
 		return append([]byte(nil), buf[:n]...), nil

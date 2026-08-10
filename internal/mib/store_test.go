@@ -73,12 +73,79 @@ func TestResetRetainsOnlyONUCreatedInstances(t *testing.T) {
 		t.Fatalf("Create() error = %v", err)
 	}
 
-	store.Reset()
+	if err := store.Reset(); err != nil {
+		t.Fatalf("Reset() error = %v", err)
+	}
 	if got := store.DataSync(); got != 0 {
 		t.Fatalf("DataSync() after reset = %d, want 0", got)
 	}
 	if got := len(store.Snapshot()); got != 1 {
 		t.Fatalf("len(Snapshot()) = %d, want 1", got)
+	}
+}
+
+func TestPlatformApplyFailureDoesNotCommitCandidate(t *testing.T) {
+	wantError := errors.New("platform rejected service graph")
+	store, err := NewWithApplier([]Instance{{
+		Key: Key{ClassID: me.OnuDataClassID, EntityID: 0},
+		Attributes: me.AttributeValueMap{
+			me.OnuData_MibDataSync: uint8(0),
+		},
+	}}, ApplyFunc(func(change Change) error {
+		if change.Operation != OperationCreate || change.MIBDataSync != 1 {
+			t.Fatalf("change = %#v, want create/data-sync 1", change)
+		}
+		if len(change.Snapshot) != 2 {
+			t.Fatalf("candidate snapshot has %d MEs, want 2", len(change.Snapshot))
+		}
+		return wantError
+	}))
+	if err != nil {
+		t.Fatalf("NewWithApplier() error = %v", err)
+	}
+
+	err = store.Create(me.GalEthernetProfileClassID, 1, me.AttributeValueMap{
+		me.GalEthernetProfile_MaximumGemPayloadSize: uint16(48),
+	})
+	var result *ResultError
+	if !errors.As(err, &result) || result.Result != me.ProcessingError ||
+		!errors.Is(err, wantError) {
+		t.Fatalf("Create() error = %#v, want wrapped platform ProcessingError", err)
+	}
+	if got := store.DataSync(); got != 0 {
+		t.Fatalf("DataSync() = %d after rejected apply, want 0", got)
+	}
+	if got := len(store.Snapshot()); got != 1 {
+		t.Fatalf("len(Snapshot()) = %d after rejected apply, want 1", got)
+	}
+}
+
+func TestPlatformChangeDoesNotAliasCommittedStore(t *testing.T) {
+	store, err := NewWithApplier([]Instance{{
+		Key: Key{ClassID: me.OnuDataClassID, EntityID: 0},
+		Attributes: me.AttributeValueMap{
+			me.OnuData_MibDataSync: uint8(0),
+		},
+	}}, ApplyFunc(func(change Change) error {
+		change.After.Attributes[me.GalEthernetProfile_MaximumGemPayloadSize] = uint16(999)
+		change.Snapshot[0].Attributes[me.OnuData_MibDataSync] = uint8(99)
+		return nil
+	}))
+	if err != nil {
+		t.Fatalf("NewWithApplier() error = %v", err)
+	}
+	key := Key{ClassID: me.GalEthernetProfileClassID, EntityID: 1}
+	if err := store.Create(key.ClassID, key.EntityID, me.AttributeValueMap{
+		me.GalEthernetProfile_MaximumGemPayloadSize: uint16(48),
+	}); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	instance, err := store.Get(key, 0x8000)
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	if got := instance.Attributes[me.GalEthernetProfile_MaximumGemPayloadSize]; got != uint16(48) {
+		t.Fatalf("MaximumGemPayloadSize = %#v, want 48", got)
 	}
 }
 
@@ -125,5 +192,14 @@ func TestGetReturnsKnownAttributesWithUnsupportedMask(t *testing.T) {
 	}
 	if got := instance.Attributes[me.OnuData_MibDataSync]; got != uint8(0) {
 		t.Fatalf("MibDataSync = %#v, want 0", got)
+	}
+}
+
+func TestUnknownClassReturnsUnknownEntity(t *testing.T) {
+	store := newTestStore(t)
+	_, err := store.Get(Key{ClassID: me.ClassID(0xfffe), EntityID: 1}, 0x8000)
+	var result *ResultError
+	if !errors.As(err, &result) || result.Result != me.UnknownEntity {
+		t.Fatalf("Get(unknown class) error = %#v, want UnknownEntity", err)
 	}
 }

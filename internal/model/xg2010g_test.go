@@ -21,12 +21,20 @@ func TestXG2010GFactoryMIB(t *testing.T) {
 
 	var ethernetUNIs int
 	var tconts int
+	var schedulers int
+	var queues int
+	configurations := make(map[uint16]uint8)
 	for _, item := range store.Snapshot() {
 		switch item.ClassID {
 		case me.PhysicalPathTerminationPointEthernetUniClassID:
 			ethernetUNIs++
+			configurations[item.EntityID] = item.Attributes[me.PhysicalPathTerminationPointEthernetUni_ConfigurationInd].(uint8)
 		case me.TContClassID:
 			tconts++
+		case me.TrafficSchedulerClassID:
+			schedulers++
+		case me.PriorityQueueClassID:
+			queues++
 		}
 	}
 	if ethernetUNIs != 4 {
@@ -34,6 +42,19 @@ func TestXG2010GFactoryMIB(t *testing.T) {
 	}
 	if tconts != defaultTContCount {
 		t.Fatalf("T-CONT count = %d, want %d", tconts, defaultTContCount)
+	}
+	if schedulers != defaultTContCount {
+		t.Fatalf("traffic scheduler count = %d, want %d", schedulers, defaultTContCount)
+	}
+	wantQueues := (defaultTContCount + len(ethernetConfiguration)) * queuesPerPort
+	if queues != wantQueues {
+		t.Fatalf("priority queue count = %d, want %d", queues, wantQueues)
+	}
+	for index, want := range ethernetConfiguration {
+		entityID := uint16(ethernetCardID + index)
+		if got := configurations[entityID]; got != want {
+			t.Fatalf("Ethernet UNI %#x configuration = %d, want %d", entityID, got, want)
+		}
 	}
 }
 

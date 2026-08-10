@@ -16,6 +16,8 @@ type Snapshot struct {
 	StartedAt         time.Time `json:"started_at"`
 	UpdatedAt         time.Time `json:"updated_at"`
 	MIBDataSync       uint8     `json:"mib_data_sync"`
+	MIBEntries        int       `json:"mib_entries"`
+	PlatformBackend   string    `json:"platform_backend"`
 	RXFrames          uint64    `json:"rx_frames"`
 	TXFrames          uint64    `json:"tx_frames"`
 	DecodeErrors      uint64    `json:"decode_errors"`

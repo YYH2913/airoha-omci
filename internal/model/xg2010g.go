@@ -17,7 +17,15 @@ const (
 	softwareImageAID  = 0
 	softwareImageBID  = 1
 	defaultTContCount = 8
+	queuesPerPort     = 8
 )
+
+var ethernetConfiguration = [...]uint8{
+	4, // LAN1: 10G full duplex
+	4, // LAN2: 10G full duplex
+	5, // LAN3: 2.5G full duplex
+	3, // LAN4: 1G full duplex
+}
 
 type Identity struct {
 	SerialNumber string
@@ -57,7 +65,7 @@ func XG2010G(identity Identity) ([]mib.Instance, error) {
 			me.Onu2G_VendorProductCode:                                        uint16(0x2010),
 			me.Onu2G_SecurityCapability:                                       uint8(1),
 			me.Onu2G_SecurityMode:                                             uint8(1),
-			me.Onu2G_TotalPriorityQueueNumber:                                 uint16(defaultTContCount * 8),
+			me.Onu2G_TotalPriorityQueueNumber:                                 uint16((defaultTContCount + len(ethernetConfiguration)) * queuesPerPort),
 			me.Onu2G_TotalTrafficSchedulerNumber:                              uint8(defaultTContCount),
 			me.Onu2G_Deprecated:                                               uint8(1),
 			me.Onu2G_TotalGemPortIdNumber:                                     uint16(256),
@@ -108,10 +116,19 @@ func XG2010G(identity Identity) ([]mib.Instance, error) {
 		instances = append(instances, instance(me.TContClassID, entityID, me.AttributeValueMap{
 			me.TCont_AllocId: uint16(0xffff),
 			me.TCont_Policy:  uint8(0),
+		}), instance(me.TrafficSchedulerClassID, entityID, me.AttributeValueMap{
+			me.TrafficScheduler_TContPointer:            entityID,
+			me.TrafficScheduler_TrafficSchedulerPointer: uint16(0),
+			me.TrafficScheduler_Policy:                  uint8(1),
+			me.TrafficScheduler_PriorityWeight:          uint8(0),
 		}))
+		for priority := 0; priority < queuesPerPort; priority++ {
+			queueID := uint16(0x8000 + index*queuesPerPort + priority)
+			instances = append(instances, priorityQueue(queueID, entityID, entityID, priority))
+		}
 	}
 
-	for port := 1; port <= 4; port++ {
+	for port := 1; port <= len(ethernetConfiguration); port++ {
 		entityID := uint16(ethernetCardID + port - 1)
 		instances = append(instances,
 			instance(me.PhysicalPathTerminationPointEthernetUniClassID, entityID, me.AttributeValueMap{
@@ -120,7 +137,7 @@ func XG2010G(identity Identity) ([]mib.Instance, error) {
 				me.PhysicalPathTerminationPointEthernetUni_AutoDetectionConfiguration: uint8(0),
 				me.PhysicalPathTerminationPointEthernetUni_AdministrativeState:        uint8(0),
 				me.PhysicalPathTerminationPointEthernetUni_OperationalState:           uint8(1),
-				me.PhysicalPathTerminationPointEthernetUni_ConfigurationInd:           uint8(0),
+				me.PhysicalPathTerminationPointEthernetUni_ConfigurationInd:           ethernetConfiguration[port-1],
 				me.PhysicalPathTerminationPointEthernetUni_MaxFrameSize:               uint16(2000),
 				me.PhysicalPathTerminationPointEthernetUni_BridgedOrIpInd:             uint8(0),
 			}),
@@ -130,9 +147,24 @@ func XG2010G(identity Identity) ([]mib.Instance, error) {
 				me.UniG_ManagementCapability: uint8(1),
 			}),
 		)
+		for priority := 0; priority < queuesPerPort; priority++ {
+			queueID := uint16((port-1)*queuesPerPort + priority)
+			instances = append(instances, priorityQueue(queueID, entityID, 0, priority))
+		}
 	}
 
 	return instances, nil
+}
+
+func priorityQueue(entityID, relatedEntity, scheduler uint16, priority int) mib.Instance {
+	return instance(me.PriorityQueueClassID, entityID, me.AttributeValueMap{
+		me.PriorityQueue_QueueConfigurationOption: uint8(0),
+		me.PriorityQueue_MaximumQueueSize:         uint16(4096),
+		me.PriorityQueue_AllocatedQueueSize:       uint16(4096),
+		me.PriorityQueue_RelatedPort:              uint32(relatedEntity)<<16 | uint32(priority),
+		me.PriorityQueue_TrafficSchedulerPointer:  scheduler,
+		me.PriorityQueue_Weight:                   uint8(1),
+	})
 }
 
 func instance(classID me.ClassID, entityID uint16, attributes me.AttributeValueMap) mib.Instance {

@@ -16,6 +16,7 @@ import (
 	"github.com/xg2010g/airoha-omci/internal/engine"
 	"github.com/xg2010g/airoha-omci/internal/mib"
 	"github.com/xg2010g/airoha-omci/internal/model"
+	"github.com/xg2010g/airoha-omci/internal/platform"
 	"github.com/xg2010g/airoha-omci/internal/status"
 	"github.com/xg2010g/airoha-omci/internal/transport"
 )
@@ -27,6 +28,8 @@ type options struct {
 	serialNumber  string
 	equipmentID   string
 	statusPath    string
+	applyHelper   string
+	controlHelper string
 }
 
 func main() {
@@ -35,6 +38,8 @@ func main() {
 	flag.StringVar(&opts.serialNumber, "serial", "", "ONU serial: four vendor characters and eight hex digits")
 	flag.StringVar(&opts.equipmentID, "equipment-id", "XG2010G", "ONU equipment identifier")
 	flag.StringVar(&opts.statusPath, "status", "/var/run/airoha-omcid/status.json", "atomic JSON status path")
+	flag.StringVar(&opts.applyHelper, "apply-helper", "", "fixed executable receiving candidate MIB snapshots as JSON")
+	flag.StringVar(&opts.controlHelper, "control-helper", "", "fixed executable handling time sync and scheduled reboot")
 	flag.Parse()
 
 	if err := run(opts); err != nil {
@@ -52,11 +57,21 @@ func run(opts options) error {
 	if err != nil {
 		return err
 	}
-	store, err := mib.New(factory)
+	var applier mib.Applier
+	platformBackend := "memory-only"
+	if opts.applyHelper != "" {
+		applier = platform.ExecApplier{Path: opts.applyHelper}
+		platformBackend = opts.applyHelper
+	}
+	store, err := mib.NewWithApplier(factory, applier)
 	if err != nil {
 		return fmt.Errorf("initialize ONU MIB: %w", err)
 	}
-	protocol := engine.New(store)
+	var controller engine.Controller
+	if opts.controlHelper != "" {
+		controller = platform.ExecController{Path: opts.controlHelper}
+	}
+	protocol := engine.NewWithController(store, controller)
 
 	conn, err := transport.OpenPacket(opts.interfaceName)
 	if err != nil {
@@ -69,10 +84,12 @@ func run(opts options) error {
 
 	started := time.Now().UTC()
 	state := status.Snapshot{
-		State:       "online",
-		Interface:   opts.interfaceName,
-		StartedAt:   started,
-		MIBDataSync: store.DataSync(),
+		State:           "online",
+		Interface:       opts.interfaceName,
+		StartedAt:       started,
+		MIBDataSync:     store.DataSync(),
+		MIBEntries:      len(store.Snapshot()),
+		PlatformBackend: platformBackend,
 	}
 	statusWriter := status.NewWriter(opts.statusPath)
 	if err := statusWriter.Write(state); err != nil {
@@ -103,6 +120,7 @@ func run(opts options) error {
 			state.DecodeErrors++
 			state.LastError = err.Error()
 			state.MIBDataSync = store.DataSync()
+			state.MIBEntries = len(store.Snapshot())
 			_ = statusWriter.Write(state)
 			log.Printf("OMCI request rejected: %v", err)
 			continue
@@ -115,6 +133,7 @@ func run(opts options) error {
 		}
 		state.TXFrames++
 		state.MIBDataSync = store.DataSync()
+		state.MIBEntries = len(store.Snapshot())
 		state.LastError = ""
 		if err := statusWriter.Write(state); err != nil {
 			log.Printf("publish status: %v", err)
