@@ -41,12 +41,12 @@ an OLT may retransmit a request.
 ## Other helpers
 
 The apply helper receives a complete, resolved candidate service graph on
-stdin and must apply it transactionally. ABI version 1 has this top-level
+stdin and must apply it transactionally. ABI version 2 has this top-level
 shape:
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "operation": "set-table",
   "mib_data_sync": 17,
   "service_graph": {
@@ -64,8 +64,31 @@ shape:
 
 The graph contains validated and deterministically ordered references. Raw
 managed-entity attributes are not part of this ABI; interpreting G.988 remains
-the daemon's responsibility. Unknown ABI versions must be rejected before any
-platform state is changed.
+the daemon's responsibility. Extended VLAN tables are emitted as named filter
+and treatment fields, including enhanced row keys and directions; no encoded
+table rows cross this boundary. Unknown ABI versions must be rejected before
+any platform state is changed.
+
+VLAN tagging filter data is similarly normalized. `forward_operation` is kept
+for diagnostics, while `tagged_action` contains the G.988 action letter
+(`a`, `c`, `g`, `h` or `j`), `tagged_criterion` is `none`, `vid`, `priority` or
+`tci`, and `untagged_action` is `a` or `c`. Reserved forward-operation values
+are rejected before the platform helper is called.
+
+MAC bridge profiles carry their learning, spanning-tree, port-bridging,
+unknown-MAC, timer and learning-depth policy. Each bridge port carries its
+termination type and pointer, priority, path cost, spanning-tree state,
+traffic-descriptor pointers and learning depth. A platform may reject a graph
+that cannot be represented without loss, but it must do so before changing
+hardware state. The XG2010G backend currently accepts one active bridge profile
+with one ANI logical port and one or more Ethernet UNIs. It never removes an
+interface from a non-OMCI Linux bridge implicitly.
+
+XG2010G Ethernet PPTP UNI instances carry a fixed, validated Linux interface
+name in the graph. The mapping is `0x0101` to `lan1`, `0x0102` to `lan2`,
+`0x0103` to `lan3`, and `0x0104` to `lan4`. The platform helper must reject a
+different name for one of these entity IDs rather than treating an OLT value as
+an interface name.
 
 The control helper handles validated time and reboot operations. The event
 helper streams bounded JSON lines for platform alarms and AVCs. Their schemas

@@ -10,6 +10,7 @@ import (
 	"sort"
 
 	me "github.com/opencord/omci-lib-go/v2/generated"
+	"github.com/xg2010g/airoha-omci/internal/vlan"
 )
 
 const (
@@ -109,6 +110,15 @@ func (s *Store) applyTableRows(classID me.ClassID, name string, existing, update
 
 	switch name {
 	case me.ExtendedVlanTaggingOperationConfigurationData_ReceivedFrameVlanTaggingOperationTable:
+		for offset := 0; offset < len(updates.Rows); offset += extendedVLANRowSize {
+			row := updates.Rows[offset : offset+extendedVLANRowSize]
+			if allBytes(row[8:], 0xff) {
+				continue
+			}
+			if _, err := vlan.ParseRow(row, false); err != nil {
+				return me.TableRows{}, &ResultError{Result: me.ParameterError, Cause: err}
+			}
+		}
 		rows := applyKeyedRows(existing.Rows, updates.Rows, extendedVLANRowSize, 8,
 			func(row []byte) bool { return allBytes(row[8:], 0xff) })
 		if len(rows)/extendedVLANRowSize > int(s.extendedVLANTableSize) {
@@ -188,6 +198,9 @@ func applyEnhancedVLANRows(existing, updates []byte) ([]byte, error) {
 			}
 			stored := append([]byte(nil), row...)
 			stored[0] &= 0x3f
+			if _, err := vlan.ParseRow(stored, true); err != nil {
+				return nil, &ResultError{Result: me.ParameterError, Cause: err}
+			}
 			rows[key] = stored
 		case 2:
 			delete(rows, key)

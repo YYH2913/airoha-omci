@@ -41,16 +41,94 @@ func TestBuildServiceGraphResolvesCompleteEthernetService(t *testing.T) {
 		len(graph.ExtendedVLANs) != 1 {
 		t.Fatalf("resolved graph = %#v", graph)
 	}
+	if graph.UNIs[0].Interface != "lan1" {
+		t.Fatalf("Ethernet UNI interface = %q, want lan1", graph.UNIs[0].Interface)
+	}
 	for priority, pointer := range graph.Mappers[0].PBits {
 		if pointer != testMapperIW {
 			t.Fatalf("P-bit %d pointer = %#x, want %#x", priority, pointer, testMapperIW)
 		}
 	}
+	if graph.Mappers[0].UnmarkedFrameOption != 1 || graph.Mappers[0].DefaultPBit != 0 {
+		t.Fatalf("mapper unmarked policy = %d/%d, want fixed P-bit 0",
+			graph.Mappers[0].UnmarkedFrameOption, graph.Mappers[0].DefaultPBit)
+	}
 	if graph.GEMPorts[0].AllocID != 100 || graph.GEMPorts[1].AllocID != 100 {
 		t.Fatalf("GEM Alloc-IDs = %d/%d, want 100", graph.GEMPorts[0].AllocID, graph.GEMPorts[1].AllocID)
 	}
-	if got := graph.ExtendedVLANs[0].Rules; got.NumRows != 1 || len(got.Rows) != 16 {
+	bridge := graph.Bridges[0]
+	if bridge.SpanningTree != 1 || bridge.Learning != 1 || bridge.PortBridging != 1 ||
+		bridge.Priority != 0x9000 || bridge.MaxAge != 20*256 || bridge.HelloTime != 2*256 ||
+		bridge.ForwardDelay != 15*256 || bridge.UnknownMACDiscard != 1 ||
+		bridge.MACLearningDepth != 64 || bridge.DynamicFilteringAgeTime != 600 {
+		t.Fatalf("MAC bridge policy = %#v", bridge)
+	}
+	if bridge.Ports[0].Priority != 0x80 || bridge.Ports[0].PathCost != 10 ||
+		bridge.Ports[0].SpanningTree != 1 || bridge.Ports[0].MACLearningDepth != 32 {
+		t.Fatalf("MAC bridge port policy = %#v", bridge.Ports[0])
+	}
+	filter := graph.VLANFilters[0]
+	if filter.TaggedAction != VLANFilterActionPositive ||
+		filter.TaggedCriterion != VLANFilterCriterionVID ||
+		filter.UntaggedAction != VLANFilterActionDiscard {
+		t.Fatalf("VLAN filter policy = %#v", filter)
+	}
+	if got := graph.ExtendedVLANs[0].Rules; len(got) != 1 ||
+		got[0].FilterOuter.Priority != 0 || got[0].TreatmentInner.Priority != 0 {
 		t.Fatalf("extended VLAN rules = %#v, want one row", got)
+	}
+}
+
+func TestBuildServiceGraphRejectsUnknownXG2010GUNI(t *testing.T) {
+	snapshot := []mib.Instance{{
+		Key: mib.Key{ClassID: me.PhysicalPathTerminationPointEthernetUniClassID, EntityID: 0x0201},
+	}}
+	_, err := BuildServiceGraph(snapshot)
+	if err == nil || !strings.Contains(err.Error(), "no XG2010G interface mapping") {
+		t.Fatalf("BuildServiceGraph() error = %v, want missing interface mapping", err)
+	}
+}
+
+func TestBuildServiceGraphResolvesClassicVLANOperation(t *testing.T) {
+	snapshot := withoutInstance(validServiceSnapshot(),
+		me.ExtendedVlanTaggingOperationConfigurationDataClassID, 0x0600)
+	snapshot = append(snapshot, mib.Instance{
+		Key: mib.Key{ClassID: me.VlanTaggingOperationConfigurationDataClassID, EntityID: testUNI},
+		Attributes: me.AttributeValueMap{
+			me.VlanTaggingOperationConfigurationData_UpstreamVlanTaggingOperationMode:   uint8(2),
+			me.VlanTaggingOperationConfigurationData_UpstreamVlanTagTciValue:            uint16(5<<13 | 1<<12 | 100),
+			me.VlanTaggingOperationConfigurationData_DownstreamVlanTaggingOperationMode: uint8(1),
+			me.VlanTaggingOperationConfigurationData_AssociationType:                    uint8(0),
+		},
+	})
+	graph, err := BuildServiceGraph(snapshot)
+	if err != nil {
+		t.Fatalf("BuildServiceGraph() error = %v", err)
+	}
+	if len(graph.VLANOperations) != 1 {
+		t.Fatalf("VLAN operations = %#v, want one", graph.VLANOperations)
+	}
+	operation := graph.VLANOperations[0]
+	if operation.EntityID != testUNI || operation.AssociationType != 0 ||
+		operation.AssociatedClass != me.PhysicalPathTerminationPointEthernetUniClassID ||
+		operation.AssociatedME != testUNI || operation.UpstreamMode != 2 ||
+		operation.UpstreamTCI != uint16(5<<13|1<<12|100) || operation.DownstreamMode != 1 {
+		t.Fatalf("VLAN operation = %#v", operation)
+	}
+}
+
+func TestBuildServiceGraphRejectsDuplicateVLANOperationAssociation(t *testing.T) {
+	snapshot := append(validServiceSnapshot(), mib.Instance{
+		Key: mib.Key{ClassID: me.VlanTaggingOperationConfigurationDataClassID, EntityID: testUNI},
+		Attributes: me.AttributeValueMap{
+			me.VlanTaggingOperationConfigurationData_UpstreamVlanTaggingOperationMode:   uint8(0),
+			me.VlanTaggingOperationConfigurationData_UpstreamVlanTagTciValue:            uint16(0),
+			me.VlanTaggingOperationConfigurationData_DownstreamVlanTaggingOperationMode: uint8(0),
+			me.VlanTaggingOperationConfigurationData_AssociationType:                    uint8(0),
+		},
+	})
+	if _, err := BuildServiceGraph(snapshot); err == nil || !strings.Contains(err.Error(), "share target") {
+		t.Fatalf("BuildServiceGraph() error = %v, want duplicate VLAN operation target", err)
 	}
 }
 
@@ -112,6 +190,24 @@ func TestValidateServiceGraphRejectsBrokenReferencesAndConstraints(t *testing.T)
 			want: "P-bit 7 references missing GEM IW TP",
 		},
 		{
+			name: "reserved unmarked frame option",
+			edit: func(snapshot []mib.Instance) []mib.Instance {
+				findInstance(snapshot, me.Ieee8021PMapperServiceProfileClassID,
+					testMapper).Attributes[me.Ieee8021PMapperServiceProfile_UnmarkedFrameOption] = uint8(2)
+				return snapshot
+			},
+			want: "invalid unmarked frame option 2",
+		},
+		{
+			name: "reserved default P-bit",
+			edit: func(snapshot []mib.Instance) []mib.Instance {
+				findInstance(snapshot, me.Ieee8021PMapperServiceProfileClassID,
+					testMapper).Attributes[me.Ieee8021PMapperServiceProfile_DefaultPBitAssumption] = uint8(8)
+				return snapshot
+			},
+			want: "invalid default P-bit 8",
+		},
+		{
 			name: "duplicate bridge port number",
 			edit: func(snapshot []mib.Instance) []mib.Instance {
 				findInstance(snapshot, me.MacBridgePortConfigurationDataClassID, mapperPort).Attributes[me.MacBridgePortConfigurationData_PortNum] = uint8(1)
@@ -153,6 +249,16 @@ func TestValidateServiceGraphRejectsBrokenReferencesAndConstraints(t *testing.T)
 			want: "references missing",
 		},
 		{
+			name: "reserved extended VLAN rule",
+			edit: func(snapshot []mib.Instance) []mib.Instance {
+				table := findInstance(snapshot, me.ExtendedVlanTaggingOperationConfigurationDataClassID,
+					0x0600).Attributes[me.ExtendedVlanTaggingOperationConfigurationData_ReceivedFrameVlanTaggingOperationTable].(me.TableRows)
+				table.Rows[0] = 0x90
+				return snapshot
+			},
+			want: "priority 9 is reserved",
+		},
+		{
 			name: "delete GAL before GEM IW",
 			edit: func(snapshot []mib.Instance) []mib.Instance {
 				return withoutInstance(snapshot, me.GalEthernetProfileClassID, testGAL)
@@ -181,6 +287,74 @@ func TestValidateServiceGraphAllowsUnusedTCONTAndNullMapperBranches(t *testing.T
 	}
 	if err := ValidateServiceGraph(snapshot); err != nil {
 		t.Fatalf("ValidateServiceGraph() error = %v", err)
+	}
+}
+
+func TestDecodeVLANForwardOperation(t *testing.T) {
+	tests := []struct {
+		operation uint8
+		tagged    VLANFilterAction
+		criterion VLANFilterCriterion
+		untagged  VLANFilterAction
+	}{
+		{0x00, VLANFilterActionBridge, VLANFilterCriterionNone, VLANFilterActionBridge},
+		{0x01, VLANFilterActionDiscard, VLANFilterCriterionNone, VLANFilterActionBridge},
+		{0x02, VLANFilterActionBridge, VLANFilterCriterionNone, VLANFilterActionDiscard},
+		{0x03, VLANFilterActionPositive, VLANFilterCriterionVID, VLANFilterActionBridge},
+		{0x04, VLANFilterActionPositive, VLANFilterCriterionVID, VLANFilterActionDiscard},
+		{0x05, VLANFilterActionNegative, VLANFilterCriterionVID, VLANFilterActionBridge},
+		{0x06, VLANFilterActionNegative, VLANFilterCriterionVID, VLANFilterActionDiscard},
+		{0x07, VLANFilterActionPositive, VLANFilterCriterionPriority, VLANFilterActionBridge},
+		{0x08, VLANFilterActionPositive, VLANFilterCriterionPriority, VLANFilterActionDiscard},
+		{0x09, VLANFilterActionNegative, VLANFilterCriterionPriority, VLANFilterActionBridge},
+		{0x0a, VLANFilterActionNegative, VLANFilterCriterionPriority, VLANFilterActionDiscard},
+		{0x0b, VLANFilterActionPositive, VLANFilterCriterionTCI, VLANFilterActionBridge},
+		{0x0c, VLANFilterActionPositive, VLANFilterCriterionTCI, VLANFilterActionDiscard},
+		{0x0d, VLANFilterActionNegative, VLANFilterCriterionTCI, VLANFilterActionBridge},
+		{0x0e, VLANFilterActionNegative, VLANFilterCriterionTCI, VLANFilterActionDiscard},
+		{0x0f, VLANFilterActionPositive, VLANFilterCriterionVID, VLANFilterActionBridge},
+		{0x10, VLANFilterActionPositive, VLANFilterCriterionVID, VLANFilterActionDiscard},
+		{0x11, VLANFilterActionPositive, VLANFilterCriterionPriority, VLANFilterActionBridge},
+		{0x12, VLANFilterActionPositive, VLANFilterCriterionPriority, VLANFilterActionDiscard},
+		{0x13, VLANFilterActionPositive, VLANFilterCriterionTCI, VLANFilterActionBridge},
+		{0x14, VLANFilterActionPositive, VLANFilterCriterionTCI, VLANFilterActionDiscard},
+		{0x15, VLANFilterActionBridge, VLANFilterCriterionNone, VLANFilterActionDiscard},
+		{0x16, VLANFilterActionPositiveDA, VLANFilterCriterionVID, VLANFilterActionBridge},
+		{0x17, VLANFilterActionPositiveDA, VLANFilterCriterionVID, VLANFilterActionDiscard},
+		{0x18, VLANFilterActionPositiveDA, VLANFilterCriterionPriority, VLANFilterActionBridge},
+		{0x19, VLANFilterActionPositiveDA, VLANFilterCriterionPriority, VLANFilterActionDiscard},
+		{0x1a, VLANFilterActionPositiveDA, VLANFilterCriterionTCI, VLANFilterActionBridge},
+		{0x1b, VLANFilterActionPositiveDA, VLANFilterCriterionTCI, VLANFilterActionDiscard},
+		{0x1c, VLANFilterActionPositive, VLANFilterCriterionVID, VLANFilterActionBridge},
+		{0x1d, VLANFilterActionPositive, VLANFilterCriterionVID, VLANFilterActionDiscard},
+		{0x1e, VLANFilterActionPositive, VLANFilterCriterionPriority, VLANFilterActionBridge},
+		{0x1f, VLANFilterActionPositive, VLANFilterCriterionPriority, VLANFilterActionDiscard},
+		{0x20, VLANFilterActionPositive, VLANFilterCriterionTCI, VLANFilterActionBridge},
+		{0x21, VLANFilterActionPositive, VLANFilterCriterionTCI, VLANFilterActionDiscard},
+	}
+	for _, test := range tests {
+		tagged, criterion, untagged, err := decodeVLANForwardOperation(test.operation)
+		if err != nil {
+			t.Fatalf("decodeVLANForwardOperation(%#x) error = %v", test.operation, err)
+		}
+		if tagged != test.tagged || criterion != test.criterion || untagged != test.untagged {
+			t.Errorf("decodeVLANForwardOperation(%#x) = %q/%q/%q, want %q/%q/%q",
+				test.operation, tagged, criterion, untagged, test.tagged, test.criterion, test.untagged)
+		}
+	}
+	for operation := 0x22; operation <= 0xff; operation++ {
+		if _, _, _, err := decodeVLANForwardOperation(uint8(operation)); err == nil {
+			t.Errorf("decodeVLANForwardOperation(%#x) accepted reserved operation", operation)
+		}
+	}
+}
+
+func TestBuildServiceGraphRejectsReservedVLANForwardOperation(t *testing.T) {
+	snapshot := validServiceSnapshot()
+	filter := findInstance(snapshot, me.VlanTaggingFilterDataClassID, uniBridgePort)
+	filter.Attributes[me.VlanTaggingFilterData_ForwardOperation] = uint8(0x22)
+	if _, err := BuildServiceGraph(snapshot); err == nil || !strings.Contains(err.Error(), "reserved") {
+		t.Fatalf("BuildServiceGraph() error = %v, want reserved forward operation", err)
 	}
 }
 
@@ -289,7 +463,21 @@ func validServiceSnapshot() []mib.Instance {
 			},
 		},
 		{Key: mib.Key{ClassID: me.GalEthernetProfileClassID, EntityID: testGAL}, Attributes: me.AttributeValueMap{}},
-		{Key: mib.Key{ClassID: me.MacBridgeServiceProfileClassID, EntityID: testBridge}, Attributes: me.AttributeValueMap{}},
+		{
+			Key: mib.Key{ClassID: me.MacBridgeServiceProfileClassID, EntityID: testBridge},
+			Attributes: me.AttributeValueMap{
+				me.MacBridgeServiceProfile_SpanningTreeInd:            uint8(1),
+				me.MacBridgeServiceProfile_LearningInd:                uint8(1),
+				me.MacBridgeServiceProfile_PortBridgingInd:            uint8(1),
+				me.MacBridgeServiceProfile_Priority:                   uint16(0x9000),
+				me.MacBridgeServiceProfile_MaxAge:                     uint16(20 * 256),
+				me.MacBridgeServiceProfile_HelloTime:                  uint16(2 * 256),
+				me.MacBridgeServiceProfile_ForwardDelay:               uint16(15 * 256),
+				me.MacBridgeServiceProfile_UnknownMacAddressDiscard:   uint8(1),
+				me.MacBridgeServiceProfile_MacLearningDepth:           uint8(64),
+				me.MacBridgeServiceProfile_DynamicFilteringAgeingTime: uint32(600),
+			},
+		},
 		mapper,
 		gemPortInstance(testMapperGEM, 200),
 		gemPortInstance(testBridgeGEM, 201),
@@ -372,10 +560,14 @@ func bridgePortInstance(entityID uint16, port, tpType uint8, tp uint16) mib.Inst
 	return mib.Instance{
 		Key: mib.Key{ClassID: me.MacBridgePortConfigurationDataClassID, EntityID: entityID},
 		Attributes: me.AttributeValueMap{
-			me.MacBridgePortConfigurationData_BridgeIdPointer: uint16(testBridge),
-			me.MacBridgePortConfigurationData_PortNum:         port,
-			me.MacBridgePortConfigurationData_TpType:          tpType,
-			me.MacBridgePortConfigurationData_TpPointer:       tp,
+			me.MacBridgePortConfigurationData_BridgeIdPointer:     uint16(testBridge),
+			me.MacBridgePortConfigurationData_PortNum:             port,
+			me.MacBridgePortConfigurationData_TpType:              tpType,
+			me.MacBridgePortConfigurationData_TpPointer:           tp,
+			me.MacBridgePortConfigurationData_PortPriority:        uint16(0x80),
+			me.MacBridgePortConfigurationData_PortPathCost:        uint16(10),
+			me.MacBridgePortConfigurationData_PortSpanningTreeInd: uint8(1),
+			me.MacBridgePortConfigurationData_MacLearningDepth:    uint8(32),
 		},
 	}
 }

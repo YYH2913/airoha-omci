@@ -306,7 +306,7 @@ func enhancedVLANRow(control, direction byte, key uint16, treatment byte) []byte
 	row := make([]byte, enhancedExtendedVLANRowSize)
 	row[0] = control<<6 | direction<<4
 	binary.BigEndian.PutUint16(row[2:4], key)
-	row[len(row)-1] = treatment
+	row[19] = treatment
 	return row
 }
 

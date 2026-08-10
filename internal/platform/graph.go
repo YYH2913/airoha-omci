@@ -8,6 +8,7 @@ import (
 
 	me "github.com/opencord/omci-lib-go/v2/generated"
 	"github.com/xg2010g/airoha-omci/internal/mib"
+	"github.com/xg2010g/airoha-omci/internal/vlan"
 )
 
 const nullPointer = 0xffff
@@ -24,18 +25,20 @@ var mapperPBitAttributes = [...]string{
 }
 
 type ServiceGraph struct {
-	UNIs          []EthernetUNI     `json:"unis"`
-	TCONTs        []TCONT           `json:"tconts"`
-	GEMPorts      []GEMPort         `json:"gem_ports"`
-	Interworking  []GEMInterworking `json:"gem_interworking"`
-	Mappers       []PBitMapper      `json:"pbit_mappers"`
-	Bridges       []MACBridge       `json:"bridges"`
-	VLANFilters   []VLANFilter      `json:"vlan_filters"`
-	ExtendedVLANs []ExtendedVLAN    `json:"extended_vlans"`
+	UNIs           []EthernetUNI     `json:"unis"`
+	TCONTs         []TCONT           `json:"tconts"`
+	GEMPorts       []GEMPort         `json:"gem_ports"`
+	Interworking   []GEMInterworking `json:"gem_interworking"`
+	Mappers        []PBitMapper      `json:"pbit_mappers"`
+	Bridges        []MACBridge       `json:"bridges"`
+	VLANFilters    []VLANFilter      `json:"vlan_filters"`
+	VLANOperations []VLANOperation   `json:"vlan_operations"`
+	ExtendedVLANs  []ExtendedVLAN    `json:"extended_vlans"`
 }
 
 type EthernetUNI struct {
 	EntityID            uint16 `json:"entity_id"`
+	Interface           string `json:"interface"`
 	AdministrativeState uint8  `json:"administrative_state"`
 	OperationalState    uint8  `json:"operational_state"`
 	Configuration       uint8  `json:"configuration"`
@@ -67,40 +70,93 @@ type GEMInterworking struct {
 }
 
 type PBitMapper struct {
-	EntityID  uint16    `json:"entity_id"`
-	TPType    uint8     `json:"tp_type"`
-	TPPointer uint16    `json:"tp_pointer"`
-	PBits     [8]uint16 `json:"pbits"`
+	EntityID            uint16    `json:"entity_id"`
+	TPType              uint8     `json:"tp_type"`
+	TPPointer           uint16    `json:"tp_pointer"`
+	PBits               [8]uint16 `json:"pbits"`
+	UnmarkedFrameOption uint8     `json:"unmarked_frame_option"`
+	DefaultPBit         uint8     `json:"default_pbit"`
+	DSCPToPBit          [64]uint8 `json:"dscp_to_pbit"`
 }
 
 type MACBridge struct {
-	EntityID uint16          `json:"entity_id"`
-	Ports    []MACBridgePort `json:"ports"`
+	EntityID                uint16          `json:"entity_id"`
+	SpanningTree            uint8           `json:"spanning_tree"`
+	Learning                uint8           `json:"learning"`
+	PortBridging            uint8           `json:"port_bridging"`
+	Priority                uint16          `json:"priority"`
+	MaxAge                  uint16          `json:"max_age_256ths"`
+	HelloTime               uint16          `json:"hello_time_256ths"`
+	ForwardDelay            uint16          `json:"forward_delay_256ths"`
+	UnknownMACDiscard       uint8           `json:"unknown_mac_discard"`
+	MACLearningDepth        uint8           `json:"mac_learning_depth"`
+	DynamicFilteringAgeTime uint32          `json:"dynamic_filtering_age_time_seconds"`
+	Ports                   []MACBridgePort `json:"ports"`
 }
 
 type MACBridgePort struct {
-	EntityID uint16 `json:"entity_id"`
-	Port     uint8  `json:"port"`
-	TPType   uint8  `json:"tp_type"`
-	TP       uint16 `json:"tp"`
+	EntityID         uint16 `json:"entity_id"`
+	Port             uint8  `json:"port"`
+	TPType           uint8  `json:"tp_type"`
+	TP               uint16 `json:"tp"`
+	Priority         uint16 `json:"priority"`
+	PathCost         uint16 `json:"path_cost"`
+	SpanningTree     uint8  `json:"spanning_tree"`
+	OutboundTD       uint16 `json:"outbound_td"`
+	InboundTD        uint16 `json:"inbound_td"`
+	MACLearningDepth uint8  `json:"mac_learning_depth"`
 }
 
 type VLANFilter struct {
-	EntityID         uint16   `json:"entity_id"`
-	BridgePort       uint16   `json:"bridge_port"`
-	ForwardOperation uint8    `json:"forward_operation"`
-	Entries          []uint16 `json:"entries"`
+	EntityID         uint16              `json:"entity_id"`
+	BridgePort       uint16              `json:"bridge_port"`
+	ForwardOperation uint8               `json:"forward_operation"`
+	TaggedAction     VLANFilterAction    `json:"tagged_action"`
+	TaggedCriterion  VLANFilterCriterion `json:"tagged_criterion"`
+	UntaggedAction   VLANFilterAction    `json:"untagged_action"`
+	Entries          []uint16            `json:"entries"`
 }
 
+type VLANFilterAction string
+
+const (
+	VLANFilterActionBridge     VLANFilterAction = "a"
+	VLANFilterActionDiscard    VLANFilterAction = "c"
+	VLANFilterActionNegative   VLANFilterAction = "g"
+	VLANFilterActionPositive   VLANFilterAction = "h"
+	VLANFilterActionPositiveDA VLANFilterAction = "j"
+)
+
+type VLANFilterCriterion string
+
+const (
+	VLANFilterCriterionNone     VLANFilterCriterion = "none"
+	VLANFilterCriterionVID      VLANFilterCriterion = "vid"
+	VLANFilterCriterionPriority VLANFilterCriterion = "priority"
+	VLANFilterCriterionTCI      VLANFilterCriterion = "tci"
+)
+
 type ExtendedVLAN struct {
-	EntityID        uint16       `json:"entity_id"`
-	AssociationType uint8        `json:"association_type"`
-	AssociatedME    uint16       `json:"associated_me"`
-	InputTPID       uint16       `json:"input_tpid"`
-	OutputTPID      uint16       `json:"output_tpid"`
-	DownstreamMode  uint8        `json:"downstream_mode"`
-	EnhancedMode    uint8        `json:"enhanced_mode"`
-	Rules           me.TableRows `json:"rules"`
+	EntityID        uint16      `json:"entity_id"`
+	AssociationType uint8       `json:"association_type"`
+	AssociatedClass me.ClassID  `json:"associated_class"`
+	AssociatedME    uint16      `json:"associated_me"`
+	InputTPID       uint16      `json:"input_tpid"`
+	OutputTPID      uint16      `json:"output_tpid"`
+	DownstreamMode  uint8       `json:"downstream_mode"`
+	EnhancedMode    uint8       `json:"enhanced_mode"`
+	DSCPToPBit      [64]uint8   `json:"dscp_to_pbit"`
+	Rules           []vlan.Rule `json:"rules"`
+}
+
+type VLANOperation struct {
+	EntityID        uint16     `json:"entity_id"`
+	AssociationType uint8      `json:"association_type"`
+	AssociatedClass me.ClassID `json:"associated_class"`
+	AssociatedME    uint16     `json:"associated_me"`
+	UpstreamMode    uint8      `json:"upstream_mode"`
+	UpstreamTCI     uint16     `json:"upstream_tci"`
+	DownstreamMode  uint8      `json:"downstream_mode"`
 }
 
 // ValidateServiceGraph rejects mutations that would leave hardware-facing
@@ -146,6 +202,10 @@ func BuildServiceGraph(snapshot []mib.Instance) (ServiceGraph, error) {
 	for _, instance := range snapshot {
 		switch instance.ClassID {
 		case me.PhysicalPathTerminationPointEthernetUniClassID:
+			interfaceName, err := ethernetUNIInterface(instance.EntityID)
+			if err != nil {
+				return ServiceGraph{}, err
+			}
 			administrative, err := uint8AttributeDefault(instance,
 				me.PhysicalPathTerminationPointEthernetUni_AdministrativeState, 0)
 			if err != nil {
@@ -161,8 +221,9 @@ func BuildServiceGraph(snapshot []mib.Instance) (ServiceGraph, error) {
 			if err != nil {
 				return ServiceGraph{}, err
 			}
-			uni := EthernetUNI{EntityID: instance.EntityID, AdministrativeState: administrative,
-				OperationalState: operational, Configuration: configuration}
+			uni := EthernetUNI{EntityID: instance.EntityID, Interface: interfaceName,
+				AdministrativeState: administrative, OperationalState: operational,
+				Configuration: configuration}
 			unis[instance.EntityID] = uni
 			graph.UNIs = append(graph.UNIs, uni)
 
@@ -185,7 +246,10 @@ func BuildServiceGraph(snapshot []mib.Instance) (ServiceGraph, error) {
 			graph.TCONTs = append(graph.TCONTs, tcont)
 
 		case me.MacBridgeServiceProfileClassID:
-			bridge := &MACBridge{EntityID: instance.EntityID}
+			bridge, err := buildMACBridge(instance)
+			if err != nil {
+				return ServiceGraph{}, err
+			}
 			bridges[instance.EntityID] = bridge
 
 		case me.Ieee8021PMapperServiceProfileClassID:
@@ -314,12 +378,15 @@ func BuildServiceGraph(snapshot []mib.Instance) (ServiceGraph, error) {
 		if err := validateBridgePortTP(instance.EntityID, bridgeID, tpType, tp, instances, gemInterworking); err != nil {
 			return ServiceGraph{}, err
 		}
-		port := MACBridgePort{EntityID: instance.EntityID, Port: portNumber, TPType: tpType, TP: tp}
+		port, err := buildMACBridgePort(instance, portNumber, tpType, tp)
+		if err != nil {
+			return ServiceGraph{}, err
+		}
 		bridge.Ports = append(bridge.Ports, port)
 		bridgePorts[instance.EntityID] = port
 	}
 
-	associations := make(map[[2]uint16]uint16)
+	associations := make(map[mib.Key]uint16)
 	for _, instance := range snapshot {
 		switch instance.ClassID {
 		case me.VlanTaggingFilterDataClassID:
@@ -329,15 +396,28 @@ func BuildServiceGraph(snapshot []mib.Instance) (ServiceGraph, error) {
 			}
 			graph.VLANFilters = append(graph.VLANFilters, filter)
 
+		case me.VlanTaggingOperationConfigurationDataClassID:
+			operation, err := buildVLANOperation(instance, instances)
+			if err != nil {
+				return ServiceGraph{}, err
+			}
+			association := mib.Key{ClassID: operation.AssociatedClass, EntityID: operation.AssociatedME}
+			if previous, duplicate := associations[association]; duplicate {
+				return ServiceGraph{}, fmt.Errorf("VLAN operation MEs %#x and %#x share target %d/%#x",
+					previous, operation.EntityID, association.ClassID, association.EntityID)
+			}
+			associations[association] = operation.EntityID
+			graph.VLANOperations = append(graph.VLANOperations, operation)
+
 		case me.ExtendedVlanTaggingOperationConfigurationDataClassID:
 			extended, err := buildExtendedVLAN(instance, instances)
 			if err != nil {
 				return ServiceGraph{}, err
 			}
-			association := [2]uint16{uint16(extended.AssociationType), extended.AssociatedME}
+			association := mib.Key{ClassID: extended.AssociatedClass, EntityID: extended.AssociatedME}
 			if previous, duplicate := associations[association]; duplicate {
-				return ServiceGraph{}, fmt.Errorf("extended VLAN MEs %#x and %#x share association type %d target %#x",
-					previous, extended.EntityID, extended.AssociationType, extended.AssociatedME)
+				return ServiceGraph{}, fmt.Errorf("VLAN operation MEs %#x and %#x share target %d/%#x",
+					previous, extended.EntityID, association.ClassID, association.EntityID)
 			}
 			associations[association] = extended.EntityID
 			graph.ExtendedVLANs = append(graph.ExtendedVLANs, extended)
@@ -350,6 +430,203 @@ func BuildServiceGraph(snapshot []mib.Instance) (ServiceGraph, error) {
 	}
 	sortServiceGraph(&graph)
 	return graph, nil
+}
+
+func buildVLANOperation(instance mib.Instance, instances map[mib.Key]mib.Instance) (VLANOperation, error) {
+	upstreamMode, err := uint8Attribute(instance,
+		me.VlanTaggingOperationConfigurationData_UpstreamVlanTaggingOperationMode)
+	if err != nil {
+		return VLANOperation{}, err
+	}
+	if upstreamMode > 2 {
+		return VLANOperation{}, fmt.Errorf("VLAN operation ME %#x has invalid upstream mode %d",
+			instance.EntityID, upstreamMode)
+	}
+	tci, err := uint16Attribute(instance, me.VlanTaggingOperationConfigurationData_UpstreamVlanTagTciValue)
+	if err != nil {
+		return VLANOperation{}, err
+	}
+	if upstreamMode != 0 && tci&0x0fff == 0x0fff {
+		return VLANOperation{}, fmt.Errorf("VLAN operation ME %#x uses reserved upstream VID 4095",
+			instance.EntityID)
+	}
+	downstreamMode, err := uint8Attribute(instance,
+		me.VlanTaggingOperationConfigurationData_DownstreamVlanTaggingOperationMode)
+	if err != nil {
+		return VLANOperation{}, err
+	}
+	if downstreamMode > 1 {
+		return VLANOperation{}, fmt.Errorf("VLAN operation ME %#x has invalid downstream mode %d",
+			instance.EntityID, downstreamMode)
+	}
+	associationType, err := uint8AttributeDefault(instance,
+		me.VlanTaggingOperationConfigurationData_AssociationType, 0)
+	if err != nil {
+		return VLANOperation{}, err
+	}
+	pointer := instance.EntityID
+	if associationType != 0 {
+		pointer, err = uint16Attribute(instance,
+			me.VlanTaggingOperationConfigurationData_AssociatedMePointer)
+		if err != nil {
+			return VLANOperation{}, err
+		}
+	}
+	var targetClass me.ClassID
+	switch associationType {
+	case 0, 10:
+		targetClass = me.PhysicalPathTerminationPointEthernetUniClassID
+	case 2:
+		targetClass = me.Ieee8021PMapperServiceProfileClassID
+	case 3:
+		targetClass = me.MacBridgePortConfigurationDataClassID
+	case 5:
+		targetClass = me.GemInterworkingTerminationPointClassID
+	default:
+		return VLANOperation{}, fmt.Errorf("VLAN operation ME %#x uses unsupported association type %d",
+			instance.EntityID, associationType)
+	}
+	if !hasInstance(instances, targetClass, pointer) {
+		return VLANOperation{}, fmt.Errorf("VLAN operation ME %#x association type %d references missing class %d/%#x",
+			instance.EntityID, associationType, targetClass, pointer)
+	}
+	return VLANOperation{EntityID: instance.EntityID, AssociationType: associationType,
+		AssociatedClass: targetClass, AssociatedME: pointer, UpstreamMode: upstreamMode,
+		UpstreamTCI: tci, DownstreamMode: downstreamMode}, nil
+}
+
+func buildMACBridge(instance mib.Instance) (*MACBridge, error) {
+	bridge := &MACBridge{EntityID: instance.EntityID}
+	var err error
+	bridge.SpanningTree, err = booleanAttributeDefault(instance,
+		me.MacBridgeServiceProfile_SpanningTreeInd, 0)
+	if err != nil {
+		return nil, err
+	}
+	bridge.Learning, err = booleanAttributeDefault(instance,
+		me.MacBridgeServiceProfile_LearningInd, 0)
+	if err != nil {
+		return nil, err
+	}
+	bridge.PortBridging, err = booleanAttributeDefault(instance,
+		me.MacBridgeServiceProfile_PortBridgingInd, 0)
+	if err != nil {
+		return nil, err
+	}
+	bridge.Priority, err = uint16AttributeDefault(instance, me.MacBridgeServiceProfile_Priority, 0)
+	if err != nil {
+		return nil, err
+	}
+	bridge.MaxAge, err = uint16AttributeDefault(instance, me.MacBridgeServiceProfile_MaxAge, 0x0600)
+	if err != nil {
+		return nil, err
+	}
+	if bridge.MaxAge < 0x0600 || bridge.MaxAge > 0x2800 {
+		return nil, fmt.Errorf("MAC bridge %#x max age %#x is outside 6..40 seconds",
+			instance.EntityID, bridge.MaxAge)
+	}
+	bridge.HelloTime, err = uint16AttributeDefault(instance, me.MacBridgeServiceProfile_HelloTime, 0x0100)
+	if err != nil {
+		return nil, err
+	}
+	if bridge.HelloTime < 0x0100 || bridge.HelloTime > 0x0a00 {
+		return nil, fmt.Errorf("MAC bridge %#x hello time %#x is outside 1..10 seconds",
+			instance.EntityID, bridge.HelloTime)
+	}
+	bridge.ForwardDelay, err = uint16AttributeDefault(instance,
+		me.MacBridgeServiceProfile_ForwardDelay, 0x0400)
+	if err != nil {
+		return nil, err
+	}
+	if bridge.ForwardDelay < 0x0400 || bridge.ForwardDelay > 0x1e00 {
+		return nil, fmt.Errorf("MAC bridge %#x forward delay %#x is outside 4..30 seconds",
+			instance.EntityID, bridge.ForwardDelay)
+	}
+	bridge.UnknownMACDiscard, err = booleanAttributeDefault(instance,
+		me.MacBridgeServiceProfile_UnknownMacAddressDiscard, 0)
+	if err != nil {
+		return nil, err
+	}
+	bridge.MACLearningDepth, err = uint8AttributeDefault(instance,
+		me.MacBridgeServiceProfile_MacLearningDepth, 0)
+	if err != nil {
+		return nil, err
+	}
+	bridge.DynamicFilteringAgeTime, err = uint32AttributeDefault(instance,
+		me.MacBridgeServiceProfile_DynamicFilteringAgeingTime, 300)
+	if err != nil {
+		return nil, err
+	}
+	if bridge.DynamicFilteringAgeTime != 0 &&
+		(bridge.DynamicFilteringAgeTime < 10 || bridge.DynamicFilteringAgeTime > 1000000) {
+		return nil, fmt.Errorf("MAC bridge %#x dynamic filtering age %d is outside 10..1000000 seconds",
+			instance.EntityID, bridge.DynamicFilteringAgeTime)
+	}
+	return bridge, nil
+}
+
+func buildMACBridgePort(instance mib.Instance, portNumber, tpType uint8, tp uint16) (MACBridgePort, error) {
+	port := MACBridgePort{EntityID: instance.EntityID, Port: portNumber, TPType: tpType, TP: tp}
+	var err error
+	port.Priority, err = uint16AttributeDefault(instance, me.MacBridgePortConfigurationData_PortPriority, 0)
+	if err != nil {
+		return MACBridgePort{}, err
+	}
+	port.PathCost, err = uint16AttributeDefault(instance, me.MacBridgePortConfigurationData_PortPathCost, 1)
+	if err != nil {
+		return MACBridgePort{}, err
+	}
+	if port.PathCost == 0 {
+		return MACBridgePort{}, fmt.Errorf("MAC bridge port %#x has zero path cost", instance.EntityID)
+	}
+	port.SpanningTree, err = booleanAttributeDefault(instance,
+		me.MacBridgePortConfigurationData_PortSpanningTreeInd, 0)
+	if err != nil {
+		return MACBridgePort{}, err
+	}
+	port.OutboundTD, err = uint16AttributeDefault(instance,
+		me.MacBridgePortConfigurationData_OutboundTdPointer, nullPointer)
+	if err != nil {
+		return MACBridgePort{}, err
+	}
+	port.InboundTD, err = uint16AttributeDefault(instance,
+		me.MacBridgePortConfigurationData_InboundTdPointer, nullPointer)
+	if err != nil {
+		return MACBridgePort{}, err
+	}
+	port.MACLearningDepth, err = uint8AttributeDefault(instance,
+		me.MacBridgePortConfigurationData_MacLearningDepth, 0)
+	if err != nil {
+		return MACBridgePort{}, err
+	}
+	return port, nil
+}
+
+func booleanAttributeDefault(instance mib.Instance, name string, fallback uint8) (uint8, error) {
+	value, err := uint8AttributeDefault(instance, name, fallback)
+	if err != nil {
+		return 0, err
+	}
+	if value > 1 {
+		return 0, fmt.Errorf("managed entity %d/%#x attribute %s is not boolean: %d",
+			instance.ClassID, instance.EntityID, name, value)
+	}
+	return value, nil
+}
+
+func ethernetUNIInterface(entityID uint16) (string, error) {
+	switch entityID {
+	case 0x0101:
+		return "lan1", nil
+	case 0x0102:
+		return "lan2", nil
+	case 0x0103:
+		return "lan3", nil
+	case 0x0104:
+		return "lan4", nil
+	default:
+		return "", fmt.Errorf("Ethernet UNI %#x has no XG2010G interface mapping", entityID)
+	}
 }
 
 func buildMapper(instance mib.Instance) (PBitMapper, error) {
@@ -368,6 +645,35 @@ func buildMapper(instance mib.Instance) (PBitMapper, error) {
 		if err != nil {
 			return PBitMapper{}, err
 		}
+	}
+	mapper.UnmarkedFrameOption, err = uint8AttributeDefault(instance,
+		me.Ieee8021PMapperServiceProfile_UnmarkedFrameOption, 0)
+	if err != nil {
+		return PBitMapper{}, err
+	}
+	if mapper.UnmarkedFrameOption > 1 {
+		return PBitMapper{}, fmt.Errorf("802.1p mapper %#x has invalid unmarked frame option %d",
+			instance.EntityID, mapper.UnmarkedFrameOption)
+	}
+	mapper.DefaultPBit, err = uint8AttributeDefault(instance,
+		me.Ieee8021PMapperServiceProfile_DefaultPBitAssumption, 0)
+	if err != nil {
+		return PBitMapper{}, err
+	}
+	if mapper.DefaultPBit > 7 {
+		return PBitMapper{}, fmt.Errorf("802.1p mapper %#x has invalid default P-bit %d",
+			instance.EntityID, mapper.DefaultPBit)
+	}
+	dscpBytes := make([]byte, 24)
+	if _, present := instance.Attributes[me.Ieee8021PMapperServiceProfile_DscpToPBitMapping]; present {
+		dscpBytes, err = bytesAttribute(instance, me.Ieee8021PMapperServiceProfile_DscpToPBitMapping, 24)
+		if err != nil {
+			return PBitMapper{}, err
+		}
+	}
+	mapper.DSCPToPBit, err = vlan.DecodeDSCPMapping(dscpBytes)
+	if err != nil {
+		return PBitMapper{}, err
 	}
 	return mapper, nil
 }
@@ -529,8 +835,52 @@ func buildVLANFilter(instance mib.Instance, bridgePorts map[uint16]MACBridgePort
 	if err != nil {
 		return VLANFilter{}, err
 	}
+	taggedAction, criterion, untaggedAction, err := decodeVLANForwardOperation(operation)
+	if err != nil {
+		return VLANFilter{}, fmt.Errorf("VLAN filter %#x: %w", instance.EntityID, err)
+	}
 	return VLANFilter{EntityID: instance.EntityID, BridgePort: instance.EntityID,
-		ForwardOperation: operation, Entries: entries}, nil
+		ForwardOperation: operation, TaggedAction: taggedAction, TaggedCriterion: criterion,
+		UntaggedAction: untaggedAction, Entries: entries}, nil
+}
+
+func decodeVLANForwardOperation(operation uint8) (VLANFilterAction, VLANFilterCriterion,
+	VLANFilterAction, error) {
+	untagged := VLANFilterActionBridge
+	if operation == 0x02 || operation == 0x04 || operation == 0x06 || operation == 0x08 ||
+		operation == 0x0a || operation == 0x0c || operation == 0x0e || operation == 0x10 ||
+		operation == 0x12 || operation == 0x14 || operation == 0x15 || operation == 0x17 ||
+		operation == 0x19 || operation == 0x1b || operation == 0x1d || operation == 0x1f ||
+		operation == 0x21 {
+		untagged = VLANFilterActionDiscard
+	}
+
+	switch operation {
+	case 0x00, 0x02, 0x15:
+		return VLANFilterActionBridge, VLANFilterCriterionNone, untagged, nil
+	case 0x01:
+		return VLANFilterActionDiscard, VLANFilterCriterionNone, untagged, nil
+	case 0x03, 0x04, 0x0f, 0x10, 0x1c, 0x1d:
+		return VLANFilterActionPositive, VLANFilterCriterionVID, untagged, nil
+	case 0x05, 0x06:
+		return VLANFilterActionNegative, VLANFilterCriterionVID, untagged, nil
+	case 0x07, 0x08, 0x11, 0x12, 0x1e, 0x1f:
+		return VLANFilterActionPositive, VLANFilterCriterionPriority, untagged, nil
+	case 0x09, 0x0a:
+		return VLANFilterActionNegative, VLANFilterCriterionPriority, untagged, nil
+	case 0x0b, 0x0c, 0x13, 0x14, 0x20, 0x21:
+		return VLANFilterActionPositive, VLANFilterCriterionTCI, untagged, nil
+	case 0x0d, 0x0e:
+		return VLANFilterActionNegative, VLANFilterCriterionTCI, untagged, nil
+	case 0x16, 0x17:
+		return VLANFilterActionPositiveDA, VLANFilterCriterionVID, untagged, nil
+	case 0x18, 0x19:
+		return VLANFilterActionPositiveDA, VLANFilterCriterionPriority, untagged, nil
+	case 0x1a, 0x1b:
+		return VLANFilterActionPositiveDA, VLANFilterCriterionTCI, untagged, nil
+	default:
+		return "", "", "", fmt.Errorf("forward operation %#02x is reserved", operation)
+	}
 }
 
 func buildExtendedVLAN(instance mib.Instance, instances map[mib.Key]mib.Instance) (ExtendedVLAN, error) {
@@ -585,10 +935,10 @@ func buildExtendedVLAN(instance mib.Instance, instances map[mib.Key]mib.Instance
 		return ExtendedVLAN{}, fmt.Errorf("extended VLAN ME %#x has invalid enhanced mode %d", instance.EntityID, enhanced)
 	}
 	name := me.ExtendedVlanTaggingOperationConfigurationData_ReceivedFrameVlanTaggingOperationTable
-	rowSize := 16
+	rowSize := vlan.ClassicRowSize
 	if enhanced == 1 {
 		name = me.ExtendedVlanTaggingOperationConfigurationData_EnhancedReceivedFrameClassificationAndProcessingTable
-		rowSize = 28
+		rowSize = vlan.EnhancedRowSize
 	}
 	rules, err := tableAttributeDefault(instance, name, rowSize)
 	if err != nil {
@@ -603,9 +953,26 @@ func buildExtendedVLAN(instance mib.Instance, instances map[mib.Key]mib.Instance
 		return ExtendedVLAN{}, fmt.Errorf("extended VLAN ME %#x has %d rules, maximum is %d",
 			instance.EntityID, rules.NumRows, maximum)
 	}
+	parsedRules, err := vlan.ParseRows(rules.Rows, enhanced == 1)
+	if err != nil {
+		return ExtendedVLAN{}, fmt.Errorf("extended VLAN ME %#x: %w", instance.EntityID, err)
+	}
+	dscpBytes := make([]byte, 24)
+	if _, present := instance.Attributes[me.ExtendedVlanTaggingOperationConfigurationData_DscpToPBitMapping]; present {
+		dscpBytes, err = bytesAttribute(instance,
+			me.ExtendedVlanTaggingOperationConfigurationData_DscpToPBitMapping, 24)
+		if err != nil {
+			return ExtendedVLAN{}, err
+		}
+	}
+	dscpMapping, err := vlan.DecodeDSCPMapping(dscpBytes)
+	if err != nil {
+		return ExtendedVLAN{}, err
+	}
 	return ExtendedVLAN{EntityID: instance.EntityID, AssociationType: associationType,
-		AssociatedME: pointer, InputTPID: inputTPID, OutputTPID: outputTPID,
-		DownstreamMode: downstream, EnhancedMode: enhanced, Rules: rules}, nil
+		AssociatedClass: targetClass, AssociatedME: pointer, InputTPID: inputTPID, OutputTPID: outputTPID,
+		DownstreamMode: downstream, EnhancedMode: enhanced, DSCPToPBit: dscpMapping,
+		Rules: parsedRules}, nil
 }
 
 func validateUpstreamTrafficPointer(instances map[mib.Key]mib.Instance, gem, tcont,
@@ -640,6 +1007,7 @@ func sortServiceGraph(graph *ServiceGraph) {
 	sort.Slice(graph.Mappers, func(i, j int) bool { return graph.Mappers[i].EntityID < graph.Mappers[j].EntityID })
 	sort.Slice(graph.Bridges, func(i, j int) bool { return graph.Bridges[i].EntityID < graph.Bridges[j].EntityID })
 	sort.Slice(graph.VLANFilters, func(i, j int) bool { return graph.VLANFilters[i].EntityID < graph.VLANFilters[j].EntityID })
+	sort.Slice(graph.VLANOperations, func(i, j int) bool { return graph.VLANOperations[i].EntityID < graph.VLANOperations[j].EntityID })
 	sort.Slice(graph.ExtendedVLANs, func(i, j int) bool { return graph.ExtendedVLANs[i].EntityID < graph.ExtendedVLANs[j].EntityID })
 }
 
@@ -699,6 +1067,13 @@ func uint32Attribute(instance mib.Instance, name string) (uint32, error) {
 			instance.ClassID, instance.EntityID, name, value)
 	}
 	return typed, nil
+}
+
+func uint32AttributeDefault(instance mib.Instance, name string, fallback uint32) (uint32, error) {
+	if _, present := instance.Attributes[name]; !present {
+		return fallback, nil
+	}
+	return uint32Attribute(instance, name)
 }
 
 func bytesAttribute(instance mib.Instance, name string, size int) ([]byte, error) {
