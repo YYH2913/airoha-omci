@@ -80,9 +80,13 @@ unknown-MAC, timer and learning-depth policy. Each bridge port carries its
 termination type and pointer, priority, path cost, spanning-tree state,
 traffic-descriptor pointers and learning depth. A platform may reject a graph
 that cannot be represented without loss, but it must do so before changing
-hardware state. The XG2010G backend currently accepts one active bridge profile
-with one ANI logical port and one or more Ethernet UNIs. It never removes an
-interface from a non-OMCI Linux bridge implicitly.
+hardware state. The XG2010G backend accepts multiple active bridge profiles,
+each with one ANI logical port and one or more Ethernet UNIs. It materializes a
+profile-specific veth ANI endpoint and dispatches that endpoint's downstream
+traffic by the GEM mark supplied by the PON driver. The physical `pon` remains
+outside the per-profile Linux bridges. A UNI may belong to only one active
+profile, and the backend never removes an interface from a non-OMCI Linux
+bridge implicitly.
 
 XG2010G Ethernet PPTP UNI instances carry a fixed, validated Linux interface
 name in the graph. The mapping is `0x0101` to `lan1`, `0x0102` to `lan2`,

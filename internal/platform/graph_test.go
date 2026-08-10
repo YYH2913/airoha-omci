@@ -79,6 +79,61 @@ func TestBuildServiceGraphResolvesCompleteEthernetService(t *testing.T) {
 	}
 }
 
+func TestBuildServiceGraphAllowsMultipleBridgeProfiles(t *testing.T) {
+	const (
+		secondUNI        = 0x0102
+		secondBridge     = 0x0101
+		secondBridgeIW   = 0x0302
+		secondBridgeGEM  = 0x0402
+		secondUNIPort    = 0x0503
+		secondBridgePort = 0x0504
+	)
+	snapshot := validServiceSnapshot()
+	snapshot = append(snapshot,
+		mib.Instance{
+			Key: mib.Key{ClassID: me.PhysicalPathTerminationPointEthernetUniClassID, EntityID: secondUNI},
+			Attributes: me.AttributeValueMap{
+				me.PhysicalPathTerminationPointEthernetUni_AdministrativeState: uint8(0),
+				me.PhysicalPathTerminationPointEthernetUni_OperationalState:    uint8(0),
+				me.PhysicalPathTerminationPointEthernetUni_ConfigurationInd:    uint8(4),
+			},
+		},
+		mib.Instance{
+			Key: mib.Key{ClassID: me.MacBridgeServiceProfileClassID, EntityID: secondBridge},
+			Attributes: me.AttributeValueMap{
+				me.MacBridgeServiceProfile_SpanningTreeInd:          uint8(0),
+				me.MacBridgeServiceProfile_LearningInd:              uint8(1),
+				me.MacBridgeServiceProfile_PortBridgingInd:          uint8(0),
+				me.MacBridgeServiceProfile_Priority:                 uint16(0x8000),
+				me.MacBridgeServiceProfile_MaxAge:                   uint16(20 * 256),
+				me.MacBridgeServiceProfile_HelloTime:                uint16(2 * 256),
+				me.MacBridgeServiceProfile_ForwardDelay:             uint16(15 * 256),
+				me.MacBridgeServiceProfile_UnknownMacAddressDiscard: uint8(0),
+			},
+		},
+		gemPortInstance(secondBridgeGEM, 202),
+		gemIWInstance(secondBridgeIW, secondBridgeGEM, 1, secondBridge),
+	)
+	uniPort := bridgePortInstance(secondUNIPort, 1, 1, secondUNI)
+	uniPort.Attributes[me.MacBridgePortConfigurationData_BridgeIdPointer] = uint16(secondBridge)
+	aniPort := bridgePortInstance(secondBridgePort, 2, 5, secondBridgeIW)
+	aniPort.Attributes[me.MacBridgePortConfigurationData_BridgeIdPointer] = uint16(secondBridge)
+	snapshot = append(snapshot, uniPort, aniPort)
+
+	graph, err := BuildServiceGraph(snapshot)
+	if err != nil {
+		t.Fatalf("BuildServiceGraph() error = %v", err)
+	}
+	if len(graph.Bridges) != 2 || graph.Bridges[0].EntityID != testBridge ||
+		graph.Bridges[1].EntityID != secondBridge || len(graph.Bridges[1].Ports) != 2 {
+		t.Fatalf("multi-profile bridges = %#v", graph.Bridges)
+	}
+	if len(graph.UNIs) != 2 || graph.UNIs[1].EntityID != secondUNI ||
+		len(graph.GEMPorts) != 3 || len(graph.Interworking) != 3 {
+		t.Fatalf("multi-profile service graph = %#v", graph)
+	}
+}
+
 func TestBuildServiceGraphRejectsUnknownXG2010GUNI(t *testing.T) {
 	snapshot := []mib.Instance{{
 		Key: mib.Key{ClassID: me.PhysicalPathTerminationPointEthernetUniClassID, EntityID: 0x0201},
