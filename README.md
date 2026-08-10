@@ -19,8 +19,9 @@ transactional MIB, baseline table transfer and core MIB audit operations are
 implemented. Driver-originated alarm/AVC events have a validated upstream
 notification path. Software download, CRC-32A and ImageHash validation,
 activation and commit are implemented through a fixed platform helper ABI.
-It is not yet ready for operator deployment because multi-GEM, complete
-alarm/ARC coverage and real OLT interoperability are incomplete; see
+ANI-G optical alarms and ARC are implemented, but the daemon is not yet ready
+for operator deployment because multi-GEM, the complete Ethernet service graph
+and real OLT interoperability are incomplete; see
 [the implementation matrix](docs/implementation.md).
 
 ## Platform boundary

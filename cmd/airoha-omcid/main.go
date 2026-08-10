@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	omci "github.com/opencord/omci-lib-go/v2"
 	"github.com/xg2010g/airoha-omci/internal/engine"
 	platformevent "github.com/xg2010g/airoha-omci/internal/event"
 	"github.com/xg2010g/airoha-omci/internal/mib"
@@ -120,6 +121,19 @@ func run(opts options) error {
 	if err := statusWriter.Write(state); err != nil {
 		return err
 	}
+	sendNotifications := func(frames [][]byte) error {
+		for _, frame := range frames {
+			if err := conn.WriteFrame(ctx, frame); err != nil {
+				return err
+			}
+			state.TXFrames++
+			state.NotificationFrames++
+			if len(frame) >= 3 {
+				state.LastNotificationType = frame[2]
+			}
+		}
+		return nil
+	}
 
 	type receiveResult struct {
 		frame []byte
@@ -158,6 +172,8 @@ func run(opts options) error {
 			eventSourceErrors <- err
 		}()
 	}
+	arcTicker := time.NewTicker(time.Second)
+	defer arcTicker.Stop()
 
 	for {
 		select {
@@ -186,18 +202,11 @@ func run(opts options) error {
 				log.Printf("OMCI platform event rejected: %v", err)
 				continue
 			}
-			for _, frame := range frames {
-				if err := conn.WriteFrame(ctx, frame); err != nil {
-					state.TransportErrors++
-					state.LastError = err.Error()
-					_ = statusWriter.Write(state)
-					return err
-				}
-				state.TXFrames++
-				state.NotificationFrames++
-				if len(frame) >= 3 {
-					state.LastNotificationType = frame[2]
-				}
+			if err := sendNotifications(frames); err != nil {
+				state.TransportErrors++
+				state.LastError = err.Error()
+				_ = statusWriter.Write(state)
+				return err
 			}
 			state.MIBDataSync = store.DataSync()
 			state.MIBEntries = len(store.Snapshot())
@@ -205,6 +214,29 @@ func run(opts options) error {
 			state.LastError = ""
 			if err := statusWriter.Write(state); err != nil {
 				log.Printf("publish status: %v", err)
+			}
+
+		case <-arcTicker.C:
+			frames, err := protocol.PollARC(omci.BaselineIdent)
+			if err != nil {
+				state.EventErrors++
+				state.LastError = err.Error()
+				_ = statusWriter.Write(state)
+				log.Printf("OMCI ARC timer rejected: %v", err)
+				continue
+			}
+			if err := sendNotifications(frames); err != nil {
+				state.TransportErrors++
+				state.LastError = err.Error()
+				_ = statusWriter.Write(state)
+				return err
+			}
+			if len(frames) != 0 {
+				state.MIBDataSync = store.DataSync()
+				state.LastError = ""
+				if err := statusWriter.Write(state); err != nil {
+					log.Printf("publish status: %v", err)
+				}
 			}
 
 		case result := <-received:
@@ -246,23 +278,24 @@ func run(opts options) error {
 				}
 				state.TXFrames++
 			}
-			for _, notification := range protocol.DrainNotifications() {
-				if err := conn.WriteFrame(ctx, notification); err != nil {
-					state.TransportErrors++
-					state.LastError = err.Error()
-					_ = statusWriter.Write(state)
-					return err
-				}
-				state.TXFrames++
-				state.NotificationFrames++
-				if len(notification) >= 3 {
-					state.LastNotificationType = notification[2]
-				}
+			if err := sendNotifications(protocol.DrainNotifications()); err != nil {
+				state.TransportErrors++
+				state.LastError = err.Error()
+				_ = statusWriter.Write(state)
+				return err
+			}
+			notificationErr := protocol.DrainNotificationError()
+			if notificationErr != nil {
+				state.EventErrors++
+				state.LastError = notificationErr.Error()
+				log.Printf("OMCI derived notification failed: %v", notificationErr)
 			}
 			state.MIBDataSync = store.DataSync()
 			state.MIBEntries = len(store.Snapshot())
 			updateSoftwareStatus()
-			state.LastError = ""
+			if notificationErr == nil {
+				state.LastError = ""
+			}
 			if err := statusWriter.Write(state); err != nil {
 				log.Printf("publish status: %v", err)
 			}

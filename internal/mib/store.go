@@ -373,7 +373,85 @@ func normalize(instance Instance) (Instance, error) {
 		return Instance{}, result
 	}
 	instance.Attributes = cloneAttributes(entity.GetAttributeValueMap())
+	if err := validateSemantics(instance); err != nil {
+		return Instance{}, err
+	}
 	return instance, nil
+}
+
+func validateSemantics(instance Instance) error {
+	attributes := instance.Attributes
+	if arc, present := byteAttribute(attributes, "Arc"); present && arc > 1 {
+		return &ResultError{Result: me.AttributeFailure, FailedMask: attributeMask(instance.ClassID, "Arc"),
+			Cause: fmt.Errorf("ARC value %d is not 0 or 1", arc)}
+	}
+	if instance.ClassID != me.AniGClassID {
+		return nil
+	}
+
+	sf, sfPresent := byteAttribute(attributes, me.AniG_SignalFailThreshold)
+	sd, sdPresent := byteAttribute(attributes, me.AniG_SignalDegradeThreshold)
+	if sfPresent && (sf < 3 || sf > 8) {
+		return attributeValueError(instance.ClassID, me.AniG_SignalFailThreshold,
+			"SF threshold %d is outside 3..8", sf)
+	}
+	if sdPresent && (sd < 4 || sd > 10) {
+		return attributeValueError(instance.ClassID, me.AniG_SignalDegradeThreshold,
+			"SD threshold %d is outside 4..10", sd)
+	}
+	if sfPresent && sdPresent && sd <= sf {
+		return &ResultError{Result: me.AttributeFailure,
+			FailedMask: attributeMask(instance.ClassID, me.AniG_SignalFailThreshold) |
+				attributeMask(instance.ClassID, me.AniG_SignalDegradeThreshold),
+			Cause: fmt.Errorf("SD threshold %d must be greater than SF threshold %d", sd, sf)}
+	}
+
+	lowerRX, lowerRXPresent := byteAttribute(attributes, me.AniG_LowerOpticalThreshold)
+	upperRX, upperRXPresent := byteAttribute(attributes, me.AniG_UpperOpticalThreshold)
+	if lowerRXPresent && upperRXPresent && lowerRX != 0xff && upperRX != 0xff && lowerRX < upperRX {
+		return &ResultError{Result: me.AttributeFailure,
+			FailedMask: attributeMask(instance.ClassID, me.AniG_LowerOpticalThreshold) |
+				attributeMask(instance.ClassID, me.AniG_UpperOpticalThreshold),
+			Cause: fmt.Errorf("lower receive threshold %#x is above upper threshold %#x", lowerRX, upperRX)}
+	}
+
+	lowerTX, lowerTXPresent := byteAttribute(attributes, me.AniG_LowerTransmitPowerThreshold)
+	upperTX, upperTXPresent := byteAttribute(attributes, me.AniG_UpperTransmitPowerThreshold)
+	if lowerTXPresent && upperTXPresent && lowerTX != 0x81 && upperTX != 0x81 &&
+		int8(lowerTX) > int8(upperTX) {
+		return &ResultError{Result: me.AttributeFailure,
+			FailedMask: attributeMask(instance.ClassID, me.AniG_LowerTransmitPowerThreshold) |
+				attributeMask(instance.ClassID, me.AniG_UpperTransmitPowerThreshold),
+			Cause: fmt.Errorf("lower transmit threshold %d is above upper threshold %d",
+				int8(lowerTX), int8(upperTX))}
+	}
+	return nil
+}
+
+func byteAttribute(attributes me.AttributeValueMap, name string) (uint8, bool) {
+	value, present := attributes[name]
+	if !present {
+		return 0, false
+	}
+	byteValue, valid := value.(uint8)
+	return byteValue, valid
+}
+
+func attributeMask(classID me.ClassID, name string) uint16 {
+	definitions, omciErr := me.GetAttributesDefinitions(classID)
+	if omciErr.StatusCode() != me.Success {
+		return 0
+	}
+	definition, err := me.GetAttributeDefinitionByName(definitions, name)
+	if err != nil {
+		return 0
+	}
+	return definition.Mask
+}
+
+func attributeValueError(classID me.ClassID, name, format string, arguments ...interface{}) error {
+	return &ResultError{Result: me.AttributeFailure, FailedMask: attributeMask(classID, name),
+		Cause: fmt.Errorf(format, arguments...)}
 }
 
 func loadDefinition(classID me.ClassID, entityID uint16, attributes me.AttributeValueMap) (*me.ManagedEntity, *ResultError) {

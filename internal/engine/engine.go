@@ -53,11 +53,15 @@ type Engine struct {
 	alarms        map[mib.Key][28]byte
 	alarmUpload   map[omci.DeviceIdent][]Alarm
 	alarmSequence uint8
+	arcFreeSince  map[mib.Key]time.Time
+	opticalSample map[mib.Key]optical.Sample
+	now           func() time.Time
 	controller    Controller
 	software      software.Controller
 	download      *softwareDownload
 	softwareState SoftwareStatus
 	pending       [][]byte
+	pendingError  error
 }
 
 func New(store *mib.Store) *Engine {
@@ -76,6 +80,9 @@ func NewWithControllers(store *mib.Store, controller Controller, softwareControl
 		tables:        make(map[tableKey][]byte),
 		alarms:        make(map[mib.Key][28]byte),
 		alarmUpload:   make(map[omci.DeviceIdent][]Alarm),
+		arcFreeSince:  make(map[mib.Key]time.Time),
+		opticalSample: make(map[mib.Key]optical.Sample),
+		now:           time.Now,
 		controller:    controller,
 		software:      softwareController,
 		softwareState: SoftwareStatus{Phase: "idle"},
@@ -103,6 +110,18 @@ func (e *Engine) DrainNotifications() [][]byte {
 	frames := e.pending
 	e.pending = nil
 	return frames
+}
+
+// DrainNotificationError reports a failure that occurred while deriving an
+// autonomous notification from an already committed OLT command. The command
+// response remains successful so a retransmission cannot apply it twice.
+func (e *Engine) DrainNotificationError() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	err := e.pendingError
+	e.pendingError = nil
+	return err
 }
 
 // Handle processes one complete downstream OMCI frame and returns the upstream
@@ -208,12 +227,20 @@ func (e *Engine) dispatch(packet gopacket.Packet, header *omci.OMCI) ([]byte, er
 		if err != nil {
 			return nil, err
 		}
-		result, failed, unsupported := operationResult(e.mib.Set(mib.Key{
+		key := mib.Key{
 			ClassID:  request.EntityClass,
 			EntityID: request.EntityInstance,
-		}, request.Attributes))
+		}
+		result, failed, unsupported := operationResult(e.mib.Set(key, request.Attributes))
 		if result == me.Success {
 			e.tables = make(map[tableKey][]byte)
+			notifications, notifyErr := e.afterSetLocked(key, request.Attributes, header.DeviceIdentifier)
+			if notifyErr != nil {
+				e.pendingError = fmt.Errorf("derive notifications after Set %v/%#x: %w",
+					key.ClassID, key.EntityID, notifyErr)
+			} else {
+				e.pending = append(e.pending, notifications...)
+			}
 		}
 		return serialize(header, omci.SetResponseType, &omci.SetResponse{
 			MeBasePacket: omci.MeBasePacket{
@@ -263,6 +290,7 @@ func (e *Engine) dispatch(packet gopacket.Packet, header *omci.OMCI) ([]byte, er
 		if result == me.Success {
 			e.upload = make(map[omci.DeviceIdent][]uploadCommand)
 			e.tables = make(map[tableKey][]byte)
+			e.arcFreeSince = make(map[mib.Key]time.Time)
 		}
 		return serialize(header, omci.MibResetResponseType, &omci.MibResetResponse{
 			MeBasePacket: omci.MeBasePacket{
@@ -319,6 +347,9 @@ func (e *Engine) dispatch(packet gopacket.Packet, header *omci.OMCI) ([]byte, er
 		}
 		alarms := make([]Alarm, 0, len(e.alarms))
 		for key, bitmap := range e.alarms {
+			if request.AlarmRetrievalMode == 1 && e.arcEnabledLocked(key) {
+				continue
+			}
 			alarms = append(alarms, Alarm{Key: key, Bitmap: bitmap})
 		}
 		sort.Slice(alarms, func(i, j int) bool {
@@ -327,6 +358,7 @@ func (e *Engine) dispatch(packet gopacket.Packet, header *omci.OMCI) ([]byte, er
 			}
 			return alarms[i].Key.ClassID < alarms[j].Key.ClassID
 		})
+		e.alarmSequence = 0
 		e.alarmUpload[header.DeviceIdentifier] = alarms
 		return serialize(header, omci.GetAllAlarmsResponseType, &omci.GetAllAlarmsResponse{
 			MeBasePacket: omci.MeBasePacket{

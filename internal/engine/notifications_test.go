@@ -27,8 +27,8 @@ func TestAlarmNotificationUpdatesAuditAndSequence(t *testing.T) {
 		t.Fatal("NotifyAlarm(raise) changed = false, want true")
 	}
 	alarm := decodeResponse(t, frame).Layer(omci.LayerTypeAlarmNotification).(*omci.AlarmNotificationMsg)
-	if alarm.AlarmBitmap != raised || alarm.AlarmSequenceNumber != 0 {
-		t.Fatalf("first alarm = %#v, want raised/sequence 0", alarm)
+	if alarm.AlarmBitmap != raised || alarm.AlarmSequenceNumber != 1 {
+		t.Fatalf("first alarm = %#v, want raised/sequence 1", alarm)
 	}
 
 	if frame, changed, err = protocol.NotifyAlarm(key, raised, omci.BaselineIdent); err != nil || changed || frame != nil {
@@ -40,8 +40,8 @@ func TestAlarmNotificationUpdatesAuditAndSequence(t *testing.T) {
 		t.Fatalf("NotifyAlarm(clear) changed=%v error=%v", changed, err)
 	}
 	alarm = decodeResponse(t, frame).Layer(omci.LayerTypeAlarmNotification).(*omci.AlarmNotificationMsg)
-	if alarm.AlarmBitmap != ([28]byte{}) || alarm.AlarmSequenceNumber != 1 || !alarm.Extended {
-		t.Fatalf("clear alarm = %#v, want clear/sequence 1/extended", alarm)
+	if alarm.AlarmBitmap != ([28]byte{}) || alarm.AlarmSequenceNumber != 2 || !alarm.Extended {
+		t.Fatalf("clear alarm = %#v, want clear/sequence 2/extended", alarm)
 	}
 
 	request := encodeRequest(t, 44, omci.GetAllAlarmsRequestType, &omci.GetAllAlarmsRequest{
@@ -86,9 +86,37 @@ func TestAlarmSequenceWrapsAt255(t *testing.T) {
 	}
 	firstAlarm := decodeResponse(t, first).Layer(omci.LayerTypeAlarmNotification).(*omci.AlarmNotificationMsg)
 	secondAlarm := decodeResponse(t, second).Layer(omci.LayerTypeAlarmNotification).(*omci.AlarmNotificationMsg)
-	if firstAlarm.AlarmSequenceNumber != 255 || secondAlarm.AlarmSequenceNumber != 0 {
-		t.Fatalf("alarm sequence = %d/%d, want 255/0",
+	if firstAlarm.AlarmSequenceNumber != 1 || secondAlarm.AlarmSequenceNumber != 2 {
+		t.Fatalf("alarm sequence = %d/%d, want 1/2",
 			firstAlarm.AlarmSequenceNumber, secondAlarm.AlarmSequenceNumber)
+	}
+}
+
+func TestGetAllAlarmsResetsNotificationSequence(t *testing.T) {
+	protocol, _ := newNotificationEngine(t)
+	key := mib.Key{ClassID: me.PhysicalPathTerminationPointEthernetUniClassID, EntityID: notificationUNI}
+	var bitmap [28]byte
+	bitmap[0] = 0x80
+	first, _, err := protocol.NotifyAlarm(key, bitmap, omci.BaselineIdent)
+	if err != nil {
+		t.Fatalf("NotifyAlarm(first) error = %v", err)
+	}
+	if sequence := decodeResponse(t, first).Layer(omci.LayerTypeAlarmNotification).(*omci.AlarmNotificationMsg).AlarmSequenceNumber; sequence != 1 {
+		t.Fatalf("first sequence = %d, want 1", sequence)
+	}
+
+	request := encodeRequest(t, 45, omci.GetAllAlarmsRequestType, &omci.GetAllAlarmsRequest{
+		MeBasePacket: omci.MeBasePacket{EntityClass: me.OnuDataClassID},
+	})
+	if _, err := protocol.Handle(request); err != nil {
+		t.Fatalf("Handle(GetAllAlarms) error = %v", err)
+	}
+	clear, _, err := protocol.NotifyAlarm(key, [28]byte{}, omci.BaselineIdent)
+	if err != nil {
+		t.Fatalf("NotifyAlarm(clear) error = %v", err)
+	}
+	if sequence := decodeResponse(t, clear).Layer(omci.LayerTypeAlarmNotification).(*omci.AlarmNotificationMsg).AlarmSequenceNumber; sequence != 1 {
+		t.Fatalf("post-audit sequence = %d, want 1", sequence)
 	}
 }
 

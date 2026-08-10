@@ -265,3 +265,56 @@ func TestUnknownClassReturnsUnknownEntity(t *testing.T) {
 		t.Fatalf("Get(unknown class) error = %#v, want UnknownEntity", err)
 	}
 }
+
+func TestANIGRejectsInvalidThresholdAndARCCombinations(t *testing.T) {
+	tests := []struct {
+		name       string
+		attributes me.AttributeValueMap
+	}{
+		{name: "ARC value", attributes: me.AttributeValueMap{me.AniG_Arc: uint8(2)}},
+		{name: "SF range", attributes: me.AttributeValueMap{me.AniG_SignalFailThreshold: uint8(2)}},
+		{name: "SD not below SF BER", attributes: me.AttributeValueMap{me.AniG_SignalDegradeThreshold: uint8(5)}},
+		{name: "receive ordering", attributes: me.AttributeValueMap{me.AniG_UpperOpticalThreshold: uint8(50)}},
+		{name: "transmit ordering", attributes: me.AttributeValueMap{me.AniG_LowerTransmitPowerThreshold: uint8(20)}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := newANIGStore(t)
+			err := store.Set(Key{ClassID: me.AniGClassID, EntityID: 0x8001}, test.attributes)
+			var result *ResultError
+			if !errors.As(err, &result) || result.Result != me.AttributeFailure || result.FailedMask == 0 {
+				t.Fatalf("Set(%s) error = %#v, want masked AttributeFailure", test.name, err)
+			}
+			if store.DataSync() != 0 {
+				t.Fatalf("Set(%s) data sync = %d, want 0", test.name, store.DataSync())
+			}
+		})
+	}
+}
+
+func newANIGStore(t *testing.T) *Store {
+	t.Helper()
+	store, err := New([]Instance{
+		{
+			Key:        Key{ClassID: me.OnuDataClassID, EntityID: 0},
+			Attributes: me.AttributeValueMap{me.OnuData_MibDataSync: uint8(0)},
+		},
+		{
+			Key: Key{ClassID: me.AniGClassID, EntityID: 0x8001},
+			Attributes: me.AttributeValueMap{
+				me.AniG_SignalFailThreshold:         uint8(5),
+				me.AniG_SignalDegradeThreshold:      uint8(9),
+				me.AniG_Arc:                         uint8(0),
+				me.AniG_ArcInterval:                 uint8(0),
+				me.AniG_LowerOpticalThreshold:       uint8(40),
+				me.AniG_UpperOpticalThreshold:       uint8(0),
+				me.AniG_LowerTransmitPowerThreshold: uint8(0xec),
+				me.AniG_UpperTransmitPowerThreshold: uint8(10),
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("New(ANI-G) error = %v", err)
+	}
+	return store
+}

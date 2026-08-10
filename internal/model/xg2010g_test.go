@@ -24,8 +24,11 @@ func TestXG2010GFactoryMIB(t *testing.T) {
 	var schedulers int
 	var queues int
 	configurations := make(map[uint16]uint8)
+	var ani mib.Instance
 	for _, item := range store.Snapshot() {
 		switch item.ClassID {
+		case me.AniGClassID:
+			ani = item
 		case me.PhysicalPathTerminationPointEthernetUniClassID:
 			ethernetUNIs++
 			configurations[item.EntityID] = item.Attributes[me.PhysicalPathTerminationPointEthernetUni_ConfigurationInd].(uint8)
@@ -36,6 +39,14 @@ func TestXG2010GFactoryMIB(t *testing.T) {
 		case me.PriorityQueueClassID:
 			queues++
 		}
+	}
+	if ani.EntityID != aniEntityID || ani.Attributes[me.AniG_Arc] != uint8(0) ||
+		ani.Attributes[me.AniG_ArcInterval] != uint8(0) ||
+		ani.Attributes[me.AniG_LowerOpticalThreshold] != uint8(0xff) ||
+		ani.Attributes[me.AniG_UpperOpticalThreshold] != uint8(0xff) ||
+		ani.Attributes[me.AniG_LowerTransmitPowerThreshold] != uint8(0x81) ||
+		ani.Attributes[me.AniG_UpperTransmitPowerThreshold] != uint8(0x81) {
+		t.Fatalf("ANI-G defaults = %#v", ani)
 	}
 	if ethernetUNIs != 4 {
 		t.Fatalf("Ethernet UNI count = %d, want 4", ethernetUNIs)

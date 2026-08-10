@@ -15,18 +15,24 @@ import (
 	me "github.com/opencord/omci-lib-go/v2/generated"
 	"github.com/xg2010g/airoha-omci/internal/engine"
 	"github.com/xg2010g/airoha-omci/internal/mib"
+	"github.com/xg2010g/airoha-omci/internal/optical"
 )
 
 type Event struct {
-	Type          string                     `json:"type"`
-	ClassID       me.ClassID                 `json:"class_id"`
-	EntityID      uint16                     `json:"entity_id"`
-	Format        string                     `json:"format,omitempty"`
-	AlarmBit      *uint8                     `json:"alarm_bit,omitempty"`
-	Active        *bool                      `json:"active,omitempty"`
-	Attributes    map[string]json.RawMessage `json:"attributes,omitempty"`
-	TransactionID uint16                     `json:"transaction_id,omitempty"`
-	Payload       string                     `json:"payload,omitempty"`
+	Type             string                     `json:"type"`
+	ClassID          me.ClassID                 `json:"class_id"`
+	EntityID         uint16                     `json:"entity_id"`
+	Format           string                     `json:"format,omitempty"`
+	AlarmBit         *uint8                     `json:"alarm_bit,omitempty"`
+	Active           *bool                      `json:"active,omitempty"`
+	Attributes       map[string]json.RawMessage `json:"attributes,omitempty"`
+	TransactionID    uint16                     `json:"transaction_id,omitempty"`
+	Payload          string                     `json:"payload,omitempty"`
+	Temperature      *uint16                    `json:"temperature,omitempty"`
+	SupplyVoltage    *uint16                    `json:"supply_voltage,omitempty"`
+	LaserBiasCurrent *uint16                    `json:"laser_bias_current,omitempty"`
+	TransmitPower    *uint16                    `json:"transmit_power,omitempty"`
+	ReceivePower     *uint16                    `json:"receive_power,omitempty"`
 }
 
 func Decode(line []byte) (Event, error) {
@@ -84,6 +90,19 @@ func (event Event) Dispatch(protocol *engine.Engine) ([][]byte, error) {
 			return nil, err
 		}
 		return [][]byte{frame}, nil
+
+	case "optical-sample":
+		if event.Temperature == nil || event.SupplyVoltage == nil ||
+			event.LaserBiasCurrent == nil || event.TransmitPower == nil || event.ReceivePower == nil {
+			return nil, fmt.Errorf("optical sample requires all five diagnostics fields")
+		}
+		return protocol.NotifyOpticalSample(key, optical.Sample{
+			Temperature:      *event.Temperature,
+			SupplyVoltage:    *event.SupplyVoltage,
+			LaserBiasCurrent: *event.LaserBiasCurrent,
+			TransmitPower:    *event.TransmitPower,
+			ReceivePower:     *event.ReceivePower,
+		}, device)
 
 	default:
 		return nil, fmt.Errorf("unsupported platform event type %q", event.Type)

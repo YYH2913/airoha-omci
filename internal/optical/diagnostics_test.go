@@ -37,3 +37,18 @@ func TestOpticalPowerRoundsAndSaturates(t *testing.T) {
 		}
 	}
 }
+
+func TestSampleANILevelsUseDBmReference(t *testing.T) {
+	levels := (Sample{ReceivePower: 10, TransmitPower: 10000}).ANI()
+	if got := int16(levels.OpticalSignalLevel); got != -15000 || levels.ReceiveDBm != -15000 {
+		t.Fatalf("receive ANI level = %d/%d, want -15000", got, levels.ReceiveDBm)
+	}
+	if got := int16(levels.TransmitOpticalLevel); got != 0 || levels.TransmitDBm != 0 {
+		t.Fatalf("transmit ANI level = %d/%d, want 0", got, levels.TransmitDBm)
+	}
+
+	zero := (Sample{}).ANI()
+	if int16(zero.OpticalSignalLevel) != -32768 || zero.ReceiveDBm != -1<<31 {
+		t.Fatalf("zero ANI receive level = %d/%d", int16(zero.OpticalSignalLevel), zero.ReceiveDBm)
+	}
+}

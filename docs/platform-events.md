@@ -44,3 +44,18 @@ ID zero. A result caused by an OLT Test request retains that request's TCI.
 ```json
 {"type":"test-result","class_id":256,"entity_id":0,"transaction_id":4660,"payload":"010203"}
 ```
+
+## Optical sample
+
+One coherent EN7572 diagnostics sample updates the ANI-G receive and transmit
+optical levels. The protocol engine, rather than the platform helper, applies
+the current OLT thresholds, the XG2010G module's internal SFF-8472 thresholds,
+0.5 dB clear hysteresis and ARC suppression. All fields use the raw units
+defined by the control helper ABI.
+
+```json
+{"type":"optical-sample","class_id":263,"entity_id":32769,"temperature":62976,"supply_voltage":33000,"laser_bias_current":2500,"transmit_power":10000,"receive_power":10}
+```
+
+The helper may suppress identical consecutive samples. Threshold changes are
+re-evaluated against the last sample retained by the engine.

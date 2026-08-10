@@ -48,6 +48,25 @@ func TestDispatchAVCNormalizesNumericWidth(t *testing.T) {
 	}
 }
 
+func TestDispatchOpticalSample(t *testing.T) {
+	protocol := opticalTestEngine(t)
+	event, err := Decode([]byte(`{"type":"optical-sample","class_id":263,"entity_id":32769,"temperature":6400,"supply_voltage":33000,"laser_bias_current":2500,"transmit_power":10000,"receive_power":10}`))
+	if err != nil {
+		t.Fatalf("Decode() error = %v", err)
+	}
+	frames, err := event.Dispatch(protocol)
+	if err != nil {
+		t.Fatalf("Dispatch() error = %v", err)
+	}
+	if len(frames) != 0 {
+		t.Fatalf("normal optical sample frames = %x, want none", frames)
+	}
+
+	if _, err := Decode([]byte(`{"type":"optical-sample","class_id":263,"entity_id":32769,"receive_power":10,"unknown":1}`)); err == nil {
+		t.Fatal("Decode(optical sample unknown field) error = nil")
+	}
+}
+
 func TestDecodeRejectsUnknownAndTrailingFields(t *testing.T) {
 	for _, input := range []string{
 		`{"type":"alarm","extra":1}`,
@@ -89,6 +108,27 @@ func testEngine(t *testing.T) *engine.Engine {
 			},
 		},
 	})
+	if err != nil {
+		t.Fatalf("mib.New() error = %v", err)
+	}
+	return engine.New(store)
+}
+
+func opticalTestEngine(t *testing.T) *engine.Engine {
+	t.Helper()
+	store, err := mib.New([]mib.Instance{{
+		Key: mib.Key{ClassID: me.AniGClassID, EntityID: 0x8001},
+		Attributes: me.AttributeValueMap{
+			me.AniG_Arc:                         uint8(0),
+			me.AniG_ArcInterval:                 uint8(0),
+			me.AniG_OpticalSignalLevel:          uint16(0),
+			me.AniG_LowerOpticalThreshold:       uint8(0xff),
+			me.AniG_UpperOpticalThreshold:       uint8(0xff),
+			me.AniG_TransmitOpticalLevel:        uint16(0),
+			me.AniG_LowerTransmitPowerThreshold: uint8(0x81),
+			me.AniG_UpperTransmitPowerThreshold: uint8(0x81),
+		},
+	}})
 	if err != nil {
 		t.Fatalf("mib.New() error = %v", err)
 	}

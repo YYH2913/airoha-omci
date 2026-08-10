@@ -26,11 +26,12 @@ transactional platform commits, baseline table transfer, extended MIB upload
 packing, alarm audits, time synchronization and scheduled reboot. The factory
 MIB advertises the two 10G, one 2.5G and one 1G Ethernet UNIs independently.
 
-The fixed-path event helper now maps XG2010G BOSA LOS, GPON activation state and
-the four Ethernet carrier states into validated Alarm/AVC frames. ANI-G optical
-line supervision tests read one coherent EN7572 DDM sample and return all five
-G.988 result types in baseline and extended format. Full optical threshold
-monitoring and alarm reporting control (ARC) suppression are still required.
+The fixed-path event helper now maps XG2010G BOSA LOS, GPON activation state,
+optical diagnostics and the four Ethernet carrier states into validated
+Alarm/AVC state. ANI-G optical line supervision tests return all five G.988
+result types in baseline and extended format. Dynamic ANI-G optical attributes,
+OLT and internal thresholds, clear hysteresis, ARC suppression/cancellation and
+ARC-aware alarm audits are implemented; physical OLT verification remains.
 
 Software download now implements baseline and extended sections, negotiated
 windows, duplicate no-response section replay, G.988 CRC-32A, MD5 ImageHash,
@@ -42,5 +43,5 @@ download and deliberate power-loss testing remain required.
 The current Airoha Ethernet metadata ABI exposes only one data GEM to Linux.
 The OpenWrt backend records all OLT-provisioned GEM CTPs but selects one
 bidirectional GEM for the `pon` netdev and reports the limitation through
-ubus/LuCI. Multi-GEM representors, complete optical alarm/ARC behavior and
-physical baseline/extended OLT interoperability remain completion blockers.
+ubus/LuCI. Multi-GEM representors and physical baseline/extended OLT
+interoperability remain completion blockers.

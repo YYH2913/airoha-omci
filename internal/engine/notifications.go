@@ -15,7 +15,7 @@ const baselineAVCPayloadLimit = 30
 
 // NotifyAlarm updates the alarm audit table and returns an autonomous alarm
 // notification when the bitmap changed. Alarm sequence numbers are shared by
-// all managed entities and wrap naturally at 255, as required by G.988.
+// all managed entities, range from 1 through 255 and wrap back to 1.
 func (e *Engine) NotifyAlarm(key mib.Key, bitmap [28]byte,
 	device omci.DeviceIdent) ([]byte, bool, error) {
 	e.mu.Lock()
@@ -68,6 +68,31 @@ func (e *Engine) notifyAlarmLocked(key mib.Key, bitmap [28]byte,
 		return nil, false, nil
 	}
 
+	if bitmap == ([28]byte{}) {
+		delete(e.alarms, key)
+	} else {
+		e.alarms[key] = bitmap
+	}
+	if e.arcEnabledLocked(key) {
+		if bitmap == ([28]byte{}) {
+			if _, exists := e.arcFreeSince[key]; !exists {
+				e.arcFreeSince[key] = e.now()
+			}
+		} else {
+			delete(e.arcFreeSince, key)
+		}
+		frames, err := e.pollARCKeyLocked(key, device)
+		if err != nil {
+			return nil, false, err
+		}
+		if len(frames) == 0 {
+			return nil, false, nil
+		}
+		return frames[0], true, nil
+	}
+
+	previousSequence := e.alarmSequence
+	sequence := e.nextAlarmSequenceLocked()
 	frame, err := serializeAutonomous(device, 0, omci.AlarmNotificationType,
 		&omci.AlarmNotificationMsg{
 			MeBasePacket: omci.MeBasePacket{
@@ -76,18 +101,27 @@ func (e *Engine) notifyAlarmLocked(key mib.Key, bitmap [28]byte,
 				Extended:       device == omci.ExtendedIdent,
 			},
 			AlarmBitmap:         bitmap,
-			AlarmSequenceNumber: e.alarmSequence,
+			AlarmSequenceNumber: sequence,
 		})
 	if err != nil {
+		e.alarmSequence = previousSequence
+		if found {
+			e.alarms[key] = previous
+		} else {
+			delete(e.alarms, key)
+		}
 		return nil, false, err
 	}
-	if bitmap == ([28]byte{}) {
-		delete(e.alarms, key)
-	} else {
-		e.alarms[key] = bitmap
-	}
-	e.alarmSequence++
 	return frame, true, nil
+}
+
+func (e *Engine) nextAlarmSequenceLocked() uint8 {
+	if e.alarmSequence == 0 || e.alarmSequence == 255 {
+		e.alarmSequence = 1
+	} else {
+		e.alarmSequence++
+	}
+	return e.alarmSequence
 }
 
 // NotifyAttributeChange commits ONU-originated state and returns one or more
@@ -98,7 +132,11 @@ func (e *Engine) NotifyAttributeChange(key mib.Key, attributes me.AttributeValue
 	device omci.DeviceIdent) ([][]byte, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	return e.notifyAttributeChangeLocked(key, attributes, device)
+}
 
+func (e *Engine) notifyAttributeChangeLocked(key mib.Key, attributes me.AttributeValueMap,
+	device omci.DeviceIdent) ([][]byte, error) {
 	if err := validateDeviceIdentifier(device); err != nil {
 		return nil, err
 	}
