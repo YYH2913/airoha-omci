@@ -20,8 +20,7 @@ implemented. Driver-originated alarm/AVC events have a validated upstream
 notification path. Software download, CRC-32A and ImageHash validation,
 activation and commit are implemented through a fixed platform helper ABI.
 It is not yet ready for operator deployment because multi-GEM, complete
-alarm/ARC coverage, test execution and real OLT interoperability are
-incomplete; see
+alarm/ARC coverage and real OLT interoperability are incomplete; see
 [the implementation matrix](docs/implementation.md).
 
 ## Platform boundary

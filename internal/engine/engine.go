@@ -15,6 +15,7 @@ import (
 	omci "github.com/opencord/omci-lib-go/v2"
 	me "github.com/opencord/omci-lib-go/v2/generated"
 	"github.com/xg2010g/airoha-omci/internal/mib"
+	"github.com/xg2010g/airoha-omci/internal/optical"
 	"github.com/xg2010g/airoha-omci/internal/software"
 )
 
@@ -37,6 +38,7 @@ type Alarm struct {
 type Controller interface {
 	SynchronizeTime(time.Time) error
 	Reboot(uint8) error
+	OpticalLineSupervision() (optical.Diagnostics, error)
 }
 
 type Engine struct {
@@ -55,6 +57,7 @@ type Engine struct {
 	software      software.Controller
 	download      *softwareDownload
 	softwareState SoftwareStatus
+	pending       [][]byte
 }
 
 func New(store *mib.Store) *Engine {
@@ -91,6 +94,17 @@ func (e *Engine) SetAlarm(key mib.Key, bitmap [28]byte) {
 	e.alarms[key] = bitmap
 }
 
+// DrainNotifications returns notifications produced while handling the last
+// request. The caller sends them only after the solicited response.
+func (e *Engine) DrainNotifications() [][]byte {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	frames := e.pending
+	e.pending = nil
+	return frames
+}
+
 // Handle processes one complete downstream OMCI frame and returns the upstream
 // response. An exact retransmission is answered from a bounded cache and is
 // never applied to the MIB twice.
@@ -112,14 +126,14 @@ func (e *Engine) Handle(frame []byte) ([]byte, error) {
 	if !ok {
 		return nil, errors.New("invalid OMCI header layer")
 	}
-	if decodeError := packet.ErrorLayer(); decodeError != nil {
-		if response, handled, err := e.handleRawSpecial(header, frame); handled {
-			if err != nil {
-				return nil, err
-			}
-			e.remember(digest, response)
-			return append([]byte(nil), response...), nil
+	if response, handled, err := e.handleRawSpecial(header, frame); handled {
+		if err != nil {
+			return nil, err
 		}
+		e.remember(digest, response)
+		return append([]byte(nil), response...), nil
+	}
+	if decodeError := packet.ErrorLayer(); decodeError != nil {
 		response, handled, err := e.decodeFailureResponse(header, frame, decodeError.Error())
 		if err != nil {
 			return nil, err
@@ -519,6 +533,21 @@ func (e *Engine) dispatch(packet gopacket.Packet, header *omci.OMCI) ([]byte, er
 			Result: result,
 		})
 
+	case omci.TestRequestType:
+		request, err := layerAs[*omci.OpticalLineSupervisionTestRequest](packet, omci.LayerTypeTestRequest)
+		if err != nil {
+			return nil, err
+		}
+		result := e.opticalLineSupervision(header, request)
+		return serialize(header, omci.TestResponseType, &omci.TestResponse{
+			MeBasePacket: omci.MeBasePacket{
+				EntityClass:    request.EntityClass,
+				EntityInstance: request.EntityInstance,
+				Extended:       extended,
+			},
+			Result: result,
+		})
+
 	case omci.SynchronizeTimeRequestType:
 		request, err := layerAs[*omci.SynchronizeTimeRequest](packet, omci.LayerTypeSynchronizeTimeRequest)
 		if err != nil {
@@ -566,7 +595,78 @@ func (e *Engine) dispatch(packet gopacket.Packet, header *omci.OMCI) ([]byte, er
 	}
 }
 
+func (e *Engine) opticalLineSupervision(header *omci.OMCI,
+	request *omci.OpticalLineSupervisionTestRequest) me.Results {
+	if request.EntityClass != me.AniGClassID {
+		return me.UnknownEntity
+	}
+	if !e.mib.Exists(mib.Key{ClassID: request.EntityClass, EntityID: request.EntityInstance}) {
+		return me.UnknownInstance
+	}
+	if request.SelectTest != 7 || request.GeneralPurposeBuffer != 0 ||
+		request.VendorSpecificParameters != 0 {
+		return me.ParameterError
+	}
+	if e.controller == nil {
+		return me.NotSupported
+	}
+	diagnostics, err := e.controller.OpticalLineSupervision()
+	if err != nil {
+		return me.ProcessingError
+	}
+	frame, err := serializeAutonomous(header.DeviceIdentifier, header.TransactionID,
+		omci.TestResultType, &omci.OpticalLineSupervisionTestResult{
+			MeBasePacket: omci.MeBasePacket{
+				EntityClass:    request.EntityClass,
+				EntityInstance: request.EntityInstance,
+				Extended:       header.DeviceIdentifier == omci.ExtendedIdent,
+			},
+			PowerFeedVoltageType:     1,
+			PowerFeedVoltage:         diagnostics.PowerFeedVoltage,
+			ReceivedOpticalPowerType: 3,
+			ReceivedOpticalPower:     diagnostics.ReceivedOpticalPower,
+			MeanOpticalLaunchType:    5,
+			MeanOpticalLaunch:        diagnostics.MeanOpticalLaunch,
+			LaserBiasCurrentType:     9,
+			LaserBiasCurrent:         diagnostics.LaserBiasCurrent,
+			TemperatureType:          12,
+			Temperature:              diagnostics.Temperature,
+		})
+	if err != nil {
+		return me.ProcessingError
+	}
+	e.pending = append(e.pending, frame)
+	return me.Success
+}
+
 func (e *Engine) handleRawSpecial(header *omci.OMCI, frame []byte) ([]byte, bool, error) {
+	if header.MessageType == omci.TestRequestType &&
+		header.DeviceIdentifier == omci.ExtendedIdent {
+		if len(frame) < 8 {
+			return nil, false, nil
+		}
+		classID := me.ClassID(binary.BigEndian.Uint16(frame[4:6]))
+		entityID := binary.BigEndian.Uint16(frame[6:8])
+		if len(frame) < 15 {
+			response, err := serializeRawResult(header, classID, entityID, me.ProcessingError)
+			return response, true, err
+		}
+		if binary.BigEndian.Uint16(frame[8:10]) != 5 {
+			response, err := serializeRawResult(header, classID, entityID, me.ParameterError)
+			return response, true, err
+		}
+		request := &omci.OpticalLineSupervisionTestRequest{
+			MeBasePacket: omci.MeBasePacket{
+				EntityClass: classID, EntityInstance: entityID, Extended: true,
+			},
+			SelectTest:               frame[10],
+			GeneralPurposeBuffer:     binary.BigEndian.Uint16(frame[11:13]),
+			VendorSpecificParameters: binary.BigEndian.Uint16(frame[13:15]),
+		}
+		result := e.opticalLineSupervision(header, request)
+		response, err := serializeRawResult(header, classID, entityID, result)
+		return response, true, err
+	}
 	if header.MessageType != omci.SynchronizeTimeRequestType || len(frame) < 8 {
 		return nil, false, nil
 	}

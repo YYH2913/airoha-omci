@@ -12,6 +12,7 @@ import (
 	omci "github.com/opencord/omci-lib-go/v2"
 	me "github.com/opencord/omci-lib-go/v2/generated"
 	"github.com/xg2010g/airoha-omci/internal/mib"
+	"github.com/xg2010g/airoha-omci/internal/optical"
 )
 
 func TestCreateDuplicateIsReplayedWithoutDoubleMutation(t *testing.T) {
@@ -296,8 +297,11 @@ func TestGetAllAlarmsUsesStableSnapshot(t *testing.T) {
 }
 
 type recordingController struct {
-	timestamp time.Time
-	reboot    uint8
+	timestamp   time.Time
+	reboot      uint8
+	diagnostics optical.Diagnostics
+	opticalErr  error
+	opticalRuns int
 }
 
 func (c *recordingController) SynchronizeTime(value time.Time) error {
@@ -308,6 +312,87 @@ func (c *recordingController) SynchronizeTime(value time.Time) error {
 func (c *recordingController) Reboot(condition uint8) error {
 	c.reboot = condition
 	return nil
+}
+
+func (c *recordingController) OpticalLineSupervision() (optical.Diagnostics, error) {
+	c.opticalRuns++
+	return c.diagnostics, c.opticalErr
+}
+
+func TestOpticalLineSupervisionRespondsThenReportsResults(t *testing.T) {
+	store, err := mib.New([]mib.Instance{{
+		Key:        mib.Key{ClassID: me.AniGClassID, EntityID: 0x8001},
+		Attributes: me.AttributeValueMap{},
+	}})
+	if err != nil {
+		t.Fatalf("mib.New() error = %v", err)
+	}
+	for _, device := range []omci.DeviceIdent{omci.BaselineIdent, omci.ExtendedIdent} {
+		t.Run(device.String(), func(t *testing.T) {
+			controller := &recordingController{diagnostics: optical.Diagnostics{
+				PowerFeedVoltage: 165, ReceivedOpticalPower: 0xff00,
+				MeanOpticalLaunch: 15000, LaserBiasCurrent: 2500,
+				Temperature: 0xf600,
+			}}
+			protocol := NewWithController(store, controller)
+			var request []byte
+			if device == omci.ExtendedIdent {
+				request = make([]byte, 15)
+				binary.BigEndian.PutUint16(request, 0x1234)
+				request[2] = byte(omci.TestRequestType)
+				request[3] = byte(omci.ExtendedIdent)
+				binary.BigEndian.PutUint16(request[4:], uint16(me.AniGClassID))
+				binary.BigEndian.PutUint16(request[6:], 0x8001)
+				binary.BigEndian.PutUint16(request[8:], 5)
+				request[10] = 7
+			} else {
+				request = encodeRequest(t, 0x1234, omci.TestRequestType,
+					&omci.OpticalLineSupervisionTestRequest{
+						MeBasePacket: omci.MeBasePacket{
+							EntityClass: me.AniGClassID, EntityInstance: 0x8001,
+						},
+						SelectTest: 7,
+					})
+			}
+			responseFrame, err := protocol.Handle(request)
+			if err != nil {
+				t.Fatalf("Handle(Test) error = %v", err)
+			}
+			if device == omci.ExtendedIdent {
+				if len(responseFrame) != 11 || binary.BigEndian.Uint16(responseFrame[8:10]) != 1 ||
+					me.Results(responseFrame[10]) != me.Success {
+					t.Fatalf("extended Test response = %x", responseFrame)
+				}
+			} else {
+				response := decodeResponse(t, responseFrame).Layer(omci.LayerTypeTestResponse).(*omci.TestResponse)
+				if response.Result != me.Success {
+					t.Fatalf("Test result = %v, want Success", response.Result)
+				}
+			}
+			pending := protocol.DrainNotifications()
+			if len(pending) != 1 {
+				t.Fatalf("pending notifications = %d, want 1", len(pending))
+			}
+			packet := decodeResponse(t, pending[0])
+			header := packet.Layer(omci.LayerTypeOMCI).(*omci.OMCI)
+			result := packet.Layer(omci.LayerTypeTestResult).(*omci.OpticalLineSupervisionTestResult)
+			if header.TransactionID != 0x1234 || header.DeviceIdentifier != device ||
+				result.PowerFeedVoltageType != 1 || result.PowerFeedVoltage != 165 ||
+				result.ReceivedOpticalPowerType != 3 || result.ReceivedOpticalPower != 0xff00 ||
+				result.MeanOpticalLaunchType != 5 || result.MeanOpticalLaunch != 15000 ||
+				result.LaserBiasCurrentType != 9 || result.LaserBiasCurrent != 2500 ||
+				result.TemperatureType != 12 || result.Temperature != 0xf600 {
+				t.Fatalf("optical test result = %#v, header = %#v", result, header)
+			}
+
+			if _, err := protocol.Handle(request); err != nil {
+				t.Fatalf("Handle(duplicate Test) error = %v", err)
+			}
+			if controller.opticalRuns != 1 || len(protocol.DrainNotifications()) != 0 {
+				t.Fatalf("duplicate reran optical test: runs=%d", controller.opticalRuns)
+			}
+		})
+	}
 }
 
 func TestSynchronizeTimeHandlesBaselineLibraryDecodeFailure(t *testing.T) {
@@ -351,11 +436,16 @@ func newTestEngine(t *testing.T) (*Engine, *mib.Store) {
 }
 
 func encodeRequest(t *testing.T, transactionID uint16, messageType omci.MessageType, payload gopacket.SerializableLayer) []byte {
+	return encodeRequestForDevice(t, transactionID, messageType, payload, omci.BaselineIdent)
+}
+
+func encodeRequestForDevice(t *testing.T, transactionID uint16, messageType omci.MessageType,
+	payload gopacket.SerializableLayer, device omci.DeviceIdent) []byte {
 	t.Helper()
 	header := &omci.OMCI{
 		TransactionID:    transactionID,
 		MessageType:      messageType,
-		DeviceIdentifier: omci.BaselineIdent,
+		DeviceIdentifier: device,
 	}
 	buffer := gopacket.NewSerializeBuffer()
 	if err := gopacket.SerializeLayers(buffer, gopacket.SerializeOptions{FixLengths: true}, header, payload); err != nil {

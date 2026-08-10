@@ -246,6 +246,19 @@ func run(opts options) error {
 				}
 				state.TXFrames++
 			}
+			for _, notification := range protocol.DrainNotifications() {
+				if err := conn.WriteFrame(ctx, notification); err != nil {
+					state.TransportErrors++
+					state.LastError = err.Error()
+					_ = statusWriter.Write(state)
+					return err
+				}
+				state.TXFrames++
+				state.NotificationFrames++
+				if len(notification) >= 3 {
+					state.LastNotificationType = notification[2]
+				}
+			}
 			state.MIBDataSync = store.DataSync()
 			state.MIBEntries = len(store.Snapshot())
 			updateSoftwareStatus()

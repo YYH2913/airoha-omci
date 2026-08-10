@@ -45,3 +45,16 @@ apply it transactionally. The control helper handles validated time and reboot
 operations. The event helper streams bounded JSON lines for platform alarms
 and AVCs. Their schemas are intentionally separate from the software helper so
 software-slot privileges can be audited independently.
+
+The control helper also accepts an `optical-line-supervision` action and returns
+one strict JSON object containing an SFF-8472-compatible EN7572 sample:
+
+```json
+{"temperature":62976,"supply_voltage":33000,"laser_bias_current":2500,"transmit_power":10000,"receive_power":10}
+```
+
+All fields are unsigned 16-bit raw values. Temperature is signed two's
+complement in 1/256 C units, supply voltage is in 100 uV units, laser bias is
+in 2 uA units, and transmit/receive powers are in 0.1 uW units. The protocol
+engine performs the G.988 dBu, voltage and temperature conversions. Unknown,
+missing or trailing JSON fields are rejected.

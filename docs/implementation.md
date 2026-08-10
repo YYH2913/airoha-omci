@@ -10,7 +10,7 @@ and extended messages.  A successful build or reaching GPON O5 is not enough.
 | MIB | ONU defaults, platform-gated create/delete/set, reset, data sync | in progress |
 | MIB upload | baseline fragmentation and extended multi-ME packing | in progress |
 | Tables | stable Get/Get Next cache and extended Set Table | in progress |
-| Notifications | alarm audit/sequence, event-driven Alarm/AVC, test-result encoding and ARC | in progress |
+| Notifications | alarm audit/sequence, event-driven Alarm/AVC, requested optical tests and ARC | in progress |
 | Equipment | ONU-G, ONU2-G, ANI-G, four speed-specific Ethernet UNIs, software images | in progress |
 | Traffic | 8 T-CONTs/schedulers, 96 queues, GEM CTP/IW validation and hardware apply | in progress |
 | Ethernet service | bridge, mapper, VLAN and extended VLAN rules | pending |
@@ -27,9 +27,10 @@ packing, alarm audits, time synchronization and scheduled reboot. The factory
 MIB advertises the two 10G, one 2.5G and one 1G Ethernet UNIs independently.
 
 The fixed-path event helper now maps XG2010G BOSA LOS, GPON activation state and
-the four Ethernet carrier states into validated Alarm/AVC frames. Full optical
-threshold monitoring, alarm reporting control (ARC) suppression and execution
-of requested tests are still required.
+the four Ethernet carrier states into validated Alarm/AVC frames. ANI-G optical
+line supervision tests read one coherent EN7572 DDM sample and return all five
+G.988 result types in baseline and extended format. Full optical threshold
+monitoring and alarm reporting control (ARC) suppression are still required.
 
 Software download now implements baseline and extended sections, negotiated
 windows, duplicate no-response section replay, G.988 CRC-32A, MD5 ImageHash,
@@ -41,6 +42,5 @@ download and deliberate power-loss testing remain required.
 The current Airoha Ethernet metadata ABI exposes only one data GEM to Linux.
 The OpenWrt backend records all OLT-provisioned GEM CTPs but selects one
 bidirectional GEM for the `pon` netdev and reports the limitation through
-ubus/LuCI. Multi-GEM representors, complete optical alarm/ARC behavior, test
-execution and physical baseline/extended OLT interoperability remain
-completion blockers.
+ubus/LuCI. Multi-GEM representors, complete optical alarm/ARC behavior and
+physical baseline/extended OLT interoperability remain completion blockers.
