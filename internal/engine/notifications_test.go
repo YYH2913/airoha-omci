@@ -35,6 +35,7 @@ func TestAlarmNotificationUpdatesAuditAndSequence(t *testing.T) {
 		t.Fatalf("duplicate NotifyAlarm() = frame:%x changed:%v err:%v", frame, changed, err)
 	}
 
+	negotiateExtended(t, protocol)
 	frame, changed, err = protocol.NotifyAlarm(key, [28]byte{}, omci.ExtendedIdent)
 	if err != nil || !changed {
 		t.Fatalf("NotifyAlarm(clear) changed=%v error=%v", changed, err)
@@ -178,6 +179,7 @@ func TestBaselineAVCSplitsLargeAttributeSet(t *testing.T) {
 
 func TestRequestedTestResultKeepsTCIAndFormat(t *testing.T) {
 	protocol, _ := newNotificationEngine(t)
+	negotiateExtended(t, protocol)
 	frame, err := protocol.TestResult(0x1234,
 		mib.Key{ClassID: me.OnuGClassID, EntityID: 0}, []byte{1, 2, 3}, omci.ExtendedIdent)
 	if err != nil {
@@ -189,6 +191,45 @@ func TestRequestedTestResultKeepsTCIAndFormat(t *testing.T) {
 	if header.TransactionID != 0x1234 || header.DeviceIdentifier != omci.ExtendedIdent ||
 		len(result.Payload) != 3 || result.Payload[0] != 1 || result.Payload[2] != 3 {
 		t.Fatalf("test result = header:%#v payload:%x", header, result.Payload)
+	}
+}
+
+func TestExtendedAutonomousMessagesRequireCurrentSessionNegotiation(t *testing.T) {
+	protocol, _ := newNotificationEngine(t)
+	key := mib.Key{ClassID: me.PhysicalPathTerminationPointEthernetUniClassID, EntityID: notificationUNI}
+
+	frame, changed, err := protocol.NotifyAlarmBit(key, 0, true, omci.ExtendedIdent)
+	if err != nil || !changed || omci.DeviceIdent(frame[3]) != omci.BaselineIdent {
+		t.Fatalf("pre-negotiation alarm = %x changed=%v error=%v", frame, changed, err)
+	}
+
+	negotiateExtended(t, protocol)
+	frame, changed, err = protocol.NotifyAlarmBit(key, 0, false, omci.ExtendedIdent)
+	if err != nil || !changed || omci.DeviceIdent(frame[3]) != omci.ExtendedIdent {
+		t.Fatalf("negotiated alarm = %x changed=%v error=%v", frame, changed, err)
+	}
+
+	protocol.ResetCommunicationSession()
+	frame, changed, err = protocol.NotifyAlarmBit(key, 0, true, omci.ExtendedIdent)
+	if err != nil || !changed || omci.DeviceIdent(frame[3]) != omci.BaselineIdent {
+		t.Fatalf("post-reset alarm = %x changed=%v error=%v", frame, changed, err)
+	}
+	alarm := decodeResponse(t, frame).Layer(omci.LayerTypeAlarmNotification).(*omci.AlarmNotificationMsg)
+	if alarm.AlarmSequenceNumber != 1 {
+		t.Fatalf("post-reset alarm sequence = %d, want 1", alarm.AlarmSequenceNumber)
+	}
+}
+
+func negotiateExtended(t *testing.T, protocol *Engine) {
+	t.Helper()
+	request := encodeRequestForDevice(t, 0x222, omci.GetRequestType, &omci.GetRequest{
+		MeBasePacket: omci.MeBasePacket{
+			EntityClass: me.OnuDataClassID, EntityInstance: 0, Extended: true,
+		},
+		AttributeMask: 0x8000,
+	}, omci.ExtendedIdent)
+	if _, err := protocol.Handle(request); err != nil {
+		t.Fatalf("negotiate extended message set: %v", err)
 	}
 }
 

@@ -63,6 +63,10 @@ func (event Event) Dispatch(protocol *engine.Engine) ([][]byte, error) {
 	key := mib.Key{ClassID: event.ClassID, EntityID: event.EntityID}
 
 	switch event.Type {
+	case "omcc-session-reset":
+		protocol.ResetCommunicationSession()
+		return nil, nil
+
 	case "alarm":
 		if event.AlarmBit == nil || event.Active == nil {
 			return nil, fmt.Errorf("alarm event requires alarm_bit and active")

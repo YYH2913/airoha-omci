@@ -26,6 +26,7 @@ func (e *Engine) PollARC(device omci.DeviceIdent) ([][]byte, error) {
 	if err := validateDeviceIdentifier(device); err != nil {
 		return nil, err
 	}
+	device = e.notificationDeviceLocked(device)
 	keys := make([]mib.Key, 0, len(e.arcFreeSince))
 	for key := range e.arcFreeSince {
 		keys = append(keys, key)

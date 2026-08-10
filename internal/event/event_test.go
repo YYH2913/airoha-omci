@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/google/gopacket"
 	omci "github.com/opencord/omci-lib-go/v2"
 	me "github.com/opencord/omci-lib-go/v2/generated"
 	"github.com/xg2010g/airoha-omci/internal/engine"
@@ -43,8 +44,26 @@ func TestDispatchAVCNormalizesNumericWidth(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Dispatch() error = %v", err)
 	}
-	if len(frames) != 1 || omci.DeviceIdent(frames[0][3]) != omci.ExtendedIdent {
+	if len(frames) != 1 || omci.DeviceIdent(frames[0][3]) != omci.BaselineIdent {
 		t.Fatalf("AVC frames = %x", frames)
+	}
+
+	negotiateExtended(t, protocol)
+	event, err = Decode([]byte(`{"type":"avc","class_id":11,"entity_id":257,"format":"extended","attributes":{"OperationalState":1}}`))
+	if err != nil {
+		t.Fatalf("Decode(second AVC) error = %v", err)
+	}
+	frames, err = event.Dispatch(protocol)
+	if err != nil || len(frames) != 1 || omci.DeviceIdent(frames[0][3]) != omci.ExtendedIdent {
+		t.Fatalf("negotiated AVC frames = %x error=%v", frames, err)
+	}
+
+	reset, err := Decode([]byte(`{"type":"omcc-session-reset"}`))
+	if err != nil {
+		t.Fatalf("Decode(reset) error = %v", err)
+	}
+	if frames, err = reset.Dispatch(protocol); err != nil || len(frames) != 0 {
+		t.Fatalf("reset frames = %x error=%v", frames, err)
 	}
 }
 
@@ -133,4 +152,25 @@ func opticalTestEngine(t *testing.T) *engine.Engine {
 		t.Fatalf("mib.New() error = %v", err)
 	}
 	return engine.New(store)
+}
+
+func negotiateExtended(t *testing.T, protocol *engine.Engine) {
+	t.Helper()
+	header := &omci.OMCI{
+		TransactionID: 0x123, MessageType: omci.GetRequestType,
+		DeviceIdentifier: omci.ExtendedIdent,
+	}
+	request := &omci.GetRequest{
+		MeBasePacket: omci.MeBasePacket{
+			EntityClass: me.OnuDataClassID, EntityInstance: 0, Extended: true,
+		},
+		AttributeMask: 0x8000,
+	}
+	buffer := gopacket.NewSerializeBuffer()
+	if err := gopacket.SerializeLayers(buffer, gopacket.SerializeOptions{FixLengths: true}, header, request); err != nil {
+		t.Fatalf("serialize extended request: %v", err)
+	}
+	if _, err := protocol.Handle(buffer.Bytes()); err != nil {
+		t.Fatalf("negotiate extended message set: %v", err)
+	}
 }

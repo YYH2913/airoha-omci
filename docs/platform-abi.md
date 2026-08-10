@@ -107,3 +107,57 @@ complement in 1/256 C units, supply voltage is in 100 uV units, laser bias is
 in 2 uA units, and transmit/receive powers are in 0.1 uW units. The protocol
 engine performs the G.988 dBu, voltage and temperature conversions. Unknown,
 missing or trailing JSON fields are rejected.
+
+For GEM performance monitoring, the control helper accepts:
+
+```json
+{"action":"gem-port-counters","gem_port_id":42}
+```
+
+and returns four cumulative 64-bit hardware counters:
+
+```json
+{"gem_port_id":42,"received_gem_frames":11,"received_payload_bytes":22,"transmitted_gem_frames":33,"transmitted_payload_bytes":44}
+```
+
+For Ethernet performance monitoring, the request contains only the fixed
+G.988 PPTP Ethernet UNI entity ID. The XG2010G helper maps `0x0101` through
+`0x0104` to `lan1` through `lan4`; no interface name crosses this ABI.
+
+```json
+{"action":"ethernet-counters","ethernet_entity_id":257}
+```
+
+The response contains cumulative 64-bit GDM MIB counters. `received` is the
+CPE-to-ONU direction and `transmitted` is the ONU-to-CPE direction. The six
+size buckets are exactly 64, 65-127, 128-255, 256-511, 512-1023 and 1024-1518
+octets.
+
+```json
+{
+  "ethernet_entity_id": 257,
+  "received": {
+    "frames": 1, "octets": 2, "drop_events": 3,
+    "broadcast_frames": 4, "multicast_frames": 5, "crc_errors": 6,
+    "buffer_overflows": 7, "internal_errors": 8,
+    "undersize_frames": 9, "fragments": 10, "jabbers": 11,
+    "oversize_frames": 12, "size_buckets": [13, 14, 15, 16, 17, 18]
+  },
+  "transmitted": {
+    "frames": 21, "octets": 22, "drop_events": 23,
+    "broadcast_frames": 24, "multicast_frames": 25, "crc_errors": 0,
+    "buffer_overflows": 23, "internal_errors": 0,
+    "undersize_frames": 26, "fragments": 0, "jabbers": 0,
+    "oversize_frames": 27, "size_buckets": [28, 29, 30, 31, 32, 33]
+  }
+}
+```
+
+The Airoha driver keeps runt frames separate from the 64-octet bucket and
+uses the existing per-NBQ MIB split for multi-serdes ports. Collision, SQE,
+carrier-sense and alignment counters are zero because all four advertised
+XG2010G UNIs are full-duplex and the GDM does not expose those legacy MAC
+counters. GDM OK frame/octet counters do not include damaged-frame octets;
+the resulting class 296 packet/octet values require physical OLT validation
+against this hardware limitation. Unknown fields, missing fields, a mismatched
+entity ID or an array other than six buckets are rejected.

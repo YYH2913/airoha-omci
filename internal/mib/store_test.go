@@ -318,6 +318,40 @@ func TestAutonomousUpdateCannotOverrideMibDataSync(t *testing.T) {
 	}
 }
 
+func TestAutonomousBatchValidationFailureIsAtomic(t *testing.T) {
+	key := Key{ClassID: me.PhysicalPathTerminationPointEthernetUniClassID, EntityID: 0x101}
+	store, err := New([]Instance{
+		{
+			Key: key,
+			Attributes: me.AttributeValueMap{
+				me.PhysicalPathTerminationPointEthernetUni_OperationalState: uint8(1),
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	err = store.UpdateAutonomousBatch(map[Key]me.AttributeValueMap{
+		key: {
+			me.PhysicalPathTerminationPointEthernetUni_OperationalState: uint8(0),
+		},
+		{ClassID: me.PhysicalPathTerminationPointEthernetUniClassID, EntityID: 0x102}: {
+			me.PhysicalPathTerminationPointEthernetUni_OperationalState: uint8(0),
+		},
+	})
+	var result *ResultError
+	if !errors.As(err, &result) || result.Result != me.UnknownInstance {
+		t.Fatalf("UpdateAutonomousBatch() error = %#v, want UnknownInstance", err)
+	}
+	instance, getErr := store.Get(key, 0x0400)
+	if getErr != nil {
+		t.Fatalf("Get(UNI) error = %v", getErr)
+	}
+	if instance.Attributes[me.PhysicalPathTerminationPointEthernetUni_OperationalState] != uint8(1) {
+		t.Fatalf("rejected autonomous batch changed state: %#v", instance.Attributes)
+	}
+}
+
 func TestCommandUpdateChangesMultipleMEsAndAdvancesDataSyncOnce(t *testing.T) {
 	applyCalls := 0
 	store, err := NewWithApplier([]Instance{

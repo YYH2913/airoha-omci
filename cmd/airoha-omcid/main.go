@@ -174,6 +174,8 @@ func run(opts options) error {
 	}
 	arcTicker := time.NewTicker(time.Second)
 	defer arcTicker.Stop()
+	performanceTicker := time.NewTicker(time.Second)
+	defer performanceTicker.Stop()
 
 	for {
 		select {
@@ -237,6 +239,15 @@ func run(opts options) error {
 				if err := statusWriter.Write(state); err != nil {
 					log.Printf("publish status: %v", err)
 				}
+			}
+
+		case <-performanceTicker.C:
+			if err := protocol.PollPerformance(); err != nil {
+				state.PerformanceErrors++
+				state.LastError = err.Error()
+				_ = statusWriter.Write(state)
+				log.Printf("OMCI performance collection failed: %v", err)
+				continue
 			}
 
 		case result := <-received:

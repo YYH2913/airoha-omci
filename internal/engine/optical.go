@@ -53,6 +53,7 @@ func (e *Engine) NotifyOpticalSample(key mib.Key, sample optical.Sample,
 	if err := validateDeviceIdentifier(device); err != nil {
 		return nil, err
 	}
+	device = e.notificationDeviceLocked(device)
 	if key.ClassID != me.AniGClassID {
 		return nil, fmt.Errorf("optical sample target %v/%#x is not ANI-G", key.ClassID, key.EntityID)
 	}

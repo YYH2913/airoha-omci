@@ -68,3 +68,83 @@ func TestExecControllerRejectsIncompleteOpticalDiagnostics(t *testing.T) {
 		t.Fatalf("OpticalLineSupervision() error = %v", err)
 	}
 }
+
+func TestExecControllerReadsGEMPortCounters(t *testing.T) {
+	directory := t.TempDir()
+	requestPath := filepath.Join(directory, "request.json")
+	helper := filepath.Join(directory, "control")
+	script := "#!/bin/sh\ncat > " + requestPath + "\n" +
+		"printf '%s\\n' '{\"gem_port_id\":42,\"received_gem_frames\":11,\"received_payload_bytes\":22,\"transmitted_gem_frames\":33,\"transmitted_payload_bytes\":44}'\n"
+	if err := os.WriteFile(helper, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile(helper) error = %v", err)
+	}
+	counters, err := (ExecController{Path: helper}).GEMPortCounters(42)
+	if err != nil {
+		t.Fatalf("GEMPortCounters() error = %v", err)
+	}
+	if counters.ReceivedGEMFrames != 11 || counters.ReceivedPayloadBytes != 22 ||
+		counters.TransmittedGEMFrames != 33 || counters.TransmittedPayloadBytes != 44 {
+		t.Fatalf("counters = %#v", counters)
+	}
+	payload, err := os.ReadFile(requestPath)
+	if err != nil {
+		t.Fatalf("ReadFile(request) error = %v", err)
+	}
+	if !strings.Contains(string(payload), `"action":"gem-port-counters"`) ||
+		!strings.Contains(string(payload), `"gem_port_id":42`) {
+		t.Fatalf("request = %s", payload)
+	}
+}
+
+func TestExecControllerRejectsMismatchedGEMPortCounters(t *testing.T) {
+	helper := filepath.Join(t.TempDir(), "control")
+	if err := os.WriteFile(helper, []byte("#!/bin/sh\nprintf '%s\\n' '{\"gem_port_id\":7,\"received_gem_frames\":0,\"received_payload_bytes\":0,\"transmitted_gem_frames\":0,\"transmitted_payload_bytes\":0}'\n"), 0o755); err != nil {
+		t.Fatalf("WriteFile(helper) error = %v", err)
+	}
+	if _, err := (ExecController{Path: helper}).GEMPortCounters(42); err == nil ||
+		!strings.Contains(err.Error(), "matching field") {
+		t.Fatalf("GEMPortCounters() error = %v", err)
+	}
+}
+
+func TestExecControllerReadsEthernetCounters(t *testing.T) {
+	directory := t.TempDir()
+	requestPath := filepath.Join(directory, "request.json")
+	helper := filepath.Join(directory, "control")
+	response := `{"ethernet_entity_id":257,"received":{"frames":1,"octets":2,"drop_events":3,"broadcast_frames":4,"multicast_frames":5,"crc_errors":6,"buffer_overflows":7,"internal_errors":8,"undersize_frames":9,"fragments":10,"jabbers":11,"oversize_frames":12,"size_buckets":[13,14,15,16,17,18]},"transmitted":{"frames":21,"octets":22,"drop_events":23,"broadcast_frames":24,"multicast_frames":25,"crc_errors":26,"buffer_overflows":27,"internal_errors":28,"undersize_frames":29,"fragments":30,"jabbers":31,"oversize_frames":32,"size_buckets":[33,34,35,36,37,38]}}`
+	script := "#!/bin/sh\ncat > " + requestPath + "\n" +
+		"printf '%s\\n' '" + response + "'\n"
+	if err := os.WriteFile(helper, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile(helper) error = %v", err)
+	}
+	counters, err := (ExecController{Path: helper}).EthernetCounters(0x0101)
+	if err != nil {
+		t.Fatalf("EthernetCounters() error = %v", err)
+	}
+	if counters.Received.Frames != 1 || counters.Received.CRCErrors != 6 ||
+		counters.Received.SizeBuckets[5] != 18 || counters.Transmitted.Frames != 21 ||
+		counters.Transmitted.OversizeFrames != 32 || counters.Transmitted.SizeBuckets[5] != 38 {
+		t.Fatalf("Ethernet counters = %#v", counters)
+	}
+	payload, err := os.ReadFile(requestPath)
+	if err != nil {
+		t.Fatalf("ReadFile(request) error = %v", err)
+	}
+	if !strings.Contains(string(payload), `"action":"ethernet-counters"`) ||
+		!strings.Contains(string(payload), `"ethernet_entity_id":257`) {
+		t.Fatalf("request = %s", payload)
+	}
+}
+
+func TestExecControllerRejectsIncompleteEthernetCounters(t *testing.T) {
+	helper := filepath.Join(t.TempDir(), "control")
+	script := "#!/bin/sh\nprintf '%s\\n' " +
+		"'{\"ethernet_entity_id\":257,\"received\":{},\"transmitted\":{}}'\n"
+	if err := os.WriteFile(helper, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile(helper) error = %v", err)
+	}
+	if _, err := (ExecController{Path: helper}).EthernetCounters(0x0101); err == nil ||
+		!strings.Contains(err.Error(), "required received field") {
+		t.Fatalf("EthernetCounters() error = %v", err)
+	}
+}

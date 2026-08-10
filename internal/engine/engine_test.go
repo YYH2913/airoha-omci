@@ -11,6 +11,7 @@ import (
 	"github.com/google/gopacket"
 	omci "github.com/opencord/omci-lib-go/v2"
 	me "github.com/opencord/omci-lib-go/v2/generated"
+	"github.com/xg2010g/airoha-omci/internal/checksum"
 	"github.com/xg2010g/airoha-omci/internal/mib"
 	"github.com/xg2010g/airoha-omci/internal/optical"
 )
@@ -171,15 +172,19 @@ func TestExtendedReplayUsesSinglePriorityClass(t *testing.T) {
 func TestFrameBoundsAllowAdapterTrailerModes(t *testing.T) {
 	baseline := make([]byte, omci.MaxBaselineLength)
 	baseline[3] = byte(omci.BaselineIdent)
+	binary.BigEndian.PutUint32(baseline[omci.MaxBaselineLength-4:],
+		checksum.CRC32A(baseline[:omci.MaxBaselineLength-4]))
 	extended := make([]byte, 15)
 	extended[3] = byte(omci.ExtendedIdent)
 	binary.BigEndian.PutUint16(extended[8:10], 5)
+	extendedWithMIC := append(append([]byte(nil), extended...), make([]byte, 4)...)
+	binary.BigEndian.PutUint32(extendedWithMIC[len(extended):], checksum.CRC32A(extended))
 
 	for name, frame := range map[string][]byte{
 		"baseline with trailer":    baseline,
 		"baseline without MIC":     baseline[:omci.MaxBaselineLength-4],
 		"baseline without trailer": baseline[:omci.MaxBaselineLength-8],
-		"extended with MIC":        append(append([]byte(nil), extended...), make([]byte, 4)...),
+		"extended with MIC":        extendedWithMIC,
 		"extended without MIC":     extended,
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -202,6 +207,31 @@ func TestFrameBoundsAllowAdapterTrailerModes(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			if err := validateFrame(frame); err == nil {
 				t.Fatal("validateFrame() accepted malformed frame")
+			}
+		})
+	}
+}
+
+func TestFrameBoundsRejectInvalidGPONMIC(t *testing.T) {
+	baseline := make([]byte, omci.MaxBaselineLength)
+	baseline[3] = byte(omci.BaselineIdent)
+	binary.BigEndian.PutUint32(baseline[omci.MaxBaselineLength-4:],
+		checksum.CRC32A(baseline[:omci.MaxBaselineLength-4]))
+	baseline[7] ^= 1
+
+	extended := make([]byte, 19)
+	extended[3] = byte(omci.ExtendedIdent)
+	binary.BigEndian.PutUint16(extended[8:10], 5)
+	binary.BigEndian.PutUint32(extended[15:], checksum.CRC32A(extended[:15]))
+	extended[18] ^= 1
+
+	for name, frame := range map[string][]byte{
+		"baseline": baseline,
+		"extended": extended,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := validateFrame(frame); err == nil {
+				t.Fatal("validateFrame() accepted an invalid GPON MIC")
 			}
 		})
 	}
@@ -366,8 +396,11 @@ func TestMibUploadExcludesPerformanceCounters(t *testing.T) {
 		t.Fatalf("upload commands = %#v, want one ME", commands)
 	}
 	reported := commands[0][0]
-	if got := reported.GetAttributeMask(); got != 0xc000 {
-		t.Fatalf("reported attribute mask = %#x, want 0xc000", got)
+	if got := reported.GetAttributeMask(); got != 0x4000 {
+		t.Fatalf("reported attribute mask = %#x, want control block 0x4000", got)
+	}
+	if _, present := reported.GetAttributeValueMap()[me.EthernetPerformanceMonitoringHistoryData2_IntervalEndTime]; present {
+		t.Fatal("MIB upload includes transient PM interval end time")
 	}
 	if _, present := reported.GetAttributeValueMap()[me.EthernetPerformanceMonitoringHistoryData2_PppoeFilteredFrameCounter]; present {
 		t.Fatal("MIB upload includes a PM measurement counter")
@@ -812,6 +845,56 @@ func TestSynchronizeTimeHandlesBaselineLibraryDecodeFailure(t *testing.T) {
 	want := time.Date(2026, 8, 10, 12, 34, 56, 0, time.UTC)
 	if !controller.timestamp.Equal(want) {
 		t.Fatalf("timestamp = %v, want %v", controller.timestamp, want)
+	}
+}
+
+func TestRebootValidatesTargetAndReservedCondition(t *testing.T) {
+	store, err := mib.New([]mib.Instance{{
+		Key: mib.Key{ClassID: me.OnuGClassID, EntityID: 0},
+		Attributes: me.AttributeValueMap{
+			me.OnuG_VendorId: []byte("TEST"), me.OnuG_Version: make([]byte, 14),
+			me.OnuG_SerialNumber: make([]byte, 8),
+		},
+	}})
+	if err != nil {
+		t.Fatalf("mib.New() error = %v", err)
+	}
+	controller := &recordingController{reboot: 0xff}
+	protocol := NewWithController(store, controller)
+
+	request := func(tci uint16, entityID uint16, condition uint8) []byte {
+		return encodeRequest(t, tci, omci.RebootRequestType, &omci.RebootRequest{
+			MeBasePacket: omci.MeBasePacket{
+				EntityClass: me.OnuGClassID, EntityInstance: entityID,
+			},
+			RebootCondition: condition,
+		})
+	}
+	for _, test := range []struct {
+		name      string
+		request   []byte
+		want      me.Results
+		wantCalls bool
+	}{
+		{name: "wrong instance", request: request(0x701, 1, 0), want: me.UnknownInstance},
+		{name: "reserved condition", request: request(0x702, 0, 3), want: me.ParameterError},
+		{name: "valid conditional", request: request(0x703, 0, 2), want: me.Success, wantCalls: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			controller.reboot = 0xff
+			encoded, err := protocol.Handle(test.request)
+			if err != nil {
+				t.Fatalf("Handle(Reboot) error = %v", err)
+			}
+			response := decodeResponse(t, encoded).Layer(omci.LayerTypeRebootResponse).(*omci.RebootResponse)
+			if response.Result != test.want {
+				t.Fatalf("Reboot result = %v, want %v", response.Result, test.want)
+			}
+			called := controller.reboot != 0xff
+			if called != test.wantCalls {
+				t.Fatalf("controller called = %v, want %v", called, test.wantCalls)
+			}
+		})
 	}
 }
 

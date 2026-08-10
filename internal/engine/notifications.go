@@ -50,6 +50,7 @@ func (e *Engine) notifyAlarmLocked(key mib.Key, bitmap [28]byte,
 	if err := validateDeviceIdentifier(device); err != nil {
 		return nil, false, err
 	}
+	device = e.notificationDeviceLocked(device)
 	if !e.mib.Exists(key) {
 		return nil, false, fmt.Errorf("alarm target %v/%#x does not exist", key.ClassID, key.EntityID)
 	}
@@ -140,6 +141,7 @@ func (e *Engine) notifyAttributeChangeLocked(key mib.Key, attributes me.Attribut
 	if err := validateDeviceIdentifier(device); err != nil {
 		return nil, err
 	}
+	device = e.notificationDeviceLocked(device)
 	changed, err := e.mib.UpdateAutonomous(key, attributes)
 	if err != nil {
 		return nil, err
@@ -238,6 +240,7 @@ func (e *Engine) TestResult(transactionID uint16, key mib.Key, payload []byte,
 	if err := validateDeviceIdentifier(device); err != nil {
 		return nil, err
 	}
+	device = e.notificationDeviceLocked(device)
 	if !e.mib.Exists(key) {
 		return nil, fmt.Errorf("test target %v/%#x does not exist", key.ClassID, key.EntityID)
 	}
@@ -280,6 +283,13 @@ func validateDeviceIdentifier(device omci.DeviceIdent) error {
 		return fmt.Errorf("unsupported OMCI device identifier %#x", byte(device))
 	}
 	return nil
+}
+
+func (e *Engine) notificationDeviceLocked(requested omci.DeviceIdent) omci.DeviceIdent {
+	if requested == omci.ExtendedIdent && !e.extendedSeen {
+		return omci.BaselineIdent
+	}
+	return requested
 }
 
 func validateAlarmBitmap(alarmMap me.AlarmMap, bitmap [28]byte) error {

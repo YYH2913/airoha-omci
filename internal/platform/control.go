@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/xg2010g/airoha-omci/internal/optical"
+	"github.com/xg2010g/airoha-omci/internal/performance"
 )
 
 type ExecController struct {
@@ -21,9 +22,133 @@ type ExecController struct {
 }
 
 type controlRequest struct {
-	Action          string `json:"action"`
-	UnixTime        int64  `json:"unix_time,omitempty"`
-	RebootCondition uint8  `json:"reboot_condition,omitempty"`
+	Action           string  `json:"action"`
+	UnixTime         int64   `json:"unix_time,omitempty"`
+	RebootCondition  uint8   `json:"reboot_condition,omitempty"`
+	GEMPortID        *uint16 `json:"gem_port_id,omitempty"`
+	EthernetEntityID *uint16 `json:"ethernet_entity_id,omitempty"`
+}
+
+type ethernetDirectionResponse struct {
+	Frames          *uint64    `json:"frames"`
+	Octets          *uint64    `json:"octets"`
+	DropEvents      *uint64    `json:"drop_events"`
+	BroadcastFrames *uint64    `json:"broadcast_frames"`
+	MulticastFrames *uint64    `json:"multicast_frames"`
+	CRCErrors       *uint64    `json:"crc_errors"`
+	BufferOverflows *uint64    `json:"buffer_overflows"`
+	InternalErrors  *uint64    `json:"internal_errors"`
+	UndersizeFrames *uint64    `json:"undersize_frames"`
+	Fragments       *uint64    `json:"fragments"`
+	Jabbers         *uint64    `json:"jabbers"`
+	OversizeFrames  *uint64    `json:"oversize_frames"`
+	SizeBuckets     *[6]uint64 `json:"size_buckets"`
+}
+
+func (c ExecController) GEMPortCounters(portID uint16) (performance.GEMPortCounters, error) {
+	output, err := c.execute(controlRequest{Action: "gem-port-counters", GEMPortID: &portID})
+	if err != nil {
+		return performance.GEMPortCounters{}, err
+	}
+	type response struct {
+		GEMPortID               *uint16 `json:"gem_port_id"`
+		ReceivedGEMFrames       *uint64 `json:"received_gem_frames"`
+		ReceivedPayloadBytes    *uint64 `json:"received_payload_bytes"`
+		TransmittedGEMFrames    *uint64 `json:"transmitted_gem_frames"`
+		TransmittedPayloadBytes *uint64 `json:"transmitted_payload_bytes"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(output))
+	decoder.DisallowUnknownFields()
+	var value response
+	if err := decoder.Decode(&value); err != nil {
+		return performance.GEMPortCounters{}, fmt.Errorf("decode GEM port counters: %w", err)
+	}
+	var trailing interface{}
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return performance.GEMPortCounters{}, fmt.Errorf("decode GEM port counters: trailing JSON value")
+		}
+		return performance.GEMPortCounters{}, fmt.Errorf("decode GEM port counters: %w", err)
+	}
+	if value.GEMPortID == nil || *value.GEMPortID != portID ||
+		value.ReceivedGEMFrames == nil || value.ReceivedPayloadBytes == nil ||
+		value.TransmittedGEMFrames == nil || value.TransmittedPayloadBytes == nil {
+		return performance.GEMPortCounters{}, fmt.Errorf("decode GEM port counters: required or matching field is missing")
+	}
+	return performance.GEMPortCounters{
+		ReceivedGEMFrames:       *value.ReceivedGEMFrames,
+		ReceivedPayloadBytes:    *value.ReceivedPayloadBytes,
+		TransmittedGEMFrames:    *value.TransmittedGEMFrames,
+		TransmittedPayloadBytes: *value.TransmittedPayloadBytes,
+	}, nil
+}
+
+func (c ExecController) EthernetCounters(entityID uint16) (performance.EthernetCounters, error) {
+	output, err := c.execute(controlRequest{
+		Action: "ethernet-counters", EthernetEntityID: &entityID,
+	})
+	if err != nil {
+		return performance.EthernetCounters{}, err
+	}
+	type response struct {
+		EthernetEntityID *uint16                    `json:"ethernet_entity_id"`
+		Received         *ethernetDirectionResponse `json:"received"`
+		Transmitted      *ethernetDirectionResponse `json:"transmitted"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(output))
+	decoder.DisallowUnknownFields()
+	var value response
+	if err := decoder.Decode(&value); err != nil {
+		return performance.EthernetCounters{}, fmt.Errorf("decode Ethernet counters: %w", err)
+	}
+	var trailing interface{}
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return performance.EthernetCounters{}, fmt.Errorf("decode Ethernet counters: trailing JSON value")
+		}
+		return performance.EthernetCounters{}, fmt.Errorf("decode Ethernet counters: %w", err)
+	}
+	if value.EthernetEntityID == nil || *value.EthernetEntityID != entityID ||
+		value.Received == nil || value.Transmitted == nil {
+		return performance.EthernetCounters{}, fmt.Errorf(
+			"decode Ethernet counters: required or matching field is missing")
+	}
+	received, err := decodeEthernetDirection("received", value.Received)
+	if err != nil {
+		return performance.EthernetCounters{}, err
+	}
+	transmitted, err := decodeEthernetDirection("transmitted", value.Transmitted)
+	if err != nil {
+		return performance.EthernetCounters{}, err
+	}
+	return performance.EthernetCounters{Received: received, Transmitted: transmitted}, nil
+}
+
+func decodeEthernetDirection(name string,
+	value *ethernetDirectionResponse) (performance.EthernetDirectionCounters, error) {
+	if value.Frames == nil || value.Octets == nil || value.DropEvents == nil ||
+		value.BroadcastFrames == nil || value.MulticastFrames == nil ||
+		value.CRCErrors == nil || value.BufferOverflows == nil || value.InternalErrors == nil ||
+		value.UndersizeFrames == nil || value.Fragments == nil || value.Jabbers == nil ||
+		value.OversizeFrames == nil || value.SizeBuckets == nil {
+		return performance.EthernetDirectionCounters{}, fmt.Errorf(
+			"decode Ethernet counters: required %s field is missing", name)
+	}
+	return performance.EthernetDirectionCounters{
+		Frames:          *value.Frames,
+		Octets:          *value.Octets,
+		DropEvents:      *value.DropEvents,
+		BroadcastFrames: *value.BroadcastFrames,
+		MulticastFrames: *value.MulticastFrames,
+		CRCErrors:       *value.CRCErrors,
+		BufferOverflows: *value.BufferOverflows,
+		InternalErrors:  *value.InternalErrors,
+		UndersizeFrames: *value.UndersizeFrames,
+		Fragments:       *value.Fragments,
+		Jabbers:         *value.Jabbers,
+		OversizeFrames:  *value.OversizeFrames,
+		SizeBuckets:     *value.SizeBuckets,
+	}, nil
 }
 
 func (c ExecController) SynchronizeTime(value time.Time) error {

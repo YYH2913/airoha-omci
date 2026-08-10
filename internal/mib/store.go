@@ -333,6 +333,63 @@ func (s *Store) UpdateAutonomous(key Key, attributes me.AttributeValueMap) (me.A
 	return changed, nil
 }
 
+// UpdateAutonomousBatch atomically records multiple ONU-originated updates.
+// It does not advance MIB data sync or call the service applier. Either every
+// instance is validated and replaced, or the current MIB remains unchanged.
+func (s *Store) UpdateAutonomousBatch(updates map[Key]me.AttributeValueMap) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	proposed := cloneInstances(s.current)
+	for key, attributes := range updates {
+		current, exists := proposed[key]
+		if !exists {
+			return unknownKeyError(key)
+		}
+		entity, result := loadDefinition(key.ClassID, key.EntityID, current.Attributes)
+		if result != nil {
+			return result
+		}
+
+		definitions := entity.GetAttributeDefinitions()
+		var failed uint16
+		var unsupported uint16
+		for name := range attributes {
+			if name == me.ManagedEntityID ||
+				(key.ClassID == me.OnuDataClassID && name == me.OnuData_MibDataSync) {
+				unsupported = 0xffff
+				continue
+			}
+			definition, err := me.GetAttributeDefinitionByName(definitions, name)
+			if err != nil {
+				unsupported = 0xffff
+				continue
+			}
+			if !me.SupportsAttributeAccess(*definition, me.Read) {
+				failed |= definition.Mask
+			}
+		}
+		if failed != 0 || unsupported != 0 {
+			return &ResultError{
+				Result: me.AttributeFailure, FailedMask: failed,
+				UnsupportedMask: unsupported,
+			}
+		}
+
+		next := cloneInstance(current)
+		for name, value := range attributes {
+			next.Attributes[name] = cloneValue(value)
+		}
+		normalized, err := normalize(next)
+		if err != nil {
+			return err
+		}
+		proposed[key] = normalized
+	}
+	s.current = proposed
+	return nil
+}
+
 // UpdateByCommand atomically records read-only state changed as the result of
 // one OLT action. Multiple MEs can change, but MIB data sync advances only once
 // for the command. The action's dedicated controller has already applied the

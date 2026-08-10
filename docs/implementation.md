@@ -5,14 +5,15 @@ and extended messages.  A successful build or reaching GPON O5 is not enough.
 
 | Area | Required behavior | State |
 | --- | --- | --- |
-| OMCC transport | raw RX/TX, cancellation, frame bounds, counters | implemented; MIC/adapter verification pending |
-| Transactions | per-priority stop-and-wait replay and TCI validation | implemented; queue/MIC integration pending |
+| OMCC transport | raw RX/TX, cancellation, frame bounds, counters | implemented; physical adapter verification pending |
+| Transactions | per-priority stop-and-wait replay and TCI validation | implemented; queue integration pending |
 | MIB | ONU defaults, platform-gated create/delete/set, reset, data sync | in progress |
 | MIB upload | baseline fragmentation and extended multi-ME packing | in progress |
 | Tables | stable Get/Get Next cache and baseline/enhanced extended Set Table | implemented; OLT verification pending |
 | Notifications | alarm audit/sequence, event-driven Alarm/AVC, requested optical tests and ARC | in progress |
 | Equipment | ONU-G, ONU2-G, ANI-G, four speed-specific Ethernet UNIs, software images | in progress |
 | Traffic | 8 T-CONTs/schedulers, 96 queues, GEM CTP/IW validation and hardware apply | in progress |
+| Performance | common 15-minute engine, GEM CTP and Ethernet UNI/frame PM | class 341, 24, 296, 321 and 322 implemented; thresholds and physical verification pending |
 | Ethernet service | resolved bridge, mapper, VLAN and extended VLAN graph | common UNI/ANI bridge service implemented; advanced associations pending |
 | Lifecycle | reboot, time sync, software download/activate/commit | implemented; OLT verification pending |
 | Platform | multi-T-CONT/GEM Airoha ABI and transactional Linux backend | GEM, UNI VLAN and single-profile MAC bridge implemented; hardware offload pending |
@@ -37,8 +38,12 @@ Transport validation accepts only the explicit OMCC adapter forms: a 48-byte
 baseline frame, the 44-byte MIC-stripped form emitted by the protocol library,
 or the 40-byte trailer-stripped form; and an extended frame whose declared
 content length exactly matches the packet with or without the four-byte MIC.
-Oversized, truncated, unknown-format and trailing-byte frames are rejected
-before protocol dispatch.
+For GPON, a retained baseline or extended MIC is verified as the
+CRC-32/ITU-I.363.5 of all preceding OMCI bytes. MIC-stripped frames remain
+valid because the kernel or MAC may have already verified and consumed it;
+the protocol library's AES-CMAC mode is not used for GPON. Oversized,
+truncated, unknown-format, trailing-byte and bad-MIC frames are rejected before
+protocol dispatch.
 
 MIB upload uses an immutable per-message-set snapshot with the G.988 one-minute
 inactivity limit. Each valid MIB upload next request, including a retransmission,
@@ -52,6 +57,24 @@ Create, delete, Set and SetTable advance the counter only when the committed MIB
 changes. An OLT Set of ONU data MIB data sync to `N` atomically commits `N+1`,
 with 255 wrapping to 1; a platform apply failure leaves both the MIB and counter
 unchanged.
+
+Performance monitoring uses one synchronized 15-minute interval across all
+active PM MEs. Class 341 reads per-GEM 64-bit GPON MAC counters. Classes 24 and
+296 read the physical Ethernet UNI selected by their identical entity ID;
+classes 321 and 322 resolve a MAC bridge port whose TP type is PPTP Ethernet
+UNI and use the transmitted and received direction respectively. Bridge-port
+ANI/GEM terminations are rejected because a physical PON netdev counter cannot
+represent one bridge flow accurately. Get current data is limited to the
+G.988 aggregate attribute size of 25 octets. Counter rollback is treated as a
+hardware reset, 32-bit OMCI counters saturate, skipped intervals are emitted as
+zero, and Synchronize time or MIB reset atomically restarts the interval.
+
+The XG2010G Ethernet driver exposes a root-only counter snapshot for each
+`lan1` through `lan4` netdev. Its existing GDM3/GDM4 per-NBQ MIB split keeps
+multi-serdes ports independent, while runt and exact 64-octet frames are now
+kept in separate buckets. The platform helper accepts only the four fixed UNI
+entity IDs. PM threshold data association and TCA generation are not yet
+implemented.
 
 The fixed-path event helper now maps XG2010G BOSA LOS, GPON activation state,
 optical diagnostics and the four Ethernet carrier states into validated

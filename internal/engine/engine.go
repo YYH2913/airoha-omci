@@ -8,14 +8,17 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/gopacket"
 	omci "github.com/opencord/omci-lib-go/v2"
 	me "github.com/opencord/omci-lib-go/v2/generated"
+	"github.com/xg2010g/airoha-omci/internal/checksum"
 	"github.com/xg2010g/airoha-omci/internal/mib"
 	"github.com/xg2010g/airoha-omci/internal/optical"
+	"github.com/xg2010g/airoha-omci/internal/performance"
 	"github.com/xg2010g/airoha-omci/internal/software"
 )
 
@@ -67,23 +70,30 @@ type Engine struct {
 
 	mib *mib.Store
 
-	transactions  [transactionChannelCount]transactionReplay
-	oneWayDigest  [sha256.Size]byte
-	oneWayValid   bool
-	upload        map[omci.DeviceIdent]uploadSession
-	tables        map[tableKey][]byte
-	alarms        map[mib.Key][28]byte
-	alarmUpload   map[omci.DeviceIdent][]Alarm
-	alarmSequence uint8
-	arcFreeSince  map[mib.Key]time.Time
-	opticalSample map[mib.Key]optical.Sample
-	now           func() time.Time
-	controller    Controller
-	software      software.Controller
-	download      *softwareDownload
-	softwareState SoftwareStatus
-	pending       [][]byte
-	pendingError  error
+	transactions           [transactionChannelCount]transactionReplay
+	oneWayDigest           [sha256.Size]byte
+	oneWayValid            bool
+	upload                 map[omci.DeviceIdent]uploadSession
+	tables                 map[tableKey][]byte
+	alarms                 map[mib.Key][28]byte
+	alarmUpload            map[omci.DeviceIdent][]Alarm
+	alarmSequence          uint8
+	arcFreeSince           map[mib.Key]time.Time
+	opticalSample          map[mib.Key]optical.Sample
+	now                    func() time.Time
+	controller             Controller
+	software               software.Controller
+	download               *softwareDownload
+	softwareState          SoftwareStatus
+	pending                [][]byte
+	pendingError           error
+	extendedSeen           bool
+	performance            performance.Controller
+	performanceState       map[mib.Key]performanceState
+	ethernetPerformance    performance.EthernetController
+	ethernetPMState        map[mib.Key]ethernetPerformanceState
+	performanceNext        time.Time
+	performanceIntervalEnd uint8
 }
 
 func New(store *mib.Store) *Engine {
@@ -95,19 +105,28 @@ func NewWithController(store *mib.Store, controller Controller) *Engine {
 }
 
 func NewWithControllers(store *mib.Store, controller Controller, softwareController software.Controller) *Engine {
-	return &Engine{
-		mib:           store,
-		upload:        make(map[omci.DeviceIdent]uploadSession),
-		tables:        make(map[tableKey][]byte),
-		alarms:        make(map[mib.Key][28]byte),
-		alarmUpload:   make(map[omci.DeviceIdent][]Alarm),
-		arcFreeSince:  make(map[mib.Key]time.Time),
-		opticalSample: make(map[mib.Key]optical.Sample),
-		now:           time.Now,
-		controller:    controller,
-		software:      softwareController,
-		softwareState: SoftwareStatus{Phase: "idle"},
+	result := &Engine{
+		mib:              store,
+		upload:           make(map[omci.DeviceIdent]uploadSession),
+		tables:           make(map[tableKey][]byte),
+		alarms:           make(map[mib.Key][28]byte),
+		alarmUpload:      make(map[omci.DeviceIdent][]Alarm),
+		arcFreeSince:     make(map[mib.Key]time.Time),
+		opticalSample:    make(map[mib.Key]optical.Sample),
+		now:              time.Now,
+		controller:       controller,
+		software:         softwareController,
+		softwareState:    SoftwareStatus{Phase: "idle"},
+		performanceState: make(map[mib.Key]performanceState),
+		ethernetPMState:  make(map[mib.Key]ethernetPerformanceState),
 	}
+	if performanceController, ok := controller.(performance.Controller); ok {
+		result.performance = performanceController
+	}
+	if ethernetController, ok := controller.(performance.EthernetController); ok {
+		result.ethernetPerformance = ethernetController
+	}
+	return result
 }
 
 // SetAlarm updates the alarm table used by Get All Alarms. A zero bitmap
@@ -145,6 +164,25 @@ func (e *Engine) DrainNotificationError() error {
 	return err
 }
 
+// ResetCommunicationSession clears state scoped to one OMCC communication
+// session without changing the ONU MIB or current alarm conditions. The
+// platform adapter calls it when the OMCI carrier drops during re-ranging.
+func (e *Engine) ResetCommunicationSession() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	e.transactions = [transactionChannelCount]transactionReplay{}
+	e.oneWayDigest = [sha256.Size]byte{}
+	e.oneWayValid = false
+	e.upload = make(map[omci.DeviceIdent]uploadSession)
+	e.tables = make(map[tableKey][]byte)
+	e.alarmUpload = make(map[omci.DeviceIdent][]Alarm)
+	e.alarmSequence = 0
+	e.pending = nil
+	e.pendingError = nil
+	e.extendedSeen = false
+}
+
 // Handle processes one complete downstream OMCI frame and returns the upstream
 // response. G.988 stop-and-wait replay is tracked independently for baseline
 // low/high priority and for the single extended-message priority class.
@@ -154,6 +192,9 @@ func (e *Engine) Handle(frame []byte) ([]byte, error) {
 
 	if err := validateFrame(frame); err != nil {
 		return nil, err
+	}
+	if omci.DeviceIdent(frame[3]) == omci.ExtendedIdent {
+		e.extendedSeen = true
 	}
 	packet := gopacket.NewPacket(frame, omci.LayerTypeOMCI, gopacket.Default)
 	headerLayer := packet.Layer(omci.LayerTypeOMCI)
@@ -217,10 +258,31 @@ func (e *Engine) dispatch(packet gopacket.Packet, header *omci.OMCI) ([]byte, er
 		if err != nil {
 			return nil, err
 		}
-		operationError := e.mib.Create(request.EntityClass, request.EntityInstance, request.Attributes)
+		var preparedPerformance *performanceState
+		var preparedEthernet *ethernetPerformanceState
+		var operationError error
+		if request.EntityClass == me.GemPortNetworkCtpPerformanceMonitoringHistoryDataClassID {
+			preparedPerformance, operationError = e.prepareGEMPerformanceCreateLocked(request.EntityInstance)
+		} else if isEthernetPerformanceClass(request.EntityClass) {
+			preparedEthernet, operationError = e.prepareEthernetPerformanceCreateLocked(
+				request.EntityClass, request.EntityInstance)
+		}
+		if operationError == nil {
+			operationError = e.mib.Create(request.EntityClass, request.EntityInstance, request.Attributes)
+		}
 		result, failed, _ := operationResult(operationError)
 		if result == me.Success {
 			e.tables = make(map[tableKey][]byte)
+			if preparedPerformance != nil {
+				e.performanceState[mib.Key{
+					ClassID: request.EntityClass, EntityID: request.EntityInstance,
+				}] = *preparedPerformance
+			}
+			if preparedEthernet != nil {
+				e.ethernetPMState[mib.Key{
+					ClassID: request.EntityClass, EntityID: request.EntityInstance,
+				}] = *preparedEthernet
+			}
 		}
 		return serialize(header, omci.CreateResponseType, &omci.CreateResponse{
 			MeBasePacket: omci.MeBasePacket{
@@ -237,12 +299,29 @@ func (e *Engine) dispatch(packet gopacket.Packet, header *omci.OMCI) ([]byte, er
 		if err != nil {
 			return nil, err
 		}
-		result, _, _ := operationResult(e.mib.Delete(mib.Key{
+		key := mib.Key{
 			ClassID:  request.EntityClass,
 			EntityID: request.EntityInstance,
-		}))
+		}
+		var operationError error
+		if request.EntityClass == me.GemPortNetworkCtpClassID && e.mib.Exists(mib.Key{
+			ClassID:  me.GemPortNetworkCtpPerformanceMonitoringHistoryDataClassID,
+			EntityID: request.EntityInstance,
+		}) {
+			operationError = &mib.ResultError{Result: me.ParameterError,
+				Cause: fmt.Errorf("GEM port has an active performance monitoring instance")}
+		} else if request.EntityClass == me.MacBridgePortConfigurationDataClassID &&
+			e.bridgePortHasPerformanceLocked(request.EntityInstance) {
+			operationError = &mib.ResultError{Result: me.ParameterError,
+				Cause: fmt.Errorf("MAC bridge port has an active performance monitoring instance")}
+		} else {
+			operationError = e.mib.Delete(key)
+		}
+		result, _, _ := operationResult(operationError)
 		if result == me.Success {
 			e.tables = make(map[tableKey][]byte)
+			delete(e.performanceState, key)
+			delete(e.ethernetPMState, key)
 		}
 		return serialize(header, omci.DeleteResponseType, &omci.DeleteResponse{
 			MeBasePacket: omci.MeBasePacket{
@@ -262,7 +341,16 @@ func (e *Engine) dispatch(packet gopacket.Packet, header *omci.OMCI) ([]byte, er
 			ClassID:  request.EntityClass,
 			EntityID: request.EntityInstance,
 		}
-		result, failed, unsupported := operationResult(e.mib.Set(key, request.Attributes))
+		var operationError error
+		if request.EntityClass == me.MacBridgePortConfigurationDataClassID &&
+			e.bridgePortHasPerformanceLocked(request.EntityInstance) &&
+			bridgePortAssociationChanged(request.Attributes) {
+			operationError = &mib.ResultError{Result: me.ParameterError,
+				Cause: fmt.Errorf("MAC bridge port association is monitored")}
+		} else {
+			operationError = e.mib.Set(key, request.Attributes)
+		}
+		result, failed, unsupported := operationResult(operationError)
 		if result == me.Success {
 			e.tables = make(map[tableKey][]byte)
 			notifications, notifyErr := e.afterSetLocked(key, request.Attributes, header.DeviceIdentifier)
@@ -322,6 +410,10 @@ func (e *Engine) dispatch(packet gopacket.Packet, header *omci.OMCI) ([]byte, er
 			e.upload = make(map[omci.DeviceIdent]uploadSession)
 			e.tables = make(map[tableKey][]byte)
 			e.arcFreeSince = make(map[mib.Key]time.Time)
+			e.performanceState = make(map[mib.Key]performanceState)
+			e.ethernetPMState = make(map[mib.Key]ethernetPerformanceState)
+			e.performanceNext = time.Time{}
+			e.performanceIntervalEnd = 0
 		}
 		return serialize(header, omci.MibResetResponseType, &omci.MibResetResponse{
 			MeBasePacket: omci.MeBasePacket{
@@ -509,11 +601,16 @@ func (e *Engine) dispatch(packet gopacket.Packet, header *omci.OMCI) ([]byte, er
 		if err != nil {
 			return nil, err
 		}
-		instance, operationError := e.mib.Get(mib.Key{
+		instance, operationError := e.getCurrentPerformanceLocked(mib.Key{
 			ClassID:  request.EntityClass,
 			EntityID: request.EntityInstance,
 		}, request.AttributeMask)
 		result, failed, unsupported := operationResult(operationError)
+		responseMask := request.AttributeMask &^ unsupported &^ failed
+		if result != me.Success && result != me.AttributeFailure {
+			responseMask = 0
+			instance.Attributes = nil
+		}
 		return serialize(header, omci.GetCurrentDataResponseType, &omci.GetCurrentDataResponse{
 			MeBasePacket: omci.MeBasePacket{
 				EntityClass:    request.EntityClass,
@@ -521,7 +618,7 @@ func (e *Engine) dispatch(packet gopacket.Packet, header *omci.OMCI) ([]byte, er
 				Extended:       extended,
 			},
 			Result:                   result,
-			AttributeMask:            request.AttributeMask &^ unsupported &^ failed,
+			AttributeMask:            responseMask,
 			Attributes:               instance.Attributes,
 			FailedAttributeMask:      failed,
 			UnsupportedAttributeMask: unsupported,
@@ -638,12 +735,20 @@ func (e *Engine) dispatch(packet gopacket.Packet, header *omci.OMCI) ([]byte, er
 		if err != nil {
 			return nil, err
 		}
-		result := me.NotSupported
-		if e.controller != nil {
+		result := me.Success
+		if request.EntityClass != me.OnuGClassID {
+			result = me.UnknownEntity
+		} else if request.EntityInstance != 0 || !e.mib.Exists(mib.Key{
+			ClassID: me.OnuGClassID, EntityID: 0,
+		}) {
+			result = me.UnknownInstance
+		} else if request.RebootCondition > 2 {
+			result = me.ParameterError
+		} else if e.controller == nil {
+			result = me.NotSupported
+		} else {
 			if err := e.controller.Reboot(request.RebootCondition); err != nil {
 				result = me.ProcessingError
-			} else {
-				result = me.Success
 			}
 		}
 		return serialize(header, omci.RebootResponseType, &omci.RebootResponse{
@@ -773,7 +878,14 @@ func (e *Engine) synchronizeTime(year uint16, month, day, hour, minute, second u
 		requested.Minute() != int(minute) || requested.Second() != int(second) {
 		return me.ParameterError
 	}
+	baselines, err := e.preparePerformanceSynchronizationLocked()
+	if err != nil {
+		return me.ProcessingError
+	}
 	if err := e.controller.SynchronizeTime(requested); err != nil {
+		return me.ProcessingError
+	}
+	if err := e.commitPerformanceSynchronizationLocked(requested, baselines); err != nil {
 		return me.ProcessingError
 	}
 	return me.Success
@@ -810,6 +922,7 @@ func buildUpload(snapshot []mib.Instance, device omci.DeviceIdent) ([]uploadComm
 			return nil
 		}
 
+		performanceMonitoring := isPerformanceMonitoringDefinition(definition.GetManagedEntityDefinition().GetName())
 		for _, index := range me.GetAttributeDefinitionMapKeys(definition.GetAttributeDefinitions()) {
 			if index == 0 {
 				continue
@@ -817,7 +930,8 @@ func buildUpload(snapshot []mib.Instance, device omci.DeviceIdent) ([]uploadComm
 			attribute := definition.GetAttributeDefinitions()[index]
 			value, present := instance.Attributes[attribute.GetName()]
 			if !present || !me.SupportsAttributeAccess(attribute, me.Read) ||
-				attribute.IsTableAttribute() || attribute.IsCounter() {
+				attribute.IsTableAttribute() || attribute.IsCounter() ||
+				(performanceMonitoring && index != 2) {
 				continue
 			}
 			size := attribute.GetSize()
@@ -870,6 +984,11 @@ func buildUpload(snapshot []mib.Instance, device omci.DeviceIdent) ([]uploadComm
 		commands = append(commands, current)
 	}
 	return commands, nil
+}
+
+func isPerformanceMonitoringDefinition(name string) bool {
+	return strings.Contains(name, "PerformanceMonitoringHistoryData") ||
+		strings.Contains(name, "ExtendedPm")
 }
 
 func (e *Engine) prepareTableGet(instance *mib.Instance, requestedMask uint16,
@@ -1158,6 +1277,9 @@ func validateFrame(frame []byte) error {
 			len(frame) != omci.MaxBaselineLength-8 {
 			return fmt.Errorf("invalid baseline OMCI frame length %d", len(frame))
 		}
+		if len(frame) == omci.MaxBaselineLength {
+			return validateGPONMIC(frame[:omci.MaxBaselineLength-4], frame[omci.MaxBaselineLength-4:])
+		}
 	case omci.ExtendedIdent:
 		if len(frame) < 10 {
 			return fmt.Errorf("invalid extended OMCI frame length %d", len(frame))
@@ -1169,8 +1291,18 @@ func validateFrame(frame []byte) error {
 			return fmt.Errorf("extended OMCI content length %d does not match frame length %d",
 				payloadEnd-10, len(frame))
 		}
+		if len(frame) == payloadEnd+4 {
+			return validateGPONMIC(frame[:payloadEnd], frame[payloadEnd:])
+		}
 	default:
 		return fmt.Errorf("unsupported OMCI device identifier %#x", frame[3])
+	}
+	return nil
+}
+
+func validateGPONMIC(contents, encodedMIC []byte) error {
+	if binary.BigEndian.Uint32(encodedMIC) != checksum.CRC32A(contents) {
+		return errors.New("invalid GPON OMCI MIC")
 	}
 	return nil
 }

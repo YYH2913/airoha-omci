@@ -5,8 +5,20 @@ writes one UTF-8 JSON object per stdout line. Blank lines and lines beginning
 with `#` are ignored. A malformed line terminates the helper session so procd
 can restart the complete control plane instead of silently losing alarms.
 
-The default format is baseline. An event may set `"format":"extended"` when
-the payload requires the extended message set.
+The default format is baseline. An event may request `"format":"extended"`
+when the payload requires the extended message set. The engine emits baseline
+until the OLT has sent the first valid extended message in the current OMCC
+session, as required by G.988.
+
+## OMCC session reset
+
+The platform helper emits this event when the raw OMCI carrier drops. It clears
+message-set negotiation, transaction replay, upload caches and the alarm
+sequence number without changing the ONU MIB or current alarm conditions.
+
+```json
+{"type":"omcc-session-reset"}
+```
 
 ## Alarm condition
 

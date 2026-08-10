@@ -29,6 +29,7 @@ type Snapshot struct {
 	DecodeErrors         uint64    `json:"decode_errors"`
 	TransportErrors      uint64    `json:"transport_errors"`
 	EventErrors          uint64    `json:"event_errors"`
+	PerformanceErrors    uint64    `json:"performance_errors"`
 	NotificationFrames   uint64    `json:"notification_frames"`
 	LastTransactionID    uint16    `json:"last_transaction_id"`
 	LastMessageType      uint8     `json:"last_message_type"`

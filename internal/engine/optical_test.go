@@ -51,6 +51,7 @@ func TestOpticalSampleUpdatesANIGAndAppliesHysteresis(t *testing.T) {
 		t.Fatalf("hysteresis sample frames=%d error=%v", len(frames), err)
 	}
 
+	negotiateExtended(t, protocol)
 	frames, err = protocol.NotifyOpticalSample(key, optical.Sample{
 		LaserBiasCurrent: 2500, TransmitPower: 10000, ReceivePower: 120,
 	}, omci.ExtendedIdent)
