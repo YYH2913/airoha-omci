@@ -49,6 +49,164 @@ func TestCreateDuplicateIsReplayedWithoutDoubleMutation(t *testing.T) {
 	}
 }
 
+func TestBaselineReplayUsesLastTCIPerPriority(t *testing.T) {
+	protocol, store := newTestEngine(t)
+	low := encodeRequest(t, 0x0042, omci.CreateRequestType, &omci.CreateRequest{
+		MeBasePacket: omci.MeBasePacket{
+			EntityClass:    me.GalEthernetProfileClassID,
+			EntityInstance: 1,
+		},
+		Attributes: me.AttributeValueMap{
+			me.GalEthernetProfile_MaximumGemPayloadSize: uint16(48),
+		},
+	})
+	first, err := protocol.Handle(low)
+	if err != nil {
+		t.Fatalf("Handle(low priority) error = %v", err)
+	}
+
+	sameTCI := encodeRequest(t, 0x0042, omci.CreateRequestType, &omci.CreateRequest{
+		MeBasePacket: omci.MeBasePacket{
+			EntityClass:    me.GalEthernetProfileClassID,
+			EntityInstance: 2,
+		},
+		Attributes: me.AttributeValueMap{
+			me.GalEthernetProfile_MaximumGemPayloadSize: uint16(48),
+		},
+	})
+	replayed, err := protocol.Handle(sameTCI)
+	if err != nil {
+		t.Fatalf("Handle(same low-priority TCI) error = %v", err)
+	}
+	if string(replayed) != string(first) || store.Exists(mib.Key{
+		ClassID: me.GalEthernetProfileClassID, EntityID: 2,
+	}) {
+		t.Fatal("same low-priority TCI was executed instead of replayed")
+	}
+
+	high := encodeRequest(t, 0x8042, omci.CreateRequestType, &omci.CreateRequest{
+		MeBasePacket: omci.MeBasePacket{
+			EntityClass:    me.GalEthernetProfileClassID,
+			EntityInstance: 2,
+		},
+		Attributes: me.AttributeValueMap{
+			me.GalEthernetProfile_MaximumGemPayloadSize: uint16(48),
+		},
+	})
+	encoded, err := protocol.Handle(high)
+	if err != nil {
+		t.Fatalf("Handle(high priority) error = %v", err)
+	}
+	response := decodeResponse(t, encoded).Layer(omci.LayerTypeCreateResponse).(*omci.CreateResponse)
+	if response.Result != me.Success || !store.Exists(mib.Key{
+		ClassID: me.GalEthernetProfileClassID, EntityID: 2,
+	}) || store.DataSync() != 2 {
+		t.Fatalf("independent high-priority transaction failed: result=%v sync=%d",
+			response.Result, store.DataSync())
+	}
+}
+
+func TestOnlyLastTransactionInPriorityClassIsReplayed(t *testing.T) {
+	protocol, store := newTestEngine(t)
+	create := func(tci, entityID uint16) []byte {
+		return encodeRequest(t, tci, omci.CreateRequestType, &omci.CreateRequest{
+			MeBasePacket: omci.MeBasePacket{
+				EntityClass:    me.GalEthernetProfileClassID,
+				EntityInstance: entityID,
+			},
+			Attributes: me.AttributeValueMap{
+				me.GalEthernetProfile_MaximumGemPayloadSize: uint16(48),
+			},
+		})
+	}
+
+	first := create(1, 1)
+	if _, err := protocol.Handle(first); err != nil {
+		t.Fatalf("Handle(first transaction) error = %v", err)
+	}
+	if _, err := protocol.Handle(create(2, 2)); err != nil {
+		t.Fatalf("Handle(second transaction) error = %v", err)
+	}
+	encoded, err := protocol.Handle(first)
+	if err != nil {
+		t.Fatalf("Handle(expired transaction ID) error = %v", err)
+	}
+	response := decodeResponse(t, encoded).Layer(omci.LayerTypeCreateResponse).(*omci.CreateResponse)
+	if response.Result != me.InstanceExists || store.DataSync() != 2 {
+		t.Fatalf("expired transaction replay result=%v sync=%d, want InstanceExists/2",
+			response.Result, store.DataSync())
+	}
+}
+
+func TestExtendedReplayUsesSinglePriorityClass(t *testing.T) {
+	protocol, store := newTestEngine(t)
+	create := func(entityID uint16) []byte {
+		return encodeRequestForDevice(t, 0x8042, omci.CreateRequestType, &omci.CreateRequest{
+			MeBasePacket: omci.MeBasePacket{
+				EntityClass:    me.GalEthernetProfileClassID,
+				EntityInstance: entityID,
+				Extended:       true,
+			},
+			Attributes: me.AttributeValueMap{
+				me.GalEthernetProfile_MaximumGemPayloadSize: uint16(48),
+			},
+		}, omci.ExtendedIdent)
+	}
+
+	first, err := protocol.Handle(create(1))
+	if err != nil {
+		t.Fatalf("Handle(first extended transaction) error = %v", err)
+	}
+	replayed, err := protocol.Handle(create(2))
+	if err != nil {
+		t.Fatalf("Handle(reused extended TCI) error = %v", err)
+	}
+	if string(replayed) != string(first) || store.Exists(mib.Key{
+		ClassID: me.GalEthernetProfileClassID, EntityID: 2,
+	}) || store.DataSync() != 1 {
+		t.Fatal("extended TCI was not replayed in the single priority class")
+	}
+}
+
+func TestFrameBoundsAllowAdapterTrailerModes(t *testing.T) {
+	baseline := make([]byte, omci.MaxBaselineLength)
+	baseline[3] = byte(omci.BaselineIdent)
+	extended := make([]byte, 15)
+	extended[3] = byte(omci.ExtendedIdent)
+	binary.BigEndian.PutUint16(extended[8:10], 5)
+
+	for name, frame := range map[string][]byte{
+		"baseline with trailer":    baseline,
+		"baseline without MIC":     baseline[:omci.MaxBaselineLength-4],
+		"baseline without trailer": baseline[:omci.MaxBaselineLength-8],
+		"extended with MIC":        append(append([]byte(nil), extended...), make([]byte, 4)...),
+		"extended without MIC":     extended,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := validateFrame(frame); err != nil {
+				t.Fatalf("validateFrame() error = %v", err)
+			}
+		})
+	}
+
+	for name, frame := range map[string][]byte{
+		"short header":          make([]byte, 3),
+		"unknown device":        append([]byte{0, 1, byte(omci.GetRequestType), 0xff}, make([]byte, 44)...),
+		"short baseline":        baseline[:39],
+		"trailing baseline":     append(append([]byte(nil), baseline...), 0),
+		"short extended header": []byte{0, 1, byte(omci.GetRequestType), byte(omci.ExtendedIdent)},
+		"truncated extended":    extended[:14],
+		"trailing extended":     append(append([]byte(nil), extended...), 0),
+		"oversized extended":    append([]byte{0, 1, byte(omci.GetRequestType), byte(omci.ExtendedIdent)}, make([]byte, omci.MaxExtendedLength-3)...),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := validateFrame(frame); err == nil {
+				t.Fatal("validateFrame() accepted malformed frame")
+			}
+		})
+	}
+}
+
 func TestMibResetAndUpload(t *testing.T) {
 	engine, store := newTestEngine(t)
 	if err := store.Create(me.GalEthernetProfileClassID, 1, me.AttributeValueMap{
@@ -90,6 +248,129 @@ func TestMibResetAndUpload(t *testing.T) {
 	nextResponse := decodeResponse(t, encoded).Layer(omci.LayerTypeMibUploadNextResponse).(*omci.MibUploadNextResponse)
 	if nextResponse.ReportedME.GetClassID() != me.OnuDataClassID {
 		t.Fatalf("reported class = %v, want ONU data", nextResponse.ReportedME.GetClassID())
+	}
+}
+
+func TestMibUploadNextInvalidSequenceReturnsEmptyResponse(t *testing.T) {
+	for name, device := range map[string]omci.DeviceIdent{
+		"baseline": omci.BaselineIdent,
+		"extended": omci.ExtendedIdent,
+	} {
+		t.Run(name, func(t *testing.T) {
+			protocol, _ := newTestEngine(t)
+			upload := encodeRequestForDevice(t, 0x120, omci.MibUploadRequestType,
+				&omci.MibUploadRequest{MeBasePacket: omci.MeBasePacket{
+					EntityClass: me.OnuDataClassID,
+					Extended:    device == omci.ExtendedIdent,
+				}}, device)
+			if _, err := protocol.Handle(upload); err != nil {
+				t.Fatalf("Handle(MIB upload) error = %v", err)
+			}
+
+			next := encodeRequestForDevice(t, 0x121, omci.MibUploadNextRequestType,
+				&omci.MibUploadNextRequest{
+					MeBasePacket: omci.MeBasePacket{
+						EntityClass: me.OnuDataClassID,
+						Extended:    device == omci.ExtendedIdent,
+					},
+					CommandSequenceNumber: 1,
+				}, device)
+			encoded, err := protocol.Handle(next)
+			if err != nil {
+				t.Fatalf("Handle(out-of-range MIB upload next) error = %v", err)
+			}
+			assertEmptyMibUploadNext(t, encoded, device)
+		})
+	}
+}
+
+func TestMibUploadSessionExpiresAndValidNextRefreshesIt(t *testing.T) {
+	t.Run("expires at one minute", func(t *testing.T) {
+		protocol, _ := newTestEngine(t)
+		now := time.Date(2026, 8, 11, 0, 0, 0, 0, time.UTC)
+		protocol.now = func() time.Time { return now }
+		upload := encodeRequest(t, 0x130, omci.MibUploadRequestType,
+			&omci.MibUploadRequest{MeBasePacket: omci.MeBasePacket{EntityClass: me.OnuDataClassID}})
+		if _, err := protocol.Handle(upload); err != nil {
+			t.Fatalf("Handle(MIB upload) error = %v", err)
+		}
+		now = now.Add(mibUploadTimeout)
+		next := encodeRequest(t, 0x131, omci.MibUploadNextRequestType,
+			&omci.MibUploadNextRequest{
+				MeBasePacket:          omci.MeBasePacket{EntityClass: me.OnuDataClassID},
+				CommandSequenceNumber: 0,
+			})
+		encoded, err := protocol.Handle(next)
+		if err != nil {
+			t.Fatalf("Handle(expired MIB upload next) error = %v", err)
+		}
+		assertEmptyMibUploadNext(t, encoded, omci.BaselineIdent)
+	})
+
+	t.Run("valid request and retransmission refresh", func(t *testing.T) {
+		protocol, _ := newTestEngine(t)
+		now := time.Date(2026, 8, 11, 0, 0, 0, 0, time.UTC)
+		protocol.now = func() time.Time { return now }
+		upload := encodeRequest(t, 0x140, omci.MibUploadRequestType,
+			&omci.MibUploadRequest{MeBasePacket: omci.MeBasePacket{EntityClass: me.OnuDataClassID}})
+		if _, err := protocol.Handle(upload); err != nil {
+			t.Fatalf("Handle(MIB upload) error = %v", err)
+		}
+
+		now = now.Add(59 * time.Second)
+		next := encodeRequest(t, 0x141, omci.MibUploadNextRequestType,
+			&omci.MibUploadNextRequest{
+				MeBasePacket:          omci.MeBasePacket{EntityClass: me.OnuDataClassID},
+				CommandSequenceNumber: 0,
+			})
+		first, err := protocol.Handle(next)
+		if err != nil || !mibUploadNextHasContents(first, omci.BaselineIdent) {
+			t.Fatalf("first MIB upload next: contents=%t error=%v",
+				mibUploadNextHasContents(first, omci.BaselineIdent), err)
+		}
+
+		now = now.Add(59 * time.Second)
+		replayed, err := protocol.Handle(next)
+		if err != nil || string(replayed) != string(first) {
+			t.Fatalf("retransmitted MIB upload next was not replayed: error=%v", err)
+		}
+
+		now = now.Add(59 * time.Second)
+		later := encodeRequest(t, 0x142, omci.MibUploadNextRequestType,
+			&omci.MibUploadNextRequest{
+				MeBasePacket:          omci.MeBasePacket{EntityClass: me.OnuDataClassID},
+				CommandSequenceNumber: 0,
+			})
+		encoded, err := protocol.Handle(later)
+		if err != nil || !mibUploadNextHasContents(encoded, omci.BaselineIdent) {
+			t.Fatalf("refreshed MIB upload next: contents=%t error=%v",
+				mibUploadNextHasContents(encoded, omci.BaselineIdent), err)
+		}
+	})
+}
+
+func TestMibUploadExcludesPerformanceCounters(t *testing.T) {
+	snapshot := []mib.Instance{{
+		Key: mib.Key{ClassID: me.EthernetPerformanceMonitoringHistoryData2ClassID, EntityID: 1},
+		Attributes: me.AttributeValueMap{
+			me.EthernetPerformanceMonitoringHistoryData2_IntervalEndTime:           uint8(7),
+			me.EthernetPerformanceMonitoringHistoryData2_ThresholdData12Id:         uint16(2),
+			me.EthernetPerformanceMonitoringHistoryData2_PppoeFilteredFrameCounter: uint32(99),
+		},
+	}}
+	commands, err := buildUpload(snapshot, omci.BaselineIdent)
+	if err != nil {
+		t.Fatalf("buildUpload() error = %v", err)
+	}
+	if len(commands) != 1 || len(commands[0]) != 1 {
+		t.Fatalf("upload commands = %#v, want one ME", commands)
+	}
+	reported := commands[0][0]
+	if got := reported.GetAttributeMask(); got != 0xc000 {
+		t.Fatalf("reported attribute mask = %#x, want 0xc000", got)
+	}
+	if _, present := reported.GetAttributeValueMap()[me.EthernetPerformanceMonitoringHistoryData2_PppoeFilteredFrameCounter]; present {
+		t.Fatal("MIB upload includes a PM measurement counter")
 	}
 }
 
@@ -528,4 +809,27 @@ func decodeResponse(t *testing.T, encoded []byte) gopacket.Packet {
 		t.Fatalf("decode response error = %v\nframe = %x", err.Error(), encoded)
 	}
 	return packet
+}
+
+func assertEmptyMibUploadNext(t *testing.T, encoded []byte, device omci.DeviceIdent) {
+	t.Helper()
+	if len(encoded) < 10 || encoded[2] != byte(omci.MibUploadNextResponseType) ||
+		encoded[3] != byte(device) || binary.BigEndian.Uint16(encoded[4:6]) != uint16(me.OnuDataClassID) ||
+		binary.BigEndian.Uint16(encoded[6:8]) != 0 {
+		t.Fatalf("invalid empty MIB upload next response: %x", encoded)
+	}
+	if device == omci.ExtendedIdent {
+		if len(encoded) != 10 || binary.BigEndian.Uint16(encoded[8:10]) != 0 {
+			t.Fatalf("extended empty MIB upload next response = %x", encoded)
+		}
+		return
+	}
+	if len(encoded) != omci.MaxBaselineLength-4 {
+		t.Fatalf("baseline empty response length = %d, want %d", len(encoded), omci.MaxBaselineLength-4)
+	}
+	for offset, value := range encoded[8:40] {
+		if value != 0 {
+			t.Fatalf("baseline empty response byte %d = %#x, want 0", offset+9, value)
+		}
+	}
 }

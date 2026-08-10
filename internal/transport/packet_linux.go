@@ -49,7 +49,7 @@ func OpenPacket(interfaceName string) (*PacketConn, error) {
 }
 
 func (c *PacketConn) ReadFrame(ctx context.Context) ([]byte, error) {
-	buf := make([]byte, MaxFrameSize)
+	buf := make([]byte, MaxFrameSize+1)
 
 	for {
 		if err := ctx.Err(); err != nil {
@@ -84,6 +84,9 @@ func (c *PacketConn) ReadFrame(ctx context.Context) ([]byte, error) {
 		}
 		if link, ok := source.(*unix.SockaddrLinklayer); ok && link.Pkttype == unix.PACKET_OUTGOING {
 			continue
+		}
+		if n > MaxFrameSize {
+			return nil, fmt.Errorf("invalid OMCI frame length %d", n)
 		}
 		return append([]byte(nil), buf[:n]...), nil
 	}

@@ -19,9 +19,30 @@ import (
 	"github.com/xg2010g/airoha-omci/internal/software"
 )
 
-const responseCacheSize = 64
+const (
+	baselineLowPriority transactionChannel = iota
+	baselineHighPriority
+	extendedPriority
+	transactionChannelCount
+
+	mibUploadTimeout = time.Minute
+)
+
+type transactionChannel uint8
+
+type transactionReplay struct {
+	valid         bool
+	transactionID uint16
+	response      []byte
+	refreshUpload bool
+}
 
 type uploadCommand []me.ManagedEntity
+
+type uploadSession struct {
+	commands []uploadCommand
+	expires  time.Time
+}
 
 type tableKey struct {
 	device   omci.DeviceIdent
@@ -46,9 +67,10 @@ type Engine struct {
 
 	mib *mib.Store
 
-	cache         map[[sha256.Size]byte][]byte
-	cacheOrder    [][sha256.Size]byte
-	upload        map[omci.DeviceIdent][]uploadCommand
+	transactions  [transactionChannelCount]transactionReplay
+	oneWayDigest  [sha256.Size]byte
+	oneWayValid   bool
+	upload        map[omci.DeviceIdent]uploadSession
 	tables        map[tableKey][]byte
 	alarms        map[mib.Key][28]byte
 	alarmUpload   map[omci.DeviceIdent][]Alarm
@@ -75,8 +97,7 @@ func NewWithController(store *mib.Store, controller Controller) *Engine {
 func NewWithControllers(store *mib.Store, controller Controller, softwareController software.Controller) *Engine {
 	return &Engine{
 		mib:           store,
-		cache:         make(map[[sha256.Size]byte][]byte),
-		upload:        make(map[omci.DeviceIdent][]uploadCommand),
+		upload:        make(map[omci.DeviceIdent]uploadSession),
 		tables:        make(map[tableKey][]byte),
 		alarms:        make(map[mib.Key][28]byte),
 		alarmUpload:   make(map[omci.DeviceIdent][]Alarm),
@@ -125,17 +146,15 @@ func (e *Engine) DrainNotificationError() error {
 }
 
 // Handle processes one complete downstream OMCI frame and returns the upstream
-// response. An exact retransmission is answered from a bounded cache and is
-// never applied to the MIB twice.
+// response. G.988 stop-and-wait replay is tracked independently for baseline
+// low/high priority and for the single extended-message priority class.
 func (e *Engine) Handle(frame []byte) ([]byte, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	digest := sha256.Sum256(frame)
-	if response, found := e.cache[digest]; found {
-		return append([]byte(nil), response...), nil
+	if err := validateFrame(frame); err != nil {
+		return nil, err
 	}
-
 	packet := gopacket.NewPacket(frame, omci.LayerTypeOMCI, gopacket.Default)
 	headerLayer := packet.Layer(omci.LayerTypeOMCI)
 	if headerLayer == nil {
@@ -145,11 +164,23 @@ func (e *Engine) Handle(frame []byte) ([]byte, error) {
 	if !ok {
 		return nil, errors.New("invalid OMCI header layer")
 	}
+	noResponseDownload := header.MessageType == omci.DownloadSectionRequestType
+	if byte(header.MessageType)&me.AK != 0 ||
+		(byte(header.MessageType)&me.AR == 0 && !noResponseDownload) {
+		return nil, fmt.Errorf("unexpected downstream message type %#x", byte(header.MessageType))
+	}
+	if response, found := e.replayTransaction(header); found {
+		return response, nil
+	}
+	digest := sha256.Sum256(frame)
+	if noResponseDownload && e.oneWayValid && digest == e.oneWayDigest {
+		return nil, nil
+	}
 	if response, handled, err := e.handleRawSpecial(header, frame); handled {
 		if err != nil {
 			return nil, err
 		}
-		e.remember(digest, response)
+		e.rememberTransaction(header, response)
 		return append([]byte(nil), response...), nil
 	}
 	if decodeError := packet.ErrorLayer(); decodeError != nil {
@@ -160,20 +191,20 @@ func (e *Engine) Handle(frame []byte) ([]byte, error) {
 		if !handled {
 			return nil, fmt.Errorf("decode OMCI request: %w", decodeError.Error())
 		}
-		e.remember(digest, response)
+		e.rememberTransaction(header, response)
 		return append([]byte(nil), response...), nil
-	}
-	noResponseDownload := header.MessageType == omci.DownloadSectionRequestType
-	if byte(header.MessageType)&me.AK != 0 ||
-		(byte(header.MessageType)&me.AR == 0 && !noResponseDownload) {
-		return nil, fmt.Errorf("unexpected downstream message type %#x", byte(header.MessageType))
 	}
 
 	response, err := e.dispatch(packet, header)
 	if err != nil {
 		return nil, err
 	}
-	e.remember(digest, response)
+	if noResponseDownload {
+		e.oneWayDigest = digest
+		e.oneWayValid = true
+	} else {
+		e.rememberTransaction(header, response)
+	}
 	return append([]byte(nil), response...), nil
 }
 
@@ -288,7 +319,7 @@ func (e *Engine) dispatch(packet gopacket.Packet, header *omci.OMCI) ([]byte, er
 		}
 		result, _, _ := operationResult(e.mib.Reset())
 		if result == me.Success {
-			e.upload = make(map[omci.DeviceIdent][]uploadCommand)
+			e.upload = make(map[omci.DeviceIdent]uploadSession)
 			e.tables = make(map[tableKey][]byte)
 			e.arcFreeSince = make(map[mib.Key]time.Time)
 		}
@@ -310,7 +341,10 @@ func (e *Engine) dispatch(packet gopacket.Packet, header *omci.OMCI) ([]byte, er
 		if err != nil {
 			return nil, err
 		}
-		e.upload[header.DeviceIdentifier] = commands
+		e.upload[header.DeviceIdentifier] = uploadSession{
+			commands: commands,
+			expires:  e.now().Add(mibUploadTimeout),
+		}
 		return serialize(header, omci.MibUploadResponseType, &omci.MibUploadResponse{
 			MeBasePacket: omci.MeBasePacket{
 				EntityClass:    request.EntityClass,
@@ -325,11 +359,18 @@ func (e *Engine) dispatch(packet gopacket.Packet, header *omci.OMCI) ([]byte, er
 		if err != nil {
 			return nil, err
 		}
-		commands := e.upload[header.DeviceIdentifier]
-		if int(request.CommandSequenceNumber) >= len(commands) {
-			return nil, fmt.Errorf("MIB upload sequence %d outside snapshot of %d commands", request.CommandSequenceNumber, len(commands))
+		now := e.now()
+		session, present := e.upload[header.DeviceIdentifier]
+		if !present || !now.Before(session.expires) ||
+			int(request.CommandSequenceNumber) >= len(session.commands) {
+			if present && !now.Before(session.expires) {
+				delete(e.upload, header.DeviceIdentifier)
+			}
+			return serializeEmptyMibUploadNext(header, request.EntityClass, request.EntityInstance)
 		}
-		command := commands[request.CommandSequenceNumber]
+		session.expires = now.Add(mibUploadTimeout)
+		e.upload[header.DeviceIdentifier] = session
+		command := session.commands[request.CommandSequenceNumber]
 		return serialize(header, omci.MibUploadNextResponseType, &omci.MibUploadNextResponse{
 			MeBasePacket: omci.MeBasePacket{
 				EntityClass:    request.EntityClass,
@@ -776,7 +817,8 @@ func buildUpload(snapshot []mib.Instance, device omci.DeviceIdent) ([]uploadComm
 			}
 			attribute := definition.GetAttributeDefinitions()[index]
 			value, present := instance.Attributes[attribute.GetName()]
-			if !present || !me.SupportsAttributeAccess(attribute, me.Read) || attribute.IsTableAttribute() {
+			if !present || !me.SupportsAttributeAccess(attribute, me.Read) ||
+				attribute.IsTableAttribute() || attribute.IsCounter() {
 				continue
 			}
 			size := attribute.GetSize()
@@ -923,6 +965,33 @@ type rawResultLayer struct {
 	extended bool
 }
 
+type emptyMibUploadNextLayer struct {
+	classID  me.ClassID
+	entityID uint16
+	extended bool
+}
+
+func (l *emptyMibUploadNextLayer) LayerType() gopacket.LayerType { return gopacket.LayerTypePayload }
+func (l *emptyMibUploadNextLayer) LayerContents() []byte         { return nil }
+func (l *emptyMibUploadNextLayer) LayerPayload() []byte          { return nil }
+
+func (l *emptyMibUploadNextLayer) SerializeTo(buffer gopacket.SerializeBuffer,
+	_ gopacket.SerializeOptions) error {
+	length := 4
+	if l.extended {
+		// Extended MIB upload next signals an invalid command with a zero
+		// message-contents length. Baseline padding is supplied by the OMCI layer.
+		length = 6
+	}
+	encoded, err := buffer.AppendBytes(length)
+	if err != nil {
+		return err
+	}
+	binary.BigEndian.PutUint16(encoded, uint16(l.classID))
+	binary.BigEndian.PutUint16(encoded[2:], l.entityID)
+	return nil
+}
+
 func (l *rawResultLayer) LayerType() gopacket.LayerType { return gopacket.LayerTypePayload }
 func (l *rawResultLayer) LayerContents() []byte         { return nil }
 func (l *rawResultLayer) LayerPayload() []byte          { return nil }
@@ -968,6 +1037,14 @@ func serializeRawResult(header *omci.OMCI, classID me.ClassID, entityID uint16,
 	return append([]byte(nil), buffer.Bytes()...), nil
 }
 
+func serializeEmptyMibUploadNext(header *omci.OMCI, classID me.ClassID,
+	entityID uint16) ([]byte, error) {
+	return serialize(header, omci.MibUploadNextResponseType, &emptyMibUploadNextLayer{
+		classID: classID, entityID: entityID,
+		extended: header.DeviceIdentifier == omci.ExtendedIdent,
+	})
+}
+
 func serialize(header *omci.OMCI, responseType omci.MessageType, response gopacket.SerializableLayer) ([]byte, error) {
 	responseHeader := &omci.OMCI{
 		TransactionID:    header.TransactionID,
@@ -1006,11 +1083,95 @@ func operationResult(err error) (me.Results, uint16, uint16) {
 	return me.ProcessingError, 0, 0
 }
 
-func (e *Engine) remember(digest [sha256.Size]byte, response []byte) {
-	if len(e.cacheOrder) == responseCacheSize {
-		delete(e.cache, e.cacheOrder[0])
-		e.cacheOrder = e.cacheOrder[1:]
+func (e *Engine) replayTransaction(header *omci.OMCI) ([]byte, bool) {
+	if byte(header.MessageType)&me.AR == 0 {
+		return nil, false
 	}
-	e.cache[digest] = append([]byte(nil), response...)
-	e.cacheOrder = append(e.cacheOrder, digest)
+	replay := e.transactions[transactionPriority(header)]
+	if !replay.valid || replay.transactionID != header.TransactionID {
+		return nil, false
+	}
+	if header.MessageType == omci.MibUploadNextRequestType && replay.refreshUpload {
+		now := e.now()
+		session, present := e.upload[header.DeviceIdentifier]
+		if !present || !now.Before(session.expires) {
+			delete(e.upload, header.DeviceIdentifier)
+			return nil, false
+		}
+		session.expires = now.Add(mibUploadTimeout)
+		e.upload[header.DeviceIdentifier] = session
+	}
+	if header.MessageType == omci.MibUploadRequestType {
+		if session, present := e.upload[header.DeviceIdentifier]; present {
+			session.expires = e.now().Add(mibUploadTimeout)
+			e.upload[header.DeviceIdentifier] = session
+		}
+	}
+	return append([]byte(nil), replay.response...), true
+}
+
+func (e *Engine) rememberTransaction(header *omci.OMCI, response []byte) {
+	if byte(header.MessageType)&me.AR == 0 {
+		return
+	}
+	e.transactions[transactionPriority(header)] = transactionReplay{
+		valid: true, transactionID: header.TransactionID,
+		response: append([]byte(nil), response...),
+		refreshUpload: header.MessageType == omci.MibUploadNextRequestType &&
+			mibUploadNextHasContents(response, header.DeviceIdentifier),
+	}
+}
+
+func mibUploadNextHasContents(response []byte, device omci.DeviceIdent) bool {
+	if device == omci.ExtendedIdent {
+		return len(response) >= 10 && binary.BigEndian.Uint16(response[8:10]) != 0
+	}
+	if len(response) < 14 {
+		return false
+	}
+	for _, value := range response[8:14] {
+		if value != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func transactionPriority(header *omci.OMCI) transactionChannel {
+	if header.DeviceIdentifier == omci.ExtendedIdent {
+		return extendedPriority
+	}
+	if header.TransactionID&0x8000 != 0 {
+		return baselineHighPriority
+	}
+	return baselineLowPriority
+}
+
+func validateFrame(frame []byte) error {
+	if len(frame) < 4 || len(frame) > omci.MaxExtendedLength {
+		return fmt.Errorf("invalid OMCI frame length %d", len(frame))
+	}
+	switch omci.DeviceIdent(frame[3]) {
+	case omci.BaselineIdent:
+		// OMCC adapters may remove the MIC or the complete eight-byte trailer
+		// after validating it. omci-lib-go emits the MIC-stripped form.
+		if len(frame) != omci.MaxBaselineLength && len(frame) != omci.MaxBaselineLength-4 &&
+			len(frame) != omci.MaxBaselineLength-8 {
+			return fmt.Errorf("invalid baseline OMCI frame length %d", len(frame))
+		}
+	case omci.ExtendedIdent:
+		if len(frame) < 10 {
+			return fmt.Errorf("invalid extended OMCI frame length %d", len(frame))
+		}
+		payloadEnd := 10 + int(binary.BigEndian.Uint16(frame[8:10]))
+		// The four-byte MIC may likewise be consumed by the OMCC adapter.
+		if payloadEnd > omci.MaxExtendedLength-4 ||
+			(len(frame) != payloadEnd && len(frame) != payloadEnd+4) {
+			return fmt.Errorf("extended OMCI content length %d does not match frame length %d",
+				payloadEnd-10, len(frame))
+		}
+	default:
+		return fmt.Errorf("unsupported OMCI device identifier %#x", frame[3])
+	}
+	return nil
 }

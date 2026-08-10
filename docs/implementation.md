@@ -5,8 +5,8 @@ and extended messages.  A successful build or reaching GPON O5 is not enough.
 
 | Area | Required behavior | State |
 | --- | --- | --- |
-| OMCC transport | raw RX/TX, cancellation, frame bounds, counters | in progress |
-| Transactions | duplicate replay, TCI validation, bounded response cache | in progress |
+| OMCC transport | raw RX/TX, cancellation, frame bounds, counters | implemented; MIC/adapter verification pending |
+| Transactions | per-priority stop-and-wait replay and TCI validation | implemented; queue/MIC integration pending |
 | MIB | ONU defaults, platform-gated create/delete/set, reset, data sync | in progress |
 | MIB upload | baseline fragmentation and extended multi-ME packing | in progress |
 | Tables | stable Get/Get Next cache and baseline/enhanced extended Set Table | implemented; OLT verification pending |
@@ -25,6 +25,27 @@ The daemon now provides valid error responses for unknown managed entities,
 transactional platform commits, baseline table transfer, extended MIB upload
 packing, alarm audits, time synchronization and scheduled reboot. The factory
 MIB advertises the two 10G, one 2.5G and one 1G Ethernet UNIs independently.
+
+Acknowledged commands follow the G.988 stop-and-wait rules: baseline low and
+high priority retain independent last-command TCI/response state, while the
+extended format uses one priority class. Only the last response in each class
+is replayed, including when a retransmitted frame differs after the header;
+older reused TCIs are executed as new commands. Immediate duplicate
+unacknowledged software sections are suppressed separately.
+
+Transport validation accepts only the explicit OMCC adapter forms: a 48-byte
+baseline frame, the 44-byte MIC-stripped form emitted by the protocol library,
+or the 40-byte trailer-stripped form; and an extended frame whose declared
+content length exactly matches the packet with or without the four-byte MIC.
+Oversized, truncated, unknown-format and trailing-byte frames are rejected
+before protocol dispatch.
+
+MIB upload uses an immutable per-message-set snapshot with the G.988 one-minute
+inactivity limit. Each valid MIB upload next request, including a retransmission,
+refreshes the deadline. An expired or out-of-range baseline request receives a
+zero class/entity/mask body, while its extended equivalent receives a zero-length
+message contents field. Table attributes and PM measurement counters are omitted
+from the snapshot.
 
 The fixed-path event helper now maps XG2010G BOSA LOS, GPON activation state,
 optical diagnostics and the four Ethernet carrier states into validated
