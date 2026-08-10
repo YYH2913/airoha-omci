@@ -242,12 +242,25 @@ func run(opts options) error {
 			}
 
 		case <-performanceTicker.C:
-			if err := protocol.PollPerformance(); err != nil {
+			frames, err := protocol.PollPerformance(omci.BaselineIdent)
+			if err != nil {
 				state.PerformanceErrors++
 				state.LastError = err.Error()
 				_ = statusWriter.Write(state)
 				log.Printf("OMCI performance collection failed: %v", err)
 				continue
+			}
+			if err := sendNotifications(frames); err != nil {
+				state.TransportErrors++
+				state.LastError = err.Error()
+				_ = statusWriter.Write(state)
+				return err
+			}
+			if len(frames) != 0 {
+				state.LastError = ""
+				if err := statusWriter.Write(state); err != nil {
+					log.Printf("publish status: %v", err)
+				}
 			}
 
 		case result := <-received:

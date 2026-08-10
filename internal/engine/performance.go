@@ -7,6 +7,7 @@ import (
 	"math"
 	"time"
 
+	omci "github.com/opencord/omci-lib-go/v2"
 	me "github.com/opencord/omci-lib-go/v2/generated"
 	"github.com/xg2010g/airoha-omci/internal/mib"
 	"github.com/xg2010g/airoha-omci/internal/performance"
@@ -147,83 +148,151 @@ func (e *Engine) SetPerformanceController(controller performance.Controller) {
 	e.performanceState = make(map[mib.Key]performanceState)
 	e.ethernetPerformance, _ = controller.(performance.EthernetController)
 	e.ethernetPMState = make(map[mib.Key]ethernetPerformanceState)
+	e.clearAllPerformanceTCAsLocked()
 	e.performanceNext = time.Time{}
+	e.performanceIntervalEnd = 0
 }
 
-// PollPerformance advances completed 15-minute collection intervals. The
-// daemon calls it periodically; hardware is sampled only for a new PM instance
-// or when an interval boundary has passed.
-func (e *Engine) PollPerformance() error {
+// PollPerformance advances completed 15-minute collection intervals and
+// returns threshold crossing alerts raised since the previous poll. Hardware
+// is sampled inside an interval only while at least one enabled threshold is
+// configured for that PM instance.
+func (e *Engine) PollPerformance(device omci.DeviceIdent) ([][]byte, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return e.pollPerformanceLocked(e.now())
+	if err := validateDeviceIdentifier(device); err != nil {
+		return nil, err
+	}
+	return e.pollPerformanceLocked(e.now(), e.notificationDeviceLocked(device))
 }
 
-func (e *Engine) pollPerformanceLocked(now time.Time) error {
+type performanceThresholdEvaluation struct {
+	attributes me.AttributeValueMap
+	rules      []performanceThresholdRule
+}
+
+func (e *Engine) pollPerformanceLocked(now time.Time,
+	device omci.DeviceIdent) ([][]byte, error) {
 	if e.performance == nil && e.ethernetPerformance == nil {
-		return nil
+		return nil, nil
 	}
 	if err := e.reconcilePerformanceLocked(); err != nil {
-		return err
+		return nil, err
 	}
 	if e.performanceNext.IsZero() {
 		e.performanceNext = now.Add(performanceInterval)
-		return nil
-	}
-	if now.Before(e.performanceNext) {
-		return nil
+		return nil, nil
 	}
 
-	intervals := uint64(now.Sub(e.performanceNext)/performanceInterval) + 1
+	var intervals uint64
+	if !now.Before(e.performanceNext) {
+		intervals = uint64(now.Sub(e.performanceNext)/performanceInterval) + 1
+	}
 	intervalEnd := e.performanceIntervalEnd + uint8(intervals)
 	updates := make(map[mib.Key]me.AttributeValueMap,
 		len(e.performanceState)+len(e.ethernetPMState))
 	baselines := make(map[mib.Key]performance.GEMPortCounters, len(e.performanceState))
+	evaluations := make(map[mib.Key]performanceThresholdEvaluation,
+		len(e.performanceState)+len(e.ethernetPMState))
 	for key, state := range e.performanceState {
+		rules, err := e.performanceThresholdsLocked(key)
+		if err != nil {
+			return nil, fmt.Errorf("resolve GEM performance thresholds for %v/%#x: %w",
+				key.ClassID, key.EntityID, err)
+		}
+		if intervals == 0 && len(rules) == 0 {
+			continue
+		}
 		current, err := e.performance.GEMPortCounters(state.portID)
 		if err != nil {
-			return fmt.Errorf("read GEM port %d performance counters: %w", state.portID, err)
+			return nil, fmt.Errorf("read GEM port %d performance counters: %w", state.portID, err)
 		}
 		attributes := zeroGEMPerformanceAttributes(intervalEnd)
-		if intervals == 1 {
+		if intervals <= 1 {
 			attributes = gemPerformanceAttributes(intervalEnd,
 				deltaGEMCounters(state.baseline, current))
 		}
-		updates[key] = attributes
-		baselines[key] = current
+		if intervals != 0 {
+			updates[key] = attributes
+			baselines[key] = current
+		}
+		if intervals <= 1 && len(rules) != 0 {
+			evaluations[key] = performanceThresholdEvaluation{attributes: attributes, rules: rules}
+		}
 	}
 	ethernetBaselines := make(map[mib.Key]performance.EthernetCounters, len(e.ethernetPMState))
 	for key, state := range e.ethernetPMState {
+		rules, err := e.performanceThresholdsLocked(key)
+		if err != nil {
+			return nil, fmt.Errorf("resolve Ethernet performance thresholds for %v/%#x: %w",
+				key.ClassID, key.EntityID, err)
+		}
+		if intervals == 0 && len(rules) == 0 {
+			continue
+		}
 		current, err := e.ethernetPerformance.EthernetCounters(state.uniEntityID)
 		if err != nil {
-			return fmt.Errorf("read Ethernet UNI %#x performance counters: %w",
+			return nil, fmt.Errorf("read Ethernet UNI %#x performance counters: %w",
 				state.uniEntityID, err)
 		}
 		attributes := ethernetPerformanceAttributes(key.ClassID, intervalEnd,
 			performance.EthernetCounters{})
-		if intervals == 1 {
+		if intervals <= 1 {
 			attributes = ethernetPerformanceAttributes(key.ClassID, intervalEnd,
 				deltaEthernetCounters(state.baseline, current))
 		}
-		updates[key] = attributes
-		ethernetBaselines[key] = current
+		if intervals != 0 {
+			updates[key] = attributes
+			ethernetBaselines[key] = current
+		}
+		if intervals <= 1 && len(rules) != 0 {
+			evaluations[key] = performanceThresholdEvaluation{attributes: attributes, rules: rules}
+		}
 	}
-	if err := e.mib.UpdateAutonomousBatch(updates); err != nil {
-		return fmt.Errorf("update performance history: %w", err)
+	if intervals != 0 {
+		if err := e.mib.UpdateAutonomousBatch(updates); err != nil {
+			return nil, fmt.Errorf("update performance history: %w", err)
+		}
+		for key, baseline := range baselines {
+			state := e.performanceState[key]
+			state.baseline = baseline
+			e.performanceState[key] = state
+		}
+		for key, baseline := range ethernetBaselines {
+			state := e.ethernetPMState[key]
+			state.baseline = baseline
+			e.ethernetPMState[key] = state
+		}
+		e.performanceIntervalEnd = intervalEnd
+		e.performanceNext = e.performanceNext.Add(time.Duration(intervals) * performanceInterval)
 	}
-	for key, baseline := range baselines {
-		state := e.performanceState[key]
-		state.baseline = baseline
-		e.performanceState[key] = state
+
+	keys := make([]mib.Key, 0, len(evaluations))
+	for key := range evaluations {
+		keys = append(keys, key)
 	}
-	for key, baseline := range ethernetBaselines {
-		state := e.ethernetPMState[key]
-		state.baseline = baseline
-		e.ethernetPMState[key] = state
+	sortMIBKeys(keys)
+	frames := make([][]byte, 0, len(evaluations))
+	for _, key := range keys {
+		evaluation := evaluations[key]
+		frame, emitted, err := e.evaluatePerformanceTCALocked(
+			key, evaluation.attributes, evaluation.rules, device)
+		if err != nil {
+			return frames, fmt.Errorf("evaluate performance TCA for %v/%#x: %w",
+				key.ClassID, key.EntityID, err)
+		}
+		if emitted {
+			frames = append(frames, frame)
+		}
 	}
-	e.performanceIntervalEnd = intervalEnd
-	e.performanceNext = e.performanceNext.Add(time.Duration(intervals) * performanceInterval)
-	return nil
+	if intervals != 0 {
+		clears, err := e.clearPerformanceTCANotificationsLocked(device)
+		if err != nil {
+			return frames, err
+		}
+		frames = append(frames, clears...)
+	}
+	return frames, nil
 }
 
 func (e *Engine) reconcilePerformanceLocked() error {

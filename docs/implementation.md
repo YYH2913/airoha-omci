@@ -13,7 +13,7 @@ and extended messages.  A successful build or reaching GPON O5 is not enough.
 | Notifications | alarm audit/sequence, event-driven Alarm/AVC, requested optical tests and ARC | in progress |
 | Equipment | ONU-G, ONU2-G, ANI-G, four speed-specific Ethernet UNIs, software images | in progress |
 | Traffic | 8 T-CONTs/schedulers, 96 queues, GEM CTP/IW validation and hardware apply | in progress |
-| Performance | common 15-minute engine, GEM CTP and Ethernet UNI/frame PM | class 341, 24, 296, 321 and 322 implemented; thresholds and physical verification pending |
+| Performance | common 15-minute engine, GEM CTP and Ethernet UNI/frame PM | class 341, 24, 296, 321 and 322 counters, threshold data 1/2 and TCA implemented; physical verification pending |
 | Ethernet service | resolved bridge, mapper, VLAN and extended VLAN graph | common UNI/ANI bridge service implemented; advanced associations pending |
 | Lifecycle | reboot, time sync, software download/activate/commit | implemented; OLT verification pending |
 | Platform | multi-T-CONT/GEM Airoha ABI and transactional Linux backend | GEM, UNI VLAN and single-profile MAC bridge implemented; hardware offload pending |
@@ -73,8 +73,20 @@ The XG2010G Ethernet driver exposes a root-only counter snapshot for each
 `lan1` through `lan4` netdev. Its existing GDM3/GDM4 per-NBQ MIB split keeps
 multi-serdes ports independent, while runt and exact 64-octet frames are now
 kept in separate buckets. The platform helper accepts only the four fixed UNI
-entity IDs. PM threshold data association and TCA generation are not yet
-implemented.
+entity IDs.
+
+A non-zero PM threshold data 1/2 pointer must resolve to an existing threshold
+data 1 ME; the same-ID threshold data 2 ME supplies optional values 8 through
+14. Zero pointers and threshold values 0 or 0xFFFF disable the corresponding
+TCAs.
+The class-specific G.988 mapping is implemented for GEM CTP class 341 and
+Ethernet classes 24, 296, 321 and 322. A counter reaching its configured value
+raises its TCA bit once in the current interval; later crossings produce a
+cumulative bitmap without repeating an already active bit. At each 15-minute
+boundary the ONU sends the required all-clear TCA notification, including
+after an explicit time synchronization. MIB reset and PM deletion discard
+local state. PM instances with no enabled threshold avoid intra-interval
+hardware sampling.
 
 The fixed-path event helper now maps XG2010G BOSA LOS, GPON activation state,
 optical diagnostics and the four Ethernet carrier states into validated

@@ -92,6 +92,7 @@ type Engine struct {
 	performanceState       map[mib.Key]performanceState
 	ethernetPerformance    performance.EthernetController
 	ethernetPMState        map[mib.Key]ethernetPerformanceState
+	performanceTCA         map[mib.Key][28]byte
 	performanceNext        time.Time
 	performanceIntervalEnd uint8
 }
@@ -119,6 +120,7 @@ func NewWithControllers(store *mib.Store, controller Controller, softwareControl
 		softwareState:    SoftwareStatus{Phase: "idle"},
 		performanceState: make(map[mib.Key]performanceState),
 		ethernetPMState:  make(map[mib.Key]ethernetPerformanceState),
+		performanceTCA:   make(map[mib.Key][28]byte),
 	}
 	if performanceController, ok := controller.(performance.Controller); ok {
 		result.performance = performanceController
@@ -261,9 +263,15 @@ func (e *Engine) dispatch(packet gopacket.Packet, header *omci.OMCI) ([]byte, er
 		var preparedPerformance *performanceState
 		var preparedEthernet *ethernetPerformanceState
 		var operationError error
-		if request.EntityClass == me.GemPortNetworkCtpPerformanceMonitoringHistoryDataClassID {
+		requestKey := mib.Key{ClassID: request.EntityClass, EntityID: request.EntityInstance}
+		if !e.mib.Exists(requestKey) {
+			operationError = e.validatePerformanceThresholdPointerLocked(
+				request.EntityClass, request.Attributes)
+		}
+		if operationError == nil &&
+			request.EntityClass == me.GemPortNetworkCtpPerformanceMonitoringHistoryDataClassID {
 			preparedPerformance, operationError = e.prepareGEMPerformanceCreateLocked(request.EntityInstance)
-		} else if isEthernetPerformanceClass(request.EntityClass) {
+		} else if operationError == nil && isEthernetPerformanceClass(request.EntityClass) {
 			preparedEthernet, operationError = e.prepareEthernetPerformanceCreateLocked(
 				request.EntityClass, request.EntityInstance)
 		}
@@ -314,6 +322,10 @@ func (e *Engine) dispatch(packet gopacket.Packet, header *omci.OMCI) ([]byte, er
 			e.bridgePortHasPerformanceLocked(request.EntityInstance) {
 			operationError = &mib.ResultError{Result: me.ParameterError,
 				Cause: fmt.Errorf("MAC bridge port has an active performance monitoring instance")}
+		} else if request.EntityClass == me.ThresholdData1ClassID &&
+			e.performanceThresholdReferencedLocked(request.EntityInstance) {
+			operationError = &mib.ResultError{Result: me.ParameterError,
+				Cause: fmt.Errorf("threshold data is referenced by performance monitoring")}
 		} else {
 			operationError = e.mib.Delete(key)
 		}
@@ -322,6 +334,7 @@ func (e *Engine) dispatch(packet gopacket.Packet, header *omci.OMCI) ([]byte, er
 			e.tables = make(map[tableKey][]byte)
 			delete(e.performanceState, key)
 			delete(e.ethernetPMState, key)
+			e.clearPerformanceTCAKeyLocked(key)
 		}
 		return serialize(header, omci.DeleteResponseType, &omci.DeleteResponse{
 			MeBasePacket: omci.MeBasePacket{
@@ -342,13 +355,19 @@ func (e *Engine) dispatch(packet gopacket.Packet, header *omci.OMCI) ([]byte, er
 			EntityID: request.EntityInstance,
 		}
 		var operationError error
-		if request.EntityClass == me.MacBridgePortConfigurationDataClassID &&
-			e.bridgePortHasPerformanceLocked(request.EntityInstance) &&
-			bridgePortAssociationChanged(request.Attributes) {
-			operationError = &mib.ResultError{Result: me.ParameterError,
-				Cause: fmt.Errorf("MAC bridge port association is monitored")}
-		} else {
-			operationError = e.mib.Set(key, request.Attributes)
+		if e.mib.Exists(key) {
+			operationError = e.validatePerformanceThresholdPointerLocked(
+				request.EntityClass, request.Attributes)
+		}
+		if operationError == nil {
+			if request.EntityClass == me.MacBridgePortConfigurationDataClassID &&
+				e.bridgePortHasPerformanceLocked(request.EntityInstance) &&
+				bridgePortAssociationChanged(request.Attributes) {
+				operationError = &mib.ResultError{Result: me.ParameterError,
+					Cause: fmt.Errorf("MAC bridge port association is monitored")}
+			} else {
+				operationError = e.mib.Set(key, request.Attributes)
+			}
 		}
 		result, failed, unsupported := operationResult(operationError)
 		if result == me.Success {
@@ -412,6 +431,7 @@ func (e *Engine) dispatch(packet gopacket.Packet, header *omci.OMCI) ([]byte, er
 			e.arcFreeSince = make(map[mib.Key]time.Time)
 			e.performanceState = make(map[mib.Key]performanceState)
 			e.ethernetPMState = make(map[mib.Key]ethernetPerformanceState)
+			e.clearAllPerformanceTCAsLocked()
 			e.performanceNext = time.Time{}
 			e.performanceIntervalEnd = 0
 		}
@@ -720,7 +740,7 @@ func (e *Engine) dispatch(packet gopacket.Packet, header *omci.OMCI) ([]byte, er
 			return nil, err
 		}
 		result := e.synchronizeTime(request.Year, request.Month, request.Day,
-			request.Hour, request.Minute, request.Second)
+			request.Hour, request.Minute, request.Second, header.DeviceIdentifier)
 		return serialize(header, omci.SynchronizeTimeResponseType, &omci.SynchronizeTimeResponse{
 			MeBasePacket: omci.MeBasePacket{
 				EntityClass:    request.EntityClass,
@@ -863,12 +883,14 @@ func (e *Engine) handleRawSpecial(header *omci.OMCI, frame []byte) ([]byte, bool
 		return response, true, err
 	}
 	result := e.synchronizeTime(binary.BigEndian.Uint16(frame[offset:]), frame[offset+2],
-		frame[offset+3], frame[offset+4], frame[offset+5], frame[offset+6])
+		frame[offset+3], frame[offset+4], frame[offset+5], frame[offset+6],
+		header.DeviceIdentifier)
 	response, err := serializeRawResult(header, classID, entityID, result)
 	return response, true, err
 }
 
-func (e *Engine) synchronizeTime(year uint16, month, day, hour, minute, second uint8) me.Results {
+func (e *Engine) synchronizeTime(year uint16, month, day, hour, minute, second uint8,
+	device omci.DeviceIdent) me.Results {
 	if e.controller == nil {
 		return me.NotSupported
 	}
@@ -887,6 +909,14 @@ func (e *Engine) synchronizeTime(year uint16, month, day, hour, minute, second u
 	}
 	if err := e.commitPerformanceSynchronizationLocked(requested, baselines); err != nil {
 		return me.ProcessingError
+	}
+	frames, err := e.clearPerformanceTCANotificationsLocked(
+		e.notificationDeviceLocked(device))
+	if err != nil {
+		e.pendingError = fmt.Errorf("clear performance TCAs after time synchronization: %w", err)
+		e.clearAllPerformanceTCAsLocked()
+	} else {
+		e.pending = append(e.pending, frames...)
 	}
 	return me.Success
 }

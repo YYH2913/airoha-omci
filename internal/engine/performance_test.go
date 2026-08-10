@@ -69,9 +69,7 @@ func TestEthernetUNIPerformanceCurrentAndHistory(t *testing.T) {
 	if controller.ethernetCalls != 1 {
 		t.Fatalf("Ethernet counter calls after Create = %d, want 1", controller.ethernetCalls)
 	}
-	if err := protocol.PollPerformance(); err != nil {
-		t.Fatalf("PollPerformance(Ethernet initialize) error = %v", err)
-	}
+	pollPerformance(t, protocol)
 
 	controller.ethernetCounters.Received.Frames = 111
 	controller.ethernetCounters.Received.Octets = 1222
@@ -88,9 +86,7 @@ func TestEthernetUNIPerformanceCurrentAndHistory(t *testing.T) {
 	now = now.Add(performanceInterval)
 	controller.ethernetCounters.Received.Frames = 150
 	controller.ethernetCounters.Received.Octets = 1600
-	if err := protocol.PollPerformance(); err != nil {
-		t.Fatalf("PollPerformance(Ethernet boundary) error = %v", err)
-	}
+	pollPerformance(t, protocol)
 	history, err := store.Get(mib.Key{
 		ClassID:  me.EthernetPerformanceMonitoringHistoryData3ClassID,
 		EntityID: testGEMEntity,
@@ -173,9 +169,7 @@ func TestGEMPerformanceCurrentAndHistoryIntervals(t *testing.T) {
 		ReceivedGEMFrames: 100, ReceivedPayloadBytes: 1000,
 		TransmittedGEMFrames: 200, TransmittedPayloadBytes: 2000,
 	}
-	if err := protocol.PollPerformance(); err != nil {
-		t.Fatalf("PollPerformance(initialize) error = %v", err)
-	}
+	pollPerformance(t, protocol)
 	if controller.calls != 1 {
 		t.Fatalf("initial counter calls = %d, want 1", controller.calls)
 	}
@@ -205,9 +199,7 @@ func TestGEMPerformanceCurrentAndHistoryIntervals(t *testing.T) {
 		ReceivedGEMFrames: 150, ReceivedPayloadBytes: 1600,
 		TransmittedGEMFrames: 280, TransmittedPayloadBytes: 2900,
 	}
-	if err := protocol.PollPerformance(); err != nil {
-		t.Fatalf("PollPerformance(boundary) error = %v", err)
-	}
+	pollPerformance(t, protocol)
 	history, err = store.Get(gemPerformanceKey(), 0xbc00)
 	if err != nil {
 		t.Fatalf("Get(history) error = %v", err)
@@ -250,9 +242,7 @@ func TestGEMPerformanceHandlesHardwareResetAndSaturation(t *testing.T) {
 func TestGEMPerformanceRejectsOversizedCurrentRequestAndBackendFailure(t *testing.T) {
 	protocol, _, controller := newPerformanceEngine(t)
 	controller.counters = performance.GEMPortCounters{}
-	if err := protocol.PollPerformance(); err != nil {
-		t.Fatalf("PollPerformance(initialize) error = %v", err)
-	}
+	pollPerformance(t, protocol)
 	response := getCurrentGEMPerformance(t, protocol, 0xfe00)
 	if response.Result != me.ParameterError {
 		t.Fatalf("oversized current result = %v, want ParameterError", response.Result)
@@ -305,16 +295,270 @@ func TestGEMPerformanceCreateRequiresParentAndCounterBackend(t *testing.T) {
 	}
 }
 
+func TestPerformanceThresholdPointerValidationAndReferenceProtection(t *testing.T) {
+	store := newTestStoreForPerformanceCreate(t)
+	protocol := New(store)
+	controller := &recordingPerformanceController{}
+	protocol.SetPerformanceController(controller)
+
+	missing := createGEMPerformanceRequestWithThreshold(t, 0x630, 0x900)
+	encoded, err := protocol.Handle(missing)
+	if err != nil {
+		t.Fatalf("Handle(Create PM with missing threshold) error = %v", err)
+	}
+	response := decodeResponse(t, encoded).Layer(omci.LayerTypeCreateResponse).(*omci.CreateResponse)
+	if response.Result != me.ParameterError || store.Exists(gemPerformanceKey()) {
+		t.Fatalf("missing threshold result=%v exists=%v", response.Result, store.Exists(gemPerformanceKey()))
+	}
+
+	if err := store.Create(me.ThresholdData1ClassID, 0x900, me.AttributeValueMap{
+		me.ThresholdData1_ThresholdValue1: uint32(5),
+	}); err != nil {
+		t.Fatalf("Create(ThresholdData1) error = %v", err)
+	}
+	controller.counters = performance.GEMPortCounters{}
+	encoded, err = protocol.Handle(createGEMPerformanceRequestWithThreshold(t, 0x631, 0x900))
+	if err != nil {
+		t.Fatalf("Handle(Create PM with threshold) error = %v", err)
+	}
+	response = decodeResponse(t, encoded).Layer(omci.LayerTypeCreateResponse).(*omci.CreateResponse)
+	if response.Result != me.Success || !store.Exists(gemPerformanceKey()) {
+		t.Fatalf("valid threshold result=%v exists=%v", response.Result, store.Exists(gemPerformanceKey()))
+	}
+
+	setMissing := encodeRequest(t, 0x632, omci.SetRequestType, &omci.SetRequest{
+		MeBasePacket: omci.MeBasePacket{
+			EntityClass:    me.GemPortNetworkCtpPerformanceMonitoringHistoryDataClassID,
+			EntityInstance: testGEMEntity,
+		},
+		AttributeMask: 0x4000,
+		Attributes: me.AttributeValueMap{
+			me.GemPortNetworkCtpPerformanceMonitoringHistoryData_ThresholdData12Id: uint16(0x901),
+		},
+	})
+	encoded, err = protocol.Handle(setMissing)
+	if err != nil {
+		t.Fatalf("Handle(Set missing threshold) error = %v", err)
+	}
+	setResponse := decodeResponse(t, encoded).Layer(omci.LayerTypeSetResponse).(*omci.SetResponse)
+	if setResponse.Result != me.ParameterError {
+		t.Fatalf("Set missing threshold result = %v, want ParameterError", setResponse.Result)
+	}
+
+	deleteThreshold := encodeRequest(t, 0x633, omci.DeleteRequestType, &omci.DeleteRequest{
+		MeBasePacket: omci.MeBasePacket{EntityClass: me.ThresholdData1ClassID, EntityInstance: 0x900},
+	})
+	encoded, err = protocol.Handle(deleteThreshold)
+	if err != nil {
+		t.Fatalf("Handle(Delete referenced threshold) error = %v", err)
+	}
+	deleteResponse := decodeResponse(t, encoded).Layer(omci.LayerTypeDeleteResponse).(*omci.DeleteResponse)
+	if deleteResponse.Result != me.ParameterError || !store.Exists(mib.Key{
+		ClassID: me.ThresholdData1ClassID, EntityID: 0x900,
+	}) {
+		t.Fatalf("Delete referenced threshold result=%v exists=%v", deleteResponse.Result,
+			store.Exists(mib.Key{ClassID: me.ThresholdData1ClassID, EntityID: 0x900}))
+	}
+}
+
+func TestEthernetPerformanceThresholdCrossingAlertLifecycle(t *testing.T) {
+	protocol, store, controller := newEthernetPerformanceEngine(t, false)
+	now := time.Date(2026, 8, 11, 5, 0, 0, 0, time.UTC)
+	protocol.now = func() time.Time { return now }
+	thresholdID := uint16(0x910)
+	if err := store.Create(me.ThresholdData1ClassID, thresholdID, me.AttributeValueMap{
+		me.ThresholdData1_ThresholdValue1: uint32(5),
+		me.ThresholdData1_ThresholdValue2: uint32(3),
+	}); err != nil {
+		t.Fatalf("Create(TCA ThresholdData1) error = %v", err)
+	}
+	controller.ethernetCounters.Received.DropEvents = 100
+	createEthernetPerformanceWithThreshold(t, protocol,
+		me.EthernetPerformanceMonitoringHistoryData3ClassID, testGEMEntity, thresholdID, 0x640)
+	pollPerformance(t, protocol)
+
+	controller.ethernetCounters.Received.DropEvents = 104
+	if frames := pollPerformance(t, protocol); len(frames) != 0 {
+		t.Fatalf("below-threshold TCA frames = %d, want 0", len(frames))
+	}
+	controller.ethernetCounters.Received.DropEvents = 105
+	frames := pollPerformance(t, protocol)
+	if len(frames) != 1 {
+		t.Fatalf("first TCA frames = %d, want 1", len(frames))
+	}
+	alarm := decodeResponse(t, frames[0]).Layer(omci.LayerTypeAlarmNotification).(*omci.AlarmNotificationMsg)
+	if alarm.EntityClass != me.EthernetPerformanceMonitoringHistoryData3ClassID ||
+		alarm.EntityInstance != testGEMEntity || alarm.AlarmBitmap[0] != 0x80 ||
+		alarm.AlarmSequenceNumber != 1 {
+		t.Fatalf("first TCA = %#v", alarm)
+	}
+
+	controller.ethernetCounters.Received.UndersizeFrames = 3
+	frames = pollPerformance(t, protocol)
+	if len(frames) != 1 {
+		t.Fatalf("second TCA frames = %d, want 1", len(frames))
+	}
+	alarm = decodeResponse(t, frames[0]).Layer(omci.LayerTypeAlarmNotification).(*omci.AlarmNotificationMsg)
+	if alarm.AlarmBitmap[0] != 0xc0 || alarm.AlarmSequenceNumber != 2 {
+		t.Fatalf("combined TCA = %#v", alarm)
+	}
+
+	now = now.Add(performanceInterval)
+	controller.ethernetCounters.Received.DropEvents = 106
+	frames = pollPerformance(t, protocol)
+	if len(frames) != 1 || len(protocol.performanceTCA) != 0 || len(protocol.alarms) != 0 {
+		t.Fatalf("interval rollover frames=%d TCA=%d alarms=%d, want one clear",
+			len(frames), len(protocol.performanceTCA), len(protocol.alarms))
+	}
+	alarm = decodeResponse(t, frames[0]).Layer(omci.LayerTypeAlarmNotification).(*omci.AlarmNotificationMsg)
+	if alarm.AlarmBitmap != ([28]byte{}) || alarm.AlarmSequenceNumber != 3 {
+		t.Fatalf("interval rollover clear TCA = %#v", alarm)
+	}
+	controller.ethernetCounters.Received.DropEvents = 111
+	frames = pollPerformance(t, protocol)
+	if len(frames) != 1 {
+		t.Fatalf("next-interval TCA frames = %d, want 1", len(frames))
+	}
+	alarm = decodeResponse(t, frames[0]).Layer(omci.LayerTypeAlarmNotification).(*omci.AlarmNotificationMsg)
+	if alarm.AlarmBitmap[0] != 0x80 || alarm.AlarmSequenceNumber != 4 {
+		t.Fatalf("next-interval TCA = %#v", alarm)
+	}
+}
+
+func TestPerformanceThresholdFFFFDisablesTCA(t *testing.T) {
+	protocol, store, controller := newEthernetPerformanceEngine(t, false)
+	thresholdID := uint16(0x915)
+	if err := store.Create(me.ThresholdData1ClassID, thresholdID, me.AttributeValueMap{
+		me.ThresholdData1_ThresholdValue1: uint32(0xffff),
+	}); err != nil {
+		t.Fatalf("Create(disabled ThresholdData1) error = %v", err)
+	}
+	controller.ethernetCounters.Received.DropEvents = 10
+	createEthernetPerformanceWithThreshold(t, protocol,
+		me.EthernetPerformanceMonitoringHistoryData3ClassID, testGEMEntity, thresholdID, 0x648)
+	pollPerformance(t, protocol)
+
+	controller.ethernetCounters.Received.DropEvents = 0x10010
+	if frames := pollPerformance(t, protocol); len(frames) != 0 {
+		t.Fatalf("disabled threshold TCA frames = %d, want 0", len(frames))
+	}
+	if controller.ethernetCalls != 1 {
+		t.Fatalf("disabled threshold hardware samples = %d, want Create-only sample",
+			controller.ethernetCalls)
+	}
+}
+
+func TestPerformanceThresholdCrossedAtBoundaryRaisesThenClears(t *testing.T) {
+	protocol, store, controller := newEthernetPerformanceEngine(t, false)
+	now := time.Date(2026, 8, 11, 5, 30, 0, 0, time.UTC)
+	protocol.now = func() time.Time { return now }
+	thresholdID := uint16(0x918)
+	if err := store.Create(me.ThresholdData1ClassID, thresholdID, me.AttributeValueMap{
+		me.ThresholdData1_ThresholdValue1: uint32(5),
+	}); err != nil {
+		t.Fatalf("Create(boundary ThresholdData1) error = %v", err)
+	}
+	createEthernetPerformanceWithThreshold(t, protocol,
+		me.EthernetPerformanceMonitoringHistoryData3ClassID, testGEMEntity, thresholdID, 0x649)
+	pollPerformance(t, protocol)
+
+	now = now.Add(performanceInterval)
+	controller.ethernetCounters.Received.DropEvents = 5
+	frames := pollPerformance(t, protocol)
+	if len(frames) != 2 {
+		t.Fatalf("boundary crossing TCA frames = %d, want raise and clear", len(frames))
+	}
+	raised := decodeResponse(t, frames[0]).Layer(omci.LayerTypeAlarmNotification).(*omci.AlarmNotificationMsg)
+	cleared := decodeResponse(t, frames[1]).Layer(omci.LayerTypeAlarmNotification).(*omci.AlarmNotificationMsg)
+	if raised.AlarmBitmap[0] != 0x80 || raised.AlarmSequenceNumber != 1 ||
+		cleared.AlarmBitmap != ([28]byte{}) || cleared.AlarmSequenceNumber != 2 {
+		t.Fatalf("boundary crossing raised=%#v cleared=%#v", raised, cleared)
+	}
+}
+
+func TestEthernetPerformanceThresholdData2Mapping(t *testing.T) {
+	protocol, store, controller := newEthernetPerformanceEngine(t, false)
+	now := time.Date(2026, 8, 11, 6, 0, 0, 0, time.UTC)
+	protocol.now = func() time.Time { return now }
+	thresholdID := uint16(0x920)
+	if err := store.Create(me.ThresholdData1ClassID, thresholdID, me.AttributeValueMap{}); err != nil {
+		t.Fatalf("Create(ThresholdData1 for TD2) error = %v", err)
+	}
+	if err := store.Create(me.ThresholdData2ClassID, thresholdID, me.AttributeValueMap{
+		me.ThresholdData2_ThresholdValue11: uint32(3),
+	}); err != nil {
+		t.Fatalf("Create(ThresholdData2) error = %v", err)
+	}
+	controller.ethernetCounters.Transmitted.InternalErrors = 10
+	createEthernetPerformanceWithThreshold(t, protocol,
+		me.EthernetPerformanceMonitoringHistoryDataClassID, testGEMEntity, thresholdID, 0x650)
+	pollPerformance(t, protocol)
+	controller.ethernetCounters.Transmitted.InternalErrors = 13
+	frames := pollPerformance(t, protocol)
+	if len(frames) != 1 {
+		t.Fatalf("Threshold Data 2 TCA frames = %d, want 1", len(frames))
+	}
+	alarm := decodeResponse(t, frames[0]).Layer(omci.LayerTypeAlarmNotification).(*omci.AlarmNotificationMsg)
+	if alarm.AlarmBitmap[1] != 0x20 || alarm.AlarmSequenceNumber != 1 {
+		t.Fatalf("Threshold Data 2 TCA = %#v", alarm)
+	}
+}
+
+func TestPerformanceThresholdSetDoesNotRepeatActiveTCA(t *testing.T) {
+	protocol, store, controller := newEthernetPerformanceEngine(t, false)
+	thresholdID := uint16(0x930)
+	if err := store.Create(me.ThresholdData1ClassID, thresholdID, me.AttributeValueMap{
+		me.ThresholdData1_ThresholdValue1: uint32(2),
+	}); err != nil {
+		t.Fatalf("Create(active ThresholdData1) error = %v", err)
+	}
+	createEthernetPerformanceWithThreshold(t, protocol,
+		me.EthernetPerformanceMonitoringHistoryData3ClassID, testGEMEntity, thresholdID, 0x660)
+	pollPerformance(t, protocol)
+	controller.ethernetCounters.Received.DropEvents = 2
+	if frames := pollPerformance(t, protocol); len(frames) != 1 {
+		t.Fatalf("initial TCA frames = %d, want 1", len(frames))
+	}
+
+	setThreshold := encodeRequest(t, 0x661, omci.SetRequestType, &omci.SetRequest{
+		MeBasePacket: omci.MeBasePacket{
+			EntityClass: me.ThresholdData1ClassID, EntityInstance: thresholdID,
+		},
+		AttributeMask: 0x8000,
+		Attributes: me.AttributeValueMap{
+			me.ThresholdData1_ThresholdValue1: uint32(3),
+		},
+	})
+	encoded, err := protocol.Handle(setThreshold)
+	if err != nil {
+		t.Fatalf("Handle(Set ThresholdData1) error = %v", err)
+	}
+	response := decodeResponse(t, encoded).Layer(omci.LayerTypeSetResponse).(*omci.SetResponse)
+	if response.Result != me.Success || len(protocol.performanceTCA) != 1 || len(protocol.alarms) != 1 {
+		t.Fatalf("Set threshold result=%v TCA=%d alarms=%d", response.Result,
+			len(protocol.performanceTCA), len(protocol.alarms))
+	}
+	if frames := pollPerformance(t, protocol); len(frames) != 0 {
+		t.Fatalf("below updated threshold TCA frames = %d, want 0", len(frames))
+	}
+	controller.ethernetCounters.Received.DropEvents = 3
+	frames := pollPerformance(t, protocol)
+	if len(frames) != 0 {
+		t.Fatalf("repeated active TCA frames = %d, want 0", len(frames))
+	}
+}
+
 func TestSynchronizeTimeAtomicallyRestartsPerformanceIntervals(t *testing.T) {
 	protocol, store, controller := newPerformanceEngine(t)
 	start := time.Date(2026, 8, 11, 1, 0, 0, 0, time.UTC)
 	protocol.now = func() time.Time { return start }
 	protocol.controller = controller
 	controller.counters = performance.GEMPortCounters{ReceivedGEMFrames: 100}
-	if err := protocol.PollPerformance(); err != nil {
-		t.Fatalf("PollPerformance(initialize) error = %v", err)
-	}
+	pollPerformance(t, protocol)
 	controller.counters.ReceivedGEMFrames = 150
+	active := [28]byte{0x40}
+	protocol.performanceTCA[gemPerformanceKey()] = active
+	protocol.alarms[gemPerformanceKey()] = active
 
 	requested := time.Date(2026, 8, 11, 2, 3, 4, 0, time.UTC)
 	request := encodeRequest(t, 0x620, omci.SynchronizeTimeRequestType, &omci.SynchronizeTimeRequest{
@@ -328,6 +572,16 @@ func TestSynchronizeTimeAtomicallyRestartsPerformanceIntervals(t *testing.T) {
 	}
 	if me.Results(encoded[8]) != me.Success || !controller.synced.Equal(requested) {
 		t.Fatalf("SynchronizeTime result=%v time=%v", me.Results(encoded[8]), controller.synced)
+	}
+	frames := protocol.DrainNotifications()
+	if len(frames) != 1 {
+		t.Fatalf("SynchronizeTime clear TCA frames = %d, want 1", len(frames))
+	}
+	alarm := decodeResponse(t, frames[0]).Layer(omci.LayerTypeAlarmNotification).(*omci.AlarmNotificationMsg)
+	if alarm.AlarmBitmap != ([28]byte{}) || alarm.AlarmSequenceNumber != 1 ||
+		len(protocol.performanceTCA) != 0 || len(protocol.alarms) != 0 {
+		t.Fatalf("SynchronizeTime clear TCA = %#v TCA=%d alarms=%d", alarm,
+			len(protocol.performanceTCA), len(protocol.alarms))
 	}
 	history, err := store.Get(gemPerformanceKey(), 0x9000)
 	if err != nil {
@@ -396,6 +650,10 @@ func newTestStoreForPerformanceCreate(t *testing.T) *mib.Store {
 }
 
 func createGEMPerformanceRequest(t *testing.T, transactionID uint16) []byte {
+	return createGEMPerformanceRequestWithThreshold(t, transactionID, 0)
+}
+
+func createGEMPerformanceRequestWithThreshold(t *testing.T, transactionID, thresholdID uint16) []byte {
 	t.Helper()
 	return encodeRequest(t, transactionID, omci.CreateRequestType, &omci.CreateRequest{
 		MeBasePacket: omci.MeBasePacket{
@@ -403,7 +661,7 @@ func createGEMPerformanceRequest(t *testing.T, transactionID uint16) []byte {
 			EntityInstance: testGEMEntity,
 		},
 		Attributes: me.AttributeValueMap{
-			me.GemPortNetworkCtpPerformanceMonitoringHistoryData_ThresholdData12Id: uint16(0),
+			me.GemPortNetworkCtpPerformanceMonitoringHistoryData_ThresholdData12Id: thresholdID,
 		},
 	})
 }
@@ -483,12 +741,17 @@ func newEthernetPerformanceEngine(t *testing.T,
 
 func createEthernetPerformance(t *testing.T, protocol *Engine,
 	classID me.ClassID, entityID, transactionID uint16) {
+	createEthernetPerformanceWithThreshold(t, protocol, classID, entityID, 0, transactionID)
+}
+
+func createEthernetPerformanceWithThreshold(t *testing.T, protocol *Engine,
+	classID me.ClassID, entityID, thresholdID, transactionID uint16) {
 	t.Helper()
 	request := encodeRequest(t, transactionID, omci.CreateRequestType, &omci.CreateRequest{
 		MeBasePacket: omci.MeBasePacket{
 			EntityClass: classID, EntityInstance: entityID,
 		},
-		Attributes: me.AttributeValueMap{"ThresholdData12Id": uint16(0)},
+		Attributes: me.AttributeValueMap{"ThresholdData12Id": thresholdID},
 	})
 	encoded, err := protocol.Handle(request)
 	if err != nil {
@@ -515,4 +778,13 @@ func getCurrentPerformance(t *testing.T, protocol *Engine, classID me.ClassID,
 		t.Fatalf("Handle(GetCurrentData %v/%#x) error = %v", classID, entityID, err)
 	}
 	return decodeResponse(t, encoded).Layer(omci.LayerTypeGetCurrentDataResponse).(*omci.GetCurrentDataResponse)
+}
+
+func pollPerformance(t *testing.T, protocol *Engine) [][]byte {
+	t.Helper()
+	frames, err := protocol.PollPerformance(omci.BaselineIdent)
+	if err != nil {
+		t.Fatalf("PollPerformance() error = %v", err)
+	}
+	return frames
 }
