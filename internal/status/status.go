@@ -11,20 +11,23 @@ import (
 )
 
 type Snapshot struct {
-	State             string    `json:"state"`
-	Interface         string    `json:"interface"`
-	StartedAt         time.Time `json:"started_at"`
-	UpdatedAt         time.Time `json:"updated_at"`
-	MIBDataSync       uint8     `json:"mib_data_sync"`
-	MIBEntries        int       `json:"mib_entries"`
-	PlatformBackend   string    `json:"platform_backend"`
-	RXFrames          uint64    `json:"rx_frames"`
-	TXFrames          uint64    `json:"tx_frames"`
-	DecodeErrors      uint64    `json:"decode_errors"`
-	TransportErrors   uint64    `json:"transport_errors"`
-	LastTransactionID uint16    `json:"last_transaction_id"`
-	LastMessageType   uint8     `json:"last_message_type"`
-	LastError         string    `json:"last_error,omitempty"`
+	State                string    `json:"state"`
+	Interface            string    `json:"interface"`
+	StartedAt            time.Time `json:"started_at"`
+	UpdatedAt            time.Time `json:"updated_at"`
+	MIBDataSync          uint8     `json:"mib_data_sync"`
+	MIBEntries           int       `json:"mib_entries"`
+	PlatformBackend      string    `json:"platform_backend"`
+	RXFrames             uint64    `json:"rx_frames"`
+	TXFrames             uint64    `json:"tx_frames"`
+	DecodeErrors         uint64    `json:"decode_errors"`
+	TransportErrors      uint64    `json:"transport_errors"`
+	EventErrors          uint64    `json:"event_errors"`
+	NotificationFrames   uint64    `json:"notification_frames"`
+	LastTransactionID    uint16    `json:"last_transaction_id"`
+	LastMessageType      uint8     `json:"last_message_type"`
+	LastNotificationType uint8     `json:"last_notification_type"`
+	LastError            string    `json:"last_error,omitempty"`
 }
 
 type Writer struct {

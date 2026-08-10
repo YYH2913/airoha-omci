@@ -1,0 +1,221 @@
+// SPDX-License-Identifier: Apache-2.0
+
+package engine
+
+import (
+	"testing"
+
+	"github.com/google/gopacket"
+	omci "github.com/opencord/omci-lib-go/v2"
+	me "github.com/opencord/omci-lib-go/v2/generated"
+	"github.com/xg2010g/airoha-omci/internal/mib"
+)
+
+const notificationUNI = 0x101
+
+func TestAlarmNotificationUpdatesAuditAndSequence(t *testing.T) {
+	protocol, _ := newNotificationEngine(t)
+	key := mib.Key{ClassID: me.PhysicalPathTerminationPointEthernetUniClassID, EntityID: notificationUNI}
+	var raised [28]byte
+	raised[0] = 0x80
+
+	frame, changed, err := protocol.NotifyAlarm(key, raised, omci.BaselineIdent)
+	if err != nil {
+		t.Fatalf("NotifyAlarm(raise) error = %v", err)
+	}
+	if !changed {
+		t.Fatal("NotifyAlarm(raise) changed = false, want true")
+	}
+	alarm := decodeResponse(t, frame).Layer(omci.LayerTypeAlarmNotification).(*omci.AlarmNotificationMsg)
+	if alarm.AlarmBitmap != raised || alarm.AlarmSequenceNumber != 0 {
+		t.Fatalf("first alarm = %#v, want raised/sequence 0", alarm)
+	}
+
+	if frame, changed, err = protocol.NotifyAlarm(key, raised, omci.BaselineIdent); err != nil || changed || frame != nil {
+		t.Fatalf("duplicate NotifyAlarm() = frame:%x changed:%v err:%v", frame, changed, err)
+	}
+
+	frame, changed, err = protocol.NotifyAlarm(key, [28]byte{}, omci.ExtendedIdent)
+	if err != nil || !changed {
+		t.Fatalf("NotifyAlarm(clear) changed=%v error=%v", changed, err)
+	}
+	alarm = decodeResponse(t, frame).Layer(omci.LayerTypeAlarmNotification).(*omci.AlarmNotificationMsg)
+	if alarm.AlarmBitmap != ([28]byte{}) || alarm.AlarmSequenceNumber != 1 || !alarm.Extended {
+		t.Fatalf("clear alarm = %#v, want clear/sequence 1/extended", alarm)
+	}
+
+	request := encodeRequest(t, 44, omci.GetAllAlarmsRequestType, &omci.GetAllAlarmsRequest{
+		MeBasePacket: meBase(me.OnuDataClassID, 0),
+	})
+	response, err := protocol.Handle(request)
+	if err != nil {
+		t.Fatalf("Handle(GetAllAlarms) error = %v", err)
+	}
+	audit := decodeResponse(t, response).Layer(omci.LayerTypeGetAllAlarmsResponse).(*omci.GetAllAlarmsResponse)
+	if audit.NumberOfCommands != 0 {
+		t.Fatalf("alarm audit count = %d, want 0 after clear", audit.NumberOfCommands)
+	}
+}
+
+func TestAlarmNotificationRejectsUndefinedAlarmBit(t *testing.T) {
+	protocol, _ := newNotificationEngine(t)
+	var bitmap [28]byte
+	bitmap[0] = 0x40
+	_, _, err := protocol.NotifyAlarm(mib.Key{
+		ClassID:  me.PhysicalPathTerminationPointEthernetUniClassID,
+		EntityID: notificationUNI,
+	}, bitmap, omci.BaselineIdent)
+	if err == nil {
+		t.Fatal("NotifyAlarm(undefined bit) error = nil")
+	}
+}
+
+func TestAlarmSequenceWrapsAt255(t *testing.T) {
+	protocol, _ := newNotificationEngine(t)
+	protocol.alarmSequence = 255
+	key := mib.Key{ClassID: me.PhysicalPathTerminationPointEthernetUniClassID, EntityID: notificationUNI}
+	var bitmap [28]byte
+	bitmap[0] = 0x80
+	first, _, err := protocol.NotifyAlarm(key, bitmap, omci.BaselineIdent)
+	if err != nil {
+		t.Fatalf("NotifyAlarm(sequence 255) error = %v", err)
+	}
+	second, _, err := protocol.NotifyAlarm(key, [28]byte{}, omci.BaselineIdent)
+	if err != nil {
+		t.Fatalf("NotifyAlarm(sequence wrap) error = %v", err)
+	}
+	firstAlarm := decodeResponse(t, first).Layer(omci.LayerTypeAlarmNotification).(*omci.AlarmNotificationMsg)
+	secondAlarm := decodeResponse(t, second).Layer(omci.LayerTypeAlarmNotification).(*omci.AlarmNotificationMsg)
+	if firstAlarm.AlarmSequenceNumber != 255 || secondAlarm.AlarmSequenceNumber != 0 {
+		t.Fatalf("alarm sequence = %d/%d, want 255/0",
+			firstAlarm.AlarmSequenceNumber, secondAlarm.AlarmSequenceNumber)
+	}
+}
+
+func TestAVCUpdatesMIBWithoutDataSync(t *testing.T) {
+	protocol, store := newNotificationEngine(t)
+	key := mib.Key{ClassID: me.PhysicalPathTerminationPointEthernetUniClassID, EntityID: notificationUNI}
+	frames, err := protocol.NotifyAttributeChange(key, me.AttributeValueMap{
+		me.PhysicalPathTerminationPointEthernetUni_OperationalState: uint8(0),
+	}, omci.BaselineIdent)
+	if err != nil {
+		t.Fatalf("NotifyAttributeChange() error = %v", err)
+	}
+	if len(frames) != 1 {
+		t.Fatalf("AVC frame count = %d, want 1", len(frames))
+	}
+	packet := decodeResponse(t, frames[0])
+	header := packet.Layer(omci.LayerTypeOMCI).(*omci.OMCI)
+	avc := packet.Layer(omci.LayerTypeAttributeValueChange).(*omci.AttributeValueChangeMsg)
+	if header.TransactionID != 0 || avc.AttributeMask != 0x0400 ||
+		avc.Attributes[me.PhysicalPathTerminationPointEthernetUni_OperationalState] != uint8(0) {
+		t.Fatalf("AVC = header:%#v payload:%#v", header, avc)
+	}
+	if store.DataSync() != 0 {
+		t.Fatalf("MIB data sync = %d after AVC, want 0", store.DataSync())
+	}
+
+	frames, err = protocol.NotifyAttributeChange(key, me.AttributeValueMap{
+		me.PhysicalPathTerminationPointEthernetUni_OperationalState: uint8(0),
+	}, omci.BaselineIdent)
+	if err != nil || len(frames) != 0 {
+		t.Fatalf("duplicate AVC frames=%d err=%v, want 0/nil", len(frames), err)
+	}
+}
+
+func TestBaselineAVCSplitsLargeAttributeSet(t *testing.T) {
+	protocol, _ := newNotificationEngine(t)
+	frames, err := protocol.NotifyAttributeChange(mib.Key{
+		ClassID: me.SoftwareImageClassID, EntityID: 1,
+	}, me.AttributeValueMap{
+		me.SoftwareImage_Version:     filled(14, 0x11),
+		me.SoftwareImage_ProductCode: filled(25, 0x22),
+		me.SoftwareImage_ImageHash:   filled(16, 0x33),
+	}, omci.BaselineIdent)
+	if err != nil {
+		t.Fatalf("NotifyAttributeChange(large) error = %v", err)
+	}
+	if len(frames) != 3 {
+		t.Fatalf("baseline AVC frame count = %d, want 3", len(frames))
+	}
+	var combined uint16
+	for _, frame := range frames {
+		avc := decodeResponse(t, frame).Layer(omci.LayerTypeAttributeValueChange).(*omci.AttributeValueChangeMsg)
+		combined |= avc.AttributeMask
+	}
+	if combined != 0x8c00 {
+		t.Fatalf("combined AVC mask = %#x, want 0x8c00", combined)
+	}
+}
+
+func TestRequestedTestResultKeepsTCIAndFormat(t *testing.T) {
+	protocol, _ := newNotificationEngine(t)
+	frame, err := protocol.TestResult(0x1234,
+		mib.Key{ClassID: me.OnuGClassID, EntityID: 0}, []byte{1, 2, 3}, omci.ExtendedIdent)
+	if err != nil {
+		t.Fatalf("TestResult() error = %v", err)
+	}
+	packet := decodeResponse(t, frame)
+	header := packet.Layer(omci.LayerTypeOMCI).(*omci.OMCI)
+	result := packet.Layer(omci.LayerTypeTestResult).(*omci.TestResultNotification)
+	if header.TransactionID != 0x1234 || header.DeviceIdentifier != omci.ExtendedIdent ||
+		len(result.Payload) != 3 || result.Payload[0] != 1 || result.Payload[2] != 3 {
+		t.Fatalf("test result = header:%#v payload:%x", header, result.Payload)
+	}
+}
+
+func newNotificationEngine(t *testing.T) (*Engine, *mib.Store) {
+	t.Helper()
+	store, err := mib.New([]mib.Instance{
+		{
+			Key:        mib.Key{ClassID: me.OnuDataClassID, EntityID: 0},
+			Attributes: me.AttributeValueMap{me.OnuData_MibDataSync: uint8(0)},
+		},
+		{
+			Key: mib.Key{ClassID: me.OnuGClassID, EntityID: 0},
+			Attributes: me.AttributeValueMap{
+				me.OnuG_VendorId:            []byte("TEST"),
+				me.OnuG_Version:             filled(14, 0),
+				me.OnuG_SerialNumber:        filled(8, 0),
+				me.OnuG_OperationalState:    uint8(0),
+				me.OnuG_AdministrativeState: uint8(0),
+			},
+		},
+		{
+			Key: mib.Key{ClassID: me.PhysicalPathTerminationPointEthernetUniClassID, EntityID: notificationUNI},
+			Attributes: me.AttributeValueMap{
+				me.PhysicalPathTerminationPointEthernetUni_SensedType:       uint8(0x2f),
+				me.PhysicalPathTerminationPointEthernetUni_OperationalState: uint8(1),
+			},
+		},
+		{
+			Key: mib.Key{ClassID: me.SoftwareImageClassID, EntityID: 1},
+			Attributes: me.AttributeValueMap{
+				me.SoftwareImage_Version:     filled(14, 0),
+				me.SoftwareImage_IsCommitted: uint8(0),
+				me.SoftwareImage_IsActive:    uint8(0),
+				me.SoftwareImage_IsValid:     uint8(1),
+				me.SoftwareImage_ProductCode: filled(25, 0),
+				me.SoftwareImage_ImageHash:   filled(16, 0),
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("mib.New() error = %v", err)
+	}
+	return New(store), store
+}
+
+func meBase(classID me.ClassID, entityID uint16) omci.MeBasePacket {
+	return omci.MeBasePacket{EntityClass: classID, EntityInstance: entityID}
+}
+
+func filled(size int, value byte) []byte {
+	result := make([]byte, size)
+	for index := range result {
+		result[index] = value
+	}
+	return result
+}
+
+var _ gopacket.SerializableLayer = (*omci.TestResultNotification)(nil)

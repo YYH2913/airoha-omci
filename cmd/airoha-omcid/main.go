@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/xg2010g/airoha-omci/internal/engine"
+	platformevent "github.com/xg2010g/airoha-omci/internal/event"
 	"github.com/xg2010g/airoha-omci/internal/mib"
 	"github.com/xg2010g/airoha-omci/internal/model"
 	"github.com/xg2010g/airoha-omci/internal/platform"
@@ -30,6 +31,7 @@ type options struct {
 	statusPath    string
 	applyHelper   string
 	controlHelper string
+	eventHelper   string
 }
 
 func main() {
@@ -40,6 +42,7 @@ func main() {
 	flag.StringVar(&opts.statusPath, "status", "/var/run/airoha-omcid/status.json", "atomic JSON status path")
 	flag.StringVar(&opts.applyHelper, "apply-helper", "", "fixed executable receiving candidate MIB snapshots as JSON")
 	flag.StringVar(&opts.controlHelper, "control-helper", "", "fixed executable handling time sync and scheduled reboot")
+	flag.StringVar(&opts.eventHelper, "event-helper", "", "fixed executable streaming platform events as JSON lines")
 	flag.Parse()
 
 	if err := run(opts); err != nil {
@@ -96,47 +99,133 @@ func run(opts options) error {
 		return err
 	}
 
+	type receiveResult struct {
+		frame []byte
+		err   error
+	}
+	received := make(chan receiveResult, 1)
+	go func() {
+		for {
+			frame, err := conn.ReadFrame(ctx)
+			select {
+			case received <- receiveResult{frame: frame, err: err}:
+			case <-ctx.Done():
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	var platformEvents chan platformevent.Event
+	var eventSourceErrors chan error
+	if opts.eventHelper != "" {
+		platformEvents = make(chan platformevent.Event)
+		eventSourceErrors = make(chan error, 1)
+		go func() {
+			err := (platformevent.ExecSource{Path: opts.eventHelper}).Run(ctx,
+				func(value platformevent.Event) error {
+					select {
+					case platformEvents <- value:
+						return nil
+					case <-ctx.Done():
+						return ctx.Err()
+					}
+				})
+			eventSourceErrors <- err
+		}()
+	}
+
 	for {
-		frame, err := conn.ReadFrame(ctx)
-		if err != nil {
-			if errors.Is(err, context.Canceled) {
+		select {
+		case <-ctx.Done():
+			state.State = "stopped"
+			_ = statusWriter.Write(state)
+			return nil
+
+		case sourceErr := <-eventSourceErrors:
+			if ctx.Err() != nil {
 				state.State = "stopped"
 				_ = statusWriter.Write(state)
 				return nil
 			}
 			state.TransportErrors++
-			state.LastError = err.Error()
+			state.LastError = sourceErr.Error()
 			_ = statusWriter.Write(state)
-			return err
-		}
+			return sourceErr
 
-		state.RXFrames++
-		if len(frame) >= 4 {
-			state.LastTransactionID = uint16(frame[0])<<8 | uint16(frame[1])
-			state.LastMessageType = frame[2]
-		}
-		response, err := protocol.Handle(frame)
-		if err != nil {
-			state.DecodeErrors++
-			state.LastError = err.Error()
+		case value := <-platformEvents:
+			frames, err := value.Dispatch(protocol)
+			if err != nil {
+				state.EventErrors++
+				state.LastError = err.Error()
+				_ = statusWriter.Write(state)
+				log.Printf("OMCI platform event rejected: %v", err)
+				continue
+			}
+			for _, frame := range frames {
+				if err := conn.WriteFrame(ctx, frame); err != nil {
+					state.TransportErrors++
+					state.LastError = err.Error()
+					_ = statusWriter.Write(state)
+					return err
+				}
+				state.TXFrames++
+				state.NotificationFrames++
+				if len(frame) >= 3 {
+					state.LastNotificationType = frame[2]
+				}
+			}
 			state.MIBDataSync = store.DataSync()
 			state.MIBEntries = len(store.Snapshot())
-			_ = statusWriter.Write(state)
-			log.Printf("OMCI request rejected: %v", err)
-			continue
-		}
-		if err := conn.WriteFrame(ctx, response); err != nil {
-			state.TransportErrors++
-			state.LastError = err.Error()
-			_ = statusWriter.Write(state)
-			return err
-		}
-		state.TXFrames++
-		state.MIBDataSync = store.DataSync()
-		state.MIBEntries = len(store.Snapshot())
-		state.LastError = ""
-		if err := statusWriter.Write(state); err != nil {
-			log.Printf("publish status: %v", err)
+			state.LastError = ""
+			if err := statusWriter.Write(state); err != nil {
+				log.Printf("publish status: %v", err)
+			}
+
+		case result := <-received:
+			if result.err != nil {
+				if errors.Is(result.err, context.Canceled) {
+					state.State = "stopped"
+					_ = statusWriter.Write(state)
+					return nil
+				}
+				state.TransportErrors++
+				state.LastError = result.err.Error()
+				_ = statusWriter.Write(state)
+				return result.err
+			}
+
+			frame := result.frame
+			state.RXFrames++
+			if len(frame) >= 4 {
+				state.LastTransactionID = uint16(frame[0])<<8 | uint16(frame[1])
+				state.LastMessageType = frame[2]
+			}
+			response, err := protocol.Handle(frame)
+			if err != nil {
+				state.DecodeErrors++
+				state.LastError = err.Error()
+				state.MIBDataSync = store.DataSync()
+				state.MIBEntries = len(store.Snapshot())
+				_ = statusWriter.Write(state)
+				log.Printf("OMCI request rejected: %v", err)
+				continue
+			}
+			if err := conn.WriteFrame(ctx, response); err != nil {
+				state.TransportErrors++
+				state.LastError = err.Error()
+				_ = statusWriter.Write(state)
+				return err
+			}
+			state.TXFrames++
+			state.MIBDataSync = store.DataSync()
+			state.MIBEntries = len(store.Snapshot())
+			state.LastError = ""
+			if err := statusWriter.Write(state); err != nil {
+				log.Printf("publish status: %v", err)
+			}
 		}
 	}
 }

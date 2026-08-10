@@ -16,9 +16,11 @@ after the configured fixed-path helper accepts the complete candidate state.
 
 This repository is under active development. The raw OMCC transport,
 transactional MIB, baseline table transfer and core MIB audit operations are
-implemented. It is not yet ready for operator deployment because multi-GEM,
-autonomous notifications, tests, software lifecycle and real OLT
-interoperability are incomplete; see [the implementation matrix](docs/implementation.md).
+implemented. Driver-originated alarm/AVC events now have a validated upstream
+notification path. It is not yet ready for operator deployment because
+multi-GEM, complete alarm/ARC coverage, test execution, software lifecycle and
+real OLT interoperability are incomplete; see
+[the implementation matrix](docs/implementation.md).
 
 ## Development
 

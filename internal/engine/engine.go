@@ -43,13 +43,14 @@ type Engine struct {
 
 	mib *mib.Store
 
-	cache       map[[sha256.Size]byte][]byte
-	cacheOrder  [][sha256.Size]byte
-	upload      map[omci.DeviceIdent][]uploadCommand
-	tables      map[tableKey][]byte
-	alarms      map[mib.Key][28]byte
-	alarmUpload map[omci.DeviceIdent][]Alarm
-	controller  Controller
+	cache         map[[sha256.Size]byte][]byte
+	cacheOrder    [][sha256.Size]byte
+	upload        map[omci.DeviceIdent][]uploadCommand
+	tables        map[tableKey][]byte
+	alarms        map[mib.Key][28]byte
+	alarmUpload   map[omci.DeviceIdent][]Alarm
+	alarmSequence uint8
+	controller    Controller
 }
 
 func New(store *mib.Store) *Engine {

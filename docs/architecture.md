@@ -24,7 +24,12 @@ independently from kernel and LuCI changes.  The OpenWrt tree contains only:
    it atomically.
 5. `status` publishes bounded diagnostics for ubus and LuCI without exposing
    OMCI credentials.
+6. `event` consumes validated JSON lines from a fixed-path platform helper and
+   maps hardware alarm, AVC and test-result events to upstream OMCI frames.
 
 The kernel is responsible only for GPON/PLOAM, OMCC frame transport and the
 low-level T-CONT/GEM control ABI.  G.988 policy remains in userspace.
 
+The event helper is a platform adapter, not part of the protocol engine. It is
+started directly without a shell and cannot choose executables or command-line
+arguments from an event payload. See [the event ABI](platform-events.md).

@@ -4,6 +4,7 @@ package mib
 
 import (
 	"fmt"
+	"reflect"
 	"sort"
 	"sync"
 
@@ -223,6 +224,72 @@ func (s *Store) Set(key Key, attributes me.AttributeValueMap) error {
 	proposed := cloneInstances(s.current)
 	proposed[key] = normalized
 	return s.commitLocked(OperationSet, &current, &normalized, proposed, s.nextDataSyncLocked())
+}
+
+// UpdateAutonomous records attributes changed by the ONU itself. Autonomous
+// changes do not advance MIB data sync and are not sent to the platform
+// applier: they describe hardware state that has already changed. The returned
+// map contains only values that differ from the committed MIB.
+func (s *Store) UpdateAutonomous(key Key, attributes me.AttributeValueMap) (me.AttributeValueMap, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	current, exists := s.current[key]
+	if !exists {
+		return nil, unknownKeyError(key)
+	}
+	entity, result := loadDefinition(key.ClassID, key.EntityID, current.Attributes)
+	if result != nil {
+		return nil, result
+	}
+
+	definitions := entity.GetAttributeDefinitions()
+	var failed uint16
+	var unsupported uint16
+	for name := range attributes {
+		if name == me.ManagedEntityID ||
+			(key.ClassID == me.OnuDataClassID && name == me.OnuData_MibDataSync) {
+			unsupported = 0xffff
+			continue
+		}
+		definition, err := me.GetAttributeDefinitionByName(definitions, name)
+		if err != nil {
+			unsupported = 0xffff
+			continue
+		}
+		if !me.SupportsAttributeAccess(*definition, me.Read) {
+			failed |= definition.Mask
+		}
+	}
+	if failed != 0 || unsupported != 0 {
+		return nil, &ResultError{
+			Result:          me.AttributeFailure,
+			FailedMask:      failed,
+			UnsupportedMask: unsupported,
+		}
+	}
+
+	next := cloneInstance(current)
+	for name, value := range attributes {
+		next.Attributes[name] = cloneValue(value)
+	}
+	normalized, err := normalize(next)
+	if err != nil {
+		return nil, err
+	}
+
+	changed := make(me.AttributeValueMap)
+	for name := range attributes {
+		value := normalized.Attributes[name]
+		if !reflect.DeepEqual(current.Attributes[name], value) {
+			changed[name] = cloneValue(value)
+		}
+	}
+	if len(changed) == 0 {
+		return changed, nil
+	}
+	s.current[key] = normalized
+	return changed, nil
 }
 
 func (s *Store) Delete(key Key) error {

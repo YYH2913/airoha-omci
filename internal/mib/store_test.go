@@ -169,6 +169,68 @@ func TestRejectsWriteToReadOnlyAttribute(t *testing.T) {
 	}
 }
 
+func TestAutonomousUpdateDoesNotAdvanceDataSyncOrApplyPlatform(t *testing.T) {
+	applyCalls := 0
+	key := Key{ClassID: me.PhysicalPathTerminationPointEthernetUniClassID, EntityID: 0x101}
+	store, err := NewWithApplier([]Instance{
+		{
+			Key: Key{ClassID: me.OnuDataClassID, EntityID: 0},
+			Attributes: me.AttributeValueMap{
+				me.OnuData_MibDataSync: uint8(0),
+			},
+		},
+		{
+			Key: key,
+			Attributes: me.AttributeValueMap{
+				me.PhysicalPathTerminationPointEthernetUni_SensedType:       uint8(0x2f),
+				me.PhysicalPathTerminationPointEthernetUni_OperationalState: uint8(1),
+			},
+		},
+	}, ApplyFunc(func(Change) error {
+		applyCalls++
+		return nil
+	}))
+	if err != nil {
+		t.Fatalf("NewWithApplier() error = %v", err)
+	}
+
+	changed, err := store.UpdateAutonomous(key, me.AttributeValueMap{
+		me.PhysicalPathTerminationPointEthernetUni_OperationalState: uint8(0),
+	})
+	if err != nil {
+		t.Fatalf("UpdateAutonomous() error = %v", err)
+	}
+	if got := changed[me.PhysicalPathTerminationPointEthernetUni_OperationalState]; got != uint8(0) {
+		t.Fatalf("changed operational state = %#v, want 0", got)
+	}
+	if store.DataSync() != 0 || applyCalls != 0 {
+		t.Fatalf("autonomous update changed sync/applier: sync=%d calls=%d", store.DataSync(), applyCalls)
+	}
+
+	changed, err = store.UpdateAutonomous(key, me.AttributeValueMap{
+		me.PhysicalPathTerminationPointEthernetUni_OperationalState: uint8(0),
+	})
+	if err != nil {
+		t.Fatalf("UpdateAutonomous(duplicate) error = %v", err)
+	}
+	if len(changed) != 0 {
+		t.Fatalf("duplicate autonomous update changed = %#v, want empty", changed)
+	}
+}
+
+func TestAutonomousUpdateCannotOverrideMibDataSync(t *testing.T) {
+	store := newTestStore(t)
+	_, err := store.UpdateAutonomous(Key{ClassID: me.OnuDataClassID, EntityID: 0},
+		me.AttributeValueMap{me.OnuData_MibDataSync: uint8(7)})
+	var result *ResultError
+	if !errors.As(err, &result) || result.Result != me.AttributeFailure {
+		t.Fatalf("UpdateAutonomous(MIB data sync) error = %#v, want AttributeFailure", err)
+	}
+	if store.DataSync() != 0 {
+		t.Fatalf("DataSync() = %d, want 0", store.DataSync())
+	}
+}
+
 func TestSnapshotDoesNotAliasStore(t *testing.T) {
 	store := newTestStore(t)
 	snapshot := store.Snapshot()
