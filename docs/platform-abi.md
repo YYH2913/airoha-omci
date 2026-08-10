@@ -88,6 +88,14 @@ outside the per-profile Linux bridges. A UNI may belong to only one active
 profile, and the backend never removes an interface from a non-OMCI Linux
 bridge implicitly.
 
+Extended VLAN associations to a MAC bridge ANI port, 802.1p mapper or GEM
+interworking termination are resolved onto that profile-specific ANI endpoint.
+Upstream rules run on ANI egress and downstream rules run on ANI ingress.
+Mapper and bridge-port associations cover the complete ANI, while a GEM-IW
+association is selected by the reserved receive/transmit GEM skb mark. Multiple
+GEM-IW profiles may therefore coexist on one ANI without sharing VLAN rule
+chains.
+
 XG2010G Ethernet PPTP UNI instances carry a fixed, validated Linux interface
 name in the graph. The mapping is `0x0101` to `lan1`, `0x0102` to `lan2`,
 `0x0103` to `lan3`, and `0x0104` to `lan4`. The platform helper must reject a

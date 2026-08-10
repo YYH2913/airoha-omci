@@ -14,7 +14,7 @@ and extended messages.  A successful build or reaching GPON O5 is not enough.
 | Equipment | ONU-G, ONU2-G, ANI-G, four speed-specific Ethernet UNIs, software images | in progress |
 | Traffic | 8 T-CONTs/schedulers, 96 queues, GEM CTP/IW validation and hardware apply | in progress |
 | Performance | common 15-minute engine, GEM CTP and Ethernet UNI/frame PM | class 341, 24, 296, 321 and 322 counters, threshold data 1/2 and TCA implemented; physical verification pending |
-| Ethernet service | resolved bridge, mapper, VLAN and extended VLAN graph | common UNI/ANI bridge service implemented; advanced associations pending |
+| Ethernet service | resolved bridge, mapper, VLAN and extended VLAN graph | UNI, bridge-port, mapper and GEM-IW associations implemented; advanced treatment pending |
 | Lifecycle | reboot, time sync, software download/activate/commit | implemented; OLT verification pending |
 | Platform | multi-T-CONT/GEM Airoha ABI and transactional Linux backend | GEM, UNI VLAN and multi-profile MAC bridge implemented; hardware offload pending |
 | OpenWrt | package, procd, UCI, rpcd/ubus and LuCI | optical configuration and live service status implemented; mode integration pending |
@@ -122,9 +122,12 @@ configured, preventing ambiguous service selection.
 
 The OpenWrt backend programs all OLT-provisioned GEM CTPs. TC classifiers set
 the reserved skb mark for P-bit, DSCP and default mapper branches, dispatch
-downstream frames by their receive GEM mark, and apply UNI-side classic and
-extended VLAN rules. Each complete bridge profile with one ANI logical port
-and one or more Ethernet UNIs is materialized as a managed Linux bridge. A
+downstream frames by their receive GEM mark, and apply classic and extended
+VLAN rules on UNI and ANI bridge paths. Mapper and ANI bridge-port associations
+cover a complete ANI endpoint; GEM-IW associations use mark-dispatched rule
+chains so multiple GEM profiles can coexist on that endpoint. Each complete
+bridge profile with one ANI logical port and one or more Ethernet UNIs is
+materialized as a managed Linux bridge. A
 profile-specific veth pair represents its ANI port: the bridge-facing end
 keeps the profile's FDB and flooding policy independent, while the PON-facing
 end redirects upstream traffic to the physical `pon` and receives only the
@@ -140,8 +143,7 @@ selected LAN ports to be explicitly released from their existing network
 bridge. The platform helper reports `bridge-conflict` and leaves that network
 untouched if any requested LAN or PON port has a non-OMCI master.
 
-The remaining Ethernet blockers are VLAN associations on ANI/mapper/GEM bridge
-ports, full extended-VLAN DEI/copy/inverse behavior, learning-depth and
-traffic-descriptor enforcement, and native Airoha offload. Transactional crash
-recovery and physical baseline/extended OLT interoperability also remain
-completion gates.
+The remaining Ethernet blockers are full extended-VLAN DEI/copy/inverse
+behavior, learning-depth and traffic-descriptor enforcement, and native Airoha
+offload. Transactional crash recovery and physical baseline/extended OLT
+interoperability also remain completion gates.
