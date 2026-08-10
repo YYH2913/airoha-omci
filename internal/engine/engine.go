@@ -539,8 +539,7 @@ func (e *Engine) dispatch(packet gopacket.Packet, header *omci.OMCI) ([]byte, er
 				Extended: extended,
 			},
 			Result: result, WindowSize: request.WindowSize,
-			NumberOfInstances: request.NumberOfCircuitPacks,
-			MeResults:         softwareResults(request.CircuitPacks, result),
+			NumberOfInstances: 0,
 		})
 
 	case omci.DownloadSectionRequestType, omci.DownloadSectionRequestWithResponseType:
@@ -548,11 +547,9 @@ func (e *Engine) dispatch(packet gopacket.Packet, header *omci.OMCI) ([]byte, er
 		if err != nil {
 			return nil, err
 		}
-		result := e.downloadSoftwareSection(request, header.DeviceIdentifier)
+		acknowledged := header.MessageType == omci.DownloadSectionRequestWithResponseType
+		result := e.downloadSoftwareSection(request, header.DeviceIdentifier, acknowledged)
 		if header.MessageType == omci.DownloadSectionRequestType {
-			if result != me.Success {
-				return nil, fmt.Errorf("download section %d rejected: %s", request.SectionNumber, result)
-			}
 			return nil, nil
 		}
 		return serialize(header, omci.DownloadSectionResponseType, &omci.DownloadSectionResponse{
@@ -574,8 +571,7 @@ func (e *Engine) dispatch(packet gopacket.Packet, header *omci.OMCI) ([]byte, er
 				EntityClass: request.EntityClass, EntityInstance: request.EntityInstance,
 				Extended: extended,
 			},
-			Result: result, NumberOfInstances: request.NumberOfInstances,
-			MeResults: softwareResults(request.ImageInstances, result),
+			Result: result, NumberOfInstances: 0,
 		})
 
 	case omci.ActivateSoftwareRequestType:

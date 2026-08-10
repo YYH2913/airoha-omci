@@ -23,9 +23,37 @@ type softwareDownload struct {
 	received        uint32
 	windowSize      uint16
 	expectedSection uint8
+	window          []byte
+	windowFailed    bool
 	sink            software.Download
 	crc             uint32
 	md5             hash.Hash
+	phase           softwareDownloadPhase
+	end             softwareEndRequest
+	finish          <-chan softwareFinishResult
+	finished        *softwareFinishResult
+	imageHash       [md5.Size]byte
+}
+
+type softwareDownloadPhase uint8
+
+const (
+	softwareReceiving softwareDownloadPhase = iota
+	softwareFinalizing
+	softwareComplete
+	softwareFailed
+)
+
+type softwareEndRequest struct {
+	entityID uint16
+	device   omci.DeviceIdent
+	crc      uint32
+	size     uint32
+}
+
+type softwareFinishResult struct {
+	metadata software.Metadata
+	err      error
 }
 
 type SoftwareStatus struct {
@@ -102,11 +130,16 @@ func (e *Engine) startSoftwareDownload(request *omci.StartSoftwareDownloadReques
 	if e.software == nil {
 		return me.NotSupported
 	}
-	if e.download != nil {
+	if e.softwareDownloadBusy() {
 		return me.DeviceBusy
 	}
-	if request.EntityClass != me.SoftwareImageClassID || request.EntityInstance > 1 ||
-		request.ImageSize == 0 || request.NumberOfCircuitPacks != 1 ||
+	if request.EntityClass != me.SoftwareImageClassID {
+		return me.UnknownEntity
+	}
+	if request.EntityInstance > 1 {
+		return me.UnknownInstance
+	}
+	if request.ImageSize == 0 || request.NumberOfCircuitPacks != 1 ||
 		len(request.CircuitPacks) != 1 || request.CircuitPacks[0] != request.EntityInstance {
 		return me.ParameterError
 	}
@@ -114,9 +147,10 @@ func (e *Engine) startSoftwareDownload(request *omci.StartSoftwareDownloadReques
 	if result != me.Success {
 		return result
 	}
-	if image.active {
+	if image.active || image.committed {
 		return me.ParameterError
 	}
+	e.download = nil
 	sink, err := e.software.Start(request.EntityInstance, request.ImageSize)
 	if err != nil {
 		return me.ProcessingError
@@ -132,7 +166,7 @@ func (e *Engine) startSoftwareDownload(request *omci.StartSoftwareDownloadReques
 	e.download = &softwareDownload{
 		entityID: request.EntityInstance, device: device,
 		expectedSize: request.ImageSize, windowSize: uint16(request.WindowSize) + 1,
-		sink: sink, crc: checksum.CRC32AInitial, md5: md5.New(),
+		sink: sink, crc: checksum.CRC32AInitial, md5: md5.New(), phase: softwareReceiving,
 	}
 	e.softwareState = SoftwareStatus{
 		Phase: "downloading", ImageID: request.EntityInstance, ImageSize: request.ImageSize,
@@ -141,37 +175,65 @@ func (e *Engine) startSoftwareDownload(request *omci.StartSoftwareDownloadReques
 }
 
 func (e *Engine) downloadSoftwareSection(request *omci.DownloadSectionRequest,
-	device omci.DeviceIdent) me.Results {
+	device omci.DeviceIdent, acknowledged bool) me.Results {
 	download := e.download
-	if download == nil {
+	if download == nil || download.phase != softwareReceiving {
 		return me.ProcessingError
 	}
 	if request.EntityClass != me.SoftwareImageClassID ||
-		request.EntityInstance != download.entityID || device != download.device ||
-		request.SectionNumber != download.expectedSection || len(request.SectionData) == 0 ||
-		download.received >= download.expectedSize {
-		e.failSoftwareDownload()
+		request.EntityInstance != download.entityID || device != download.device {
 		return me.ParameterError
 	}
-	remaining := int(download.expectedSize - download.received)
+	if len(request.SectionData) == 0 {
+		return e.rejectSoftwareWindow(download, acknowledged, me.ParameterError)
+	}
+	if download.windowFailed {
+		if request.SectionNumber != 0 {
+			if acknowledged {
+				e.resetSoftwareWindow(download)
+				return me.ProcessingError
+			}
+			return me.Success
+		}
+		e.resetSoftwareWindow(download)
+	}
+	if request.SectionNumber != download.expectedSection {
+		return e.rejectSoftwareWindow(download, acknowledged, me.ProcessingError)
+	}
+
+	remaining := int(download.expectedSize - download.received - uint32(len(download.window)))
 	data := request.SectionData
 	if len(data) > remaining {
+		if device != omci.BaselineIdent || !zeroOctets(data[remaining:]) {
+			return e.rejectSoftwareWindow(download, acknowledged, me.ProcessingError)
+		}
 		data = data[:remaining]
 	}
-	written, err := download.sink.Write(data)
-	if err != nil || written != len(data) {
-		e.failSoftwareDownload()
-		return me.ProcessingError
-	}
-	download.crc = checksum.UpdateCRC32A(download.crc, data)
-	_, _ = download.md5.Write(data)
-	download.received += uint32(len(data))
+	download.window = append(download.window, data...)
+
 	next := uint16(download.expectedSection) + 1
-	if next >= download.windowSize {
-		download.expectedSection = 0
-	} else {
+	if !acknowledged {
+		if next >= download.windowSize {
+			download.window = nil
+			download.windowFailed = true
+			download.expectedSection = 0
+			return me.Success
+		}
 		download.expectedSection = uint8(next)
+		return me.Success
 	}
+
+	if len(download.window) != 0 {
+		written, err := download.sink.Write(download.window)
+		if err != nil || written != len(download.window) {
+			e.failSoftwareDownload()
+			return me.ProcessingError
+		}
+		download.crc = checksum.UpdateCRC32A(download.crc, download.window)
+		_, _ = download.md5.Write(download.window)
+		download.received += uint32(len(download.window))
+	}
+	e.resetSoftwareWindow(download)
 	e.softwareState.Bytes = download.received
 	return me.Success
 }
@@ -182,53 +244,60 @@ func (e *Engine) endSoftwareDownload(request *omci.EndSoftwareDownloadRequest,
 	if download == nil {
 		return me.ProcessingError
 	}
-	validRequest := request.EntityClass == me.SoftwareImageClassID &&
-		request.EntityInstance == download.entityID && device == download.device &&
-		request.ImageSize == download.expectedSize && request.ImageSize == download.received &&
+	if request.EntityClass != me.SoftwareImageClassID {
+		return me.UnknownEntity
+	}
+	if request.EntityInstance > 1 {
+		return me.UnknownInstance
+	}
+	if request.EntityInstance != download.entityID || device != download.device {
+		return me.ProcessingError
+	}
+	end := softwareEndRequest{
+		entityID: request.EntityInstance, device: device, crc: request.CRC32, size: request.ImageSize,
+	}
+	if download.phase != softwareReceiving {
+		if end != download.end {
+			return me.ProcessingError
+		}
+		return e.softwareFinishStatus(download)
+	}
+	validRequest := request.ImageSize == download.expectedSize && request.ImageSize == download.received &&
 		request.NumberOfInstances == 1 && len(request.ImageInstances) == 1 &&
-		request.ImageInstances[0] == download.entityID
+		request.ImageInstances[0] == download.entityID && len(download.window) == 0 &&
+		!download.windowFailed && download.expectedSection == 0
 	if !validRequest || request.CRC32 != checksum.SumCRC32A(download.crc) {
 		e.failSoftwareDownload()
 		return me.ProcessingError
 	}
-	metadata, err := download.sink.Finish()
-	if err != nil || len(metadata.Version) > 14 || len(metadata.ProductCode) > 25 {
-		e.download = nil
-		e.softwareState.Phase = "failed"
-		return me.ProcessingError
-	}
-	if strings.TrimSpace(metadata.ProductCode) == "" {
-		metadata.ProductCode = "XG2010G"
-	}
-	hashValue := download.md5.Sum(nil)
-	err = e.mib.UpdateByCommand(map[mib.Key]me.AttributeValueMap{
-		softwareKey(download.entityID): {
-			me.SoftwareImage_Version:     fixedOctets(metadata.Version, 14),
-			me.SoftwareImage_IsValid:     uint8(1),
-			me.SoftwareImage_ProductCode: fixedOctets(metadata.ProductCode, 25),
-			me.SoftwareImage_ImageHash:   append([]byte(nil), hashValue...),
-		},
-	})
-	e.download = nil
-	if err != nil {
-		e.softwareState.Phase = "failed"
-		return me.ProcessingError
-	}
-	e.softwareState.Phase = "staged"
-	e.softwareState.Bytes = request.ImageSize
-	e.softwareState.ImageHash = hex.EncodeToString(hashValue)
-	return me.Success
+
+	download.phase = softwareFinalizing
+	download.end = end
+	copy(download.imageHash[:], download.md5.Sum(nil))
+	finished := make(chan softwareFinishResult, 1)
+	download.finish = finished
+	sink := download.sink
+	go func() {
+		metadata, err := sink.Finish()
+		finished <- softwareFinishResult{metadata: metadata, err: err}
+		close(finished)
+	}()
+	e.softwareState.Phase = "finalizing"
+	return me.DeviceBusy
 }
 
 func (e *Engine) activateSoftware(request *omci.ActivateSoftwareRequest) me.Results {
 	if e.software == nil {
 		return me.NotSupported
 	}
-	if e.download != nil {
+	if e.softwareDownloadBusy() {
 		return me.DeviceBusy
 	}
-	if request.EntityClass != me.SoftwareImageClassID || request.EntityInstance > 1 {
-		return me.ParameterError
+	if request.EntityClass != me.SoftwareImageClassID {
+		return me.UnknownEntity
+	}
+	if request.EntityInstance > 1 {
+		return me.UnknownInstance
 	}
 	image, result := e.softwareImage(request.EntityInstance)
 	if result != me.Success {
@@ -237,14 +306,13 @@ func (e *Engine) activateSoftware(request *omci.ActivateSoftwareRequest) me.Resu
 	if !image.valid {
 		return me.ParameterError
 	}
-	if image.active {
-		return me.Success
-	}
 	if err := e.software.Activate(request.EntityInstance, request.ActivateFlags); err != nil {
 		return me.ProcessingError
 	}
-	if err := e.setExclusiveSoftwareFlag(request.EntityInstance, me.SoftwareImage_IsActive); err != nil {
-		return me.ProcessingError
+	if !image.active {
+		if err := e.setExclusiveSoftwareFlag(request.EntityInstance, me.SoftwareImage_IsActive); err != nil {
+			return me.ProcessingError
+		}
 	}
 	e.softwareState.Phase = "activating"
 	e.softwareState.ImageID = request.EntityInstance
@@ -255,17 +323,20 @@ func (e *Engine) commitSoftware(request *omci.CommitSoftwareRequest) me.Results 
 	if e.software == nil {
 		return me.NotSupported
 	}
-	if e.download != nil {
+	if e.softwareDownloadBusy() {
 		return me.DeviceBusy
 	}
-	if request.EntityClass != me.SoftwareImageClassID || request.EntityInstance > 1 {
-		return me.ParameterError
+	if request.EntityClass != me.SoftwareImageClassID {
+		return me.UnknownEntity
+	}
+	if request.EntityInstance > 1 {
+		return me.UnknownInstance
 	}
 	image, result := e.softwareImage(request.EntityInstance)
 	if result != me.Success {
 		return result
 	}
-	if !image.valid || !image.active {
+	if !image.valid {
 		return me.ParameterError
 	}
 	if image.committed {
@@ -283,11 +354,88 @@ func (e *Engine) commitSoftware(request *omci.CommitSoftwareRequest) me.Results 
 }
 
 func (e *Engine) failSoftwareDownload() {
-	if e.download != nil {
+	if e.download != nil && e.download.phase == softwareReceiving {
 		_ = e.download.sink.Abort()
 	}
 	e.download = nil
 	e.softwareState.Phase = "failed"
+}
+
+func (e *Engine) softwareDownloadBusy() bool {
+	return e.download != nil &&
+		(e.download.phase == softwareReceiving || e.download.phase == softwareFinalizing)
+}
+
+func (e *Engine) softwareFinishStatus(download *softwareDownload) me.Results {
+	switch download.phase {
+	case softwareComplete:
+		return me.Success
+	case softwareFailed:
+		return me.ProcessingError
+	case softwareFinalizing:
+	default:
+		return me.ProcessingError
+	}
+
+	if download.finished == nil {
+		select {
+		case result := <-download.finish:
+			download.finished = &result
+		default:
+			return me.DeviceBusy
+		}
+	}
+	result := download.finished
+	if result.err != nil || len(result.metadata.Version) > 14 || len(result.metadata.ProductCode) > 25 {
+		download.phase = softwareFailed
+		e.softwareState.Phase = "failed"
+		return me.ProcessingError
+	}
+	if strings.TrimSpace(result.metadata.ProductCode) == "" {
+		result.metadata.ProductCode = "XG2010G"
+	}
+	if err := e.mib.UpdateByCommand(map[mib.Key]me.AttributeValueMap{
+		softwareKey(download.entityID): {
+			me.SoftwareImage_Version:     fixedOctets(result.metadata.Version, 14),
+			me.SoftwareImage_IsValid:     uint8(1),
+			me.SoftwareImage_ProductCode: fixedOctets(result.metadata.ProductCode, 25),
+			me.SoftwareImage_ImageHash:   append([]byte(nil), download.imageHash[:]...),
+		},
+	}); err != nil {
+		return me.ProcessingError
+	}
+	download.phase = softwareComplete
+	e.softwareState.Phase = "staged"
+	e.softwareState.Bytes = download.expectedSize
+	e.softwareState.ImageHash = hex.EncodeToString(download.imageHash[:])
+	return me.Success
+}
+
+func (e *Engine) rejectSoftwareWindow(download *softwareDownload, acknowledged bool,
+	result me.Results) me.Results {
+	download.window = nil
+	download.expectedSection = 0
+	if acknowledged {
+		download.windowFailed = false
+		return result
+	}
+	download.windowFailed = true
+	return me.Success
+}
+
+func (e *Engine) resetSoftwareWindow(download *softwareDownload) {
+	download.window = nil
+	download.windowFailed = false
+	download.expectedSection = 0
+}
+
+func zeroOctets(value []byte) bool {
+	for _, octet := range value {
+		if octet != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 type imageFlags struct {
@@ -323,14 +471,6 @@ func (e *Engine) setExclusiveSoftwareFlag(selected uint16, attribute string) err
 		}
 	}
 	return e.mib.UpdateByCommand(updates)
-}
-
-func softwareResults(instances []uint16, result me.Results) []omci.DownloadResults {
-	results := make([]omci.DownloadResults, len(instances))
-	for index, entityID := range instances {
-		results[index] = omci.DownloadResults{ManagedEntityID: entityID, Result: result}
-	}
-	return results
 }
 
 func softwareKey(entityID uint16) mib.Key {

@@ -61,13 +61,23 @@ OLT and internal thresholds, clear hysteresis, ARC suppression/cancellation and
 ARC-aware alarm audits are implemented; physical OLT verification remains.
 
 Software download now implements baseline and extended sections, negotiated
-windows, duplicate no-response section replay, G.988 CRC-32A, MD5 ImageHash,
-and persistent activate/commit through the software helper. Start, successful
-end, activate and commit update all affected software image MEs atomically and
-advance MIB data sync once per command when their state changes. The XG2010G
-backend stages an OpenWrt FIT in an inactive UBI volume and uses a boot guard to
-roll back an activated but uncommitted image. Physical OLT software download
-and deliberate power-loss testing remain required.
+maximum windows, shorter OLT-selected windows and complete-window retry without
+committing partial data. Baseline final padding must be zero, while extended
+sections may not overrun the declared image. Immediate duplicate no-response
+sections are suppressed. End download validates the G.988 CRC-32A and image
+size, returns `device busy` while non-volatile validation runs asynchronously,
+and accepts continued matching End requests until a stable result is available.
+The single-target response omits the optional parallel-download result list.
+
+Start download rejects active or committed targets. Activating the already
+active image still performs the required soft restart, and Commit accepts any
+valid target, including an inactive image selected for the next boot. Start,
+successful End, Activate and Commit update all affected software image MEs
+atomically and advance MIB data sync once per command when their state changes.
+The XG2010G backend stages an OpenWrt FIT in an inactive UBI volume and uses a
+boot guard to roll back an activated but uncommitted image or restartably select
+a committed inactive image at the next boot. Physical OLT software download and
+deliberate power-loss testing remain required.
 
 The Airoha Ethernet metadata ABI now exposes an atomic GEM/channel/direction
 table. Receive packets carry a reserved skb mark containing the GEM Port-ID;

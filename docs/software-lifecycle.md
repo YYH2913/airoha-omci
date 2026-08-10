@@ -27,6 +27,12 @@ Commit records the candidate as committed, clears the guard, and renames the
 old image into the inactive slot. The helper completes an interrupted cleanup
 the next time its state is read.
 
+G.988 also permits Commit on a valid inactive image. In that case the helper
+records the new committed slot without changing the running image. On the next
+boot, `omci_boot_guard` restartably renames the current and committed UBI
+volumes before `boot_production`, then records the newly active slot. Power loss
+at either rename boundary resumes from the volume names that are present.
+
 ## Storage prerequisite
 
 The stock layout lets `rootfs_data` consume every free UBI eraseblock. The
