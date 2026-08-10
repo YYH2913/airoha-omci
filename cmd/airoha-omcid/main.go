@@ -18,6 +18,7 @@ import (
 	"github.com/xg2010g/airoha-omci/internal/mib"
 	"github.com/xg2010g/airoha-omci/internal/model"
 	"github.com/xg2010g/airoha-omci/internal/platform"
+	"github.com/xg2010g/airoha-omci/internal/software"
 	"github.com/xg2010g/airoha-omci/internal/status"
 	"github.com/xg2010g/airoha-omci/internal/transport"
 )
@@ -25,13 +26,14 @@ import (
 var version = "devel"
 
 type options struct {
-	interfaceName string
-	serialNumber  string
-	equipmentID   string
-	statusPath    string
-	applyHelper   string
-	controlHelper string
-	eventHelper   string
+	interfaceName  string
+	serialNumber   string
+	equipmentID    string
+	statusPath     string
+	applyHelper    string
+	controlHelper  string
+	eventHelper    string
+	softwareHelper string
 }
 
 func main() {
@@ -43,6 +45,7 @@ func main() {
 	flag.StringVar(&opts.applyHelper, "apply-helper", "", "fixed executable receiving candidate MIB snapshots as JSON")
 	flag.StringVar(&opts.controlHelper, "control-helper", "", "fixed executable handling time sync and scheduled reboot")
 	flag.StringVar(&opts.eventHelper, "event-helper", "", "fixed executable streaming platform events as JSON lines")
+	flag.StringVar(&opts.softwareHelper, "software-helper", "", "fixed executable handling software image lifecycle")
 	flag.Parse()
 
 	if err := run(opts); err != nil {
@@ -74,7 +77,16 @@ func run(opts options) error {
 	if opts.controlHelper != "" {
 		controller = platform.ExecController{Path: opts.controlHelper}
 	}
-	protocol := engine.NewWithController(store, controller)
+	var softwareController software.Controller
+	softwareBackend := "disabled"
+	if opts.softwareHelper != "" {
+		softwareController = platform.ExecSoftwareController{Path: opts.softwareHelper}
+		softwareBackend = opts.softwareHelper
+	}
+	protocol := engine.NewWithControllers(store, controller, softwareController)
+	if err := protocol.RefreshSoftwareImages(); err != nil {
+		return fmt.Errorf("load software image state: %w", err)
+	}
 
 	conn, err := transport.OpenPacket(opts.interfaceName)
 	if err != nil {
@@ -93,7 +105,17 @@ func run(opts options) error {
 		MIBDataSync:     store.DataSync(),
 		MIBEntries:      len(store.Snapshot()),
 		PlatformBackend: platformBackend,
+		SoftwareBackend: softwareBackend,
 	}
+	updateSoftwareStatus := func() {
+		softwareState := protocol.SoftwareStatus()
+		state.SoftwarePhase = softwareState.Phase
+		state.SoftwareImageID = softwareState.ImageID
+		state.SoftwareBytes = softwareState.Bytes
+		state.SoftwareImageSize = softwareState.ImageSize
+		state.SoftwareImageHash = softwareState.ImageHash
+	}
+	updateSoftwareStatus()
 	statusWriter := status.NewWriter(opts.statusPath)
 	if err := statusWriter.Write(state); err != nil {
 		return err
@@ -179,6 +201,7 @@ func run(opts options) error {
 			}
 			state.MIBDataSync = store.DataSync()
 			state.MIBEntries = len(store.Snapshot())
+			updateSoftwareStatus()
 			state.LastError = ""
 			if err := statusWriter.Write(state); err != nil {
 				log.Printf("publish status: %v", err)
@@ -209,19 +232,23 @@ func run(opts options) error {
 				state.LastError = err.Error()
 				state.MIBDataSync = store.DataSync()
 				state.MIBEntries = len(store.Snapshot())
+				updateSoftwareStatus()
 				_ = statusWriter.Write(state)
 				log.Printf("OMCI request rejected: %v", err)
 				continue
 			}
-			if err := conn.WriteFrame(ctx, response); err != nil {
-				state.TransportErrors++
-				state.LastError = err.Error()
-				_ = statusWriter.Write(state)
-				return err
+			if len(response) != 0 {
+				if err := conn.WriteFrame(ctx, response); err != nil {
+					state.TransportErrors++
+					state.LastError = err.Error()
+					_ = statusWriter.Write(state)
+					return err
+				}
+				state.TXFrames++
 			}
-			state.TXFrames++
 			state.MIBDataSync = store.DataSync()
 			state.MIBEntries = len(store.Snapshot())
+			updateSoftwareStatus()
 			state.LastError = ""
 			if err := statusWriter.Write(state); err != nil {
 				log.Printf("publish status: %v", err)

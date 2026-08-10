@@ -15,6 +15,7 @@ import (
 	omci "github.com/opencord/omci-lib-go/v2"
 	me "github.com/opencord/omci-lib-go/v2/generated"
 	"github.com/xg2010g/airoha-omci/internal/mib"
+	"github.com/xg2010g/airoha-omci/internal/software"
 )
 
 const responseCacheSize = 64
@@ -51,6 +52,9 @@ type Engine struct {
 	alarmUpload   map[omci.DeviceIdent][]Alarm
 	alarmSequence uint8
 	controller    Controller
+	software      software.Controller
+	download      *softwareDownload
+	softwareState SoftwareStatus
 }
 
 func New(store *mib.Store) *Engine {
@@ -58,14 +62,20 @@ func New(store *mib.Store) *Engine {
 }
 
 func NewWithController(store *mib.Store, controller Controller) *Engine {
+	return NewWithControllers(store, controller, nil)
+}
+
+func NewWithControllers(store *mib.Store, controller Controller, softwareController software.Controller) *Engine {
 	return &Engine{
-		mib:         store,
-		cache:       make(map[[sha256.Size]byte][]byte),
-		upload:      make(map[omci.DeviceIdent][]uploadCommand),
-		tables:      make(map[tableKey][]byte),
-		alarms:      make(map[mib.Key][28]byte),
-		alarmUpload: make(map[omci.DeviceIdent][]Alarm),
-		controller:  controller,
+		mib:           store,
+		cache:         make(map[[sha256.Size]byte][]byte),
+		upload:        make(map[omci.DeviceIdent][]uploadCommand),
+		tables:        make(map[tableKey][]byte),
+		alarms:        make(map[mib.Key][28]byte),
+		alarmUpload:   make(map[omci.DeviceIdent][]Alarm),
+		controller:    controller,
+		software:      softwareController,
+		softwareState: SoftwareStatus{Phase: "idle"},
 	}
 }
 
@@ -120,7 +130,9 @@ func (e *Engine) Handle(frame []byte) ([]byte, error) {
 		e.remember(digest, response)
 		return append([]byte(nil), response...), nil
 	}
-	if byte(header.MessageType)&me.AK != 0 || byte(header.MessageType)&me.AR == 0 {
+	noResponseDownload := header.MessageType == omci.DownloadSectionRequestType
+	if byte(header.MessageType)&me.AK != 0 ||
+		(byte(header.MessageType)&me.AR == 0 && !noResponseDownload) {
 		return nil, fmt.Errorf("unexpected downstream message type %#x", byte(header.MessageType))
 	}
 
@@ -426,6 +438,85 @@ func (e *Engine) dispatch(packet gopacket.Packet, header *omci.OMCI) ([]byte, er
 			Attributes:               instance.Attributes,
 			FailedAttributeMask:      failed,
 			UnsupportedAttributeMask: unsupported,
+		})
+
+	case omci.StartSoftwareDownloadRequestType:
+		request, err := layerAs[*omci.StartSoftwareDownloadRequest](packet, omci.LayerTypeStartSoftwareDownloadRequest)
+		if err != nil {
+			return nil, err
+		}
+		result := e.startSoftwareDownload(request, header.DeviceIdentifier)
+		return serialize(header, omci.StartSoftwareDownloadResponseType, &omci.StartSoftwareDownloadResponse{
+			MeBasePacket: omci.MeBasePacket{
+				EntityClass: request.EntityClass, EntityInstance: request.EntityInstance,
+				Extended: extended,
+			},
+			Result: result, WindowSize: request.WindowSize,
+			NumberOfInstances: request.NumberOfCircuitPacks,
+			MeResults:         softwareResults(request.CircuitPacks, result),
+		})
+
+	case omci.DownloadSectionRequestType, omci.DownloadSectionRequestWithResponseType:
+		request, err := layerAs[*omci.DownloadSectionRequest](packet, omci.LayerTypeDownloadSectionRequest)
+		if err != nil {
+			return nil, err
+		}
+		result := e.downloadSoftwareSection(request, header.DeviceIdentifier)
+		if header.MessageType == omci.DownloadSectionRequestType {
+			if result != me.Success {
+				return nil, fmt.Errorf("download section %d rejected: %s", request.SectionNumber, result)
+			}
+			return nil, nil
+		}
+		return serialize(header, omci.DownloadSectionResponseType, &omci.DownloadSectionResponse{
+			MeBasePacket: omci.MeBasePacket{
+				EntityClass: request.EntityClass, EntityInstance: request.EntityInstance,
+				Extended: extended,
+			},
+			Result: result, SectionNumber: request.SectionNumber,
+		})
+
+	case omci.EndSoftwareDownloadRequestType:
+		request, err := layerAs[*omci.EndSoftwareDownloadRequest](packet, omci.LayerTypeEndSoftwareDownloadRequest)
+		if err != nil {
+			return nil, err
+		}
+		result := e.endSoftwareDownload(request, header.DeviceIdentifier)
+		return serialize(header, omci.EndSoftwareDownloadResponseType, &omci.EndSoftwareDownloadResponse{
+			MeBasePacket: omci.MeBasePacket{
+				EntityClass: request.EntityClass, EntityInstance: request.EntityInstance,
+				Extended: extended,
+			},
+			Result: result, NumberOfInstances: request.NumberOfInstances,
+			MeResults: softwareResults(request.ImageInstances, result),
+		})
+
+	case omci.ActivateSoftwareRequestType:
+		request, err := layerAs[*omci.ActivateSoftwareRequest](packet, omci.LayerTypeActivateSoftwareRequest)
+		if err != nil {
+			return nil, err
+		}
+		result := e.activateSoftware(request)
+		return serialize(header, omci.ActivateSoftwareResponseType, &omci.ActivateSoftwareResponse{
+			MeBasePacket: omci.MeBasePacket{
+				EntityClass: request.EntityClass, EntityInstance: request.EntityInstance,
+				Extended: extended,
+			},
+			Result: result,
+		})
+
+	case omci.CommitSoftwareRequestType:
+		request, err := layerAs[*omci.CommitSoftwareRequest](packet, omci.LayerTypeCommitSoftwareRequest)
+		if err != nil {
+			return nil, err
+		}
+		result := e.commitSoftware(request)
+		return serialize(header, omci.CommitSoftwareResponseType, &omci.CommitSoftwareResponse{
+			MeBasePacket: omci.MeBasePacket{
+				EntityClass: request.EntityClass, EntityInstance: request.EntityInstance,
+				Extended: extended,
+			},
+			Result: result,
 		})
 
 	case omci.SynchronizeTimeRequestType:

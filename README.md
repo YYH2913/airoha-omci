@@ -16,11 +16,27 @@ after the configured fixed-path helper accepts the complete candidate state.
 
 This repository is under active development. The raw OMCC transport,
 transactional MIB, baseline table transfer and core MIB audit operations are
-implemented. Driver-originated alarm/AVC events now have a validated upstream
-notification path. It is not yet ready for operator deployment because
-multi-GEM, complete alarm/ARC coverage, test execution, software lifecycle and
-real OLT interoperability are incomplete; see
+implemented. Driver-originated alarm/AVC events have a validated upstream
+notification path. Software download, CRC-32A and ImageHash validation,
+activation and commit are implemented through a fixed platform helper ABI.
+It is not yet ready for operator deployment because multi-GEM, complete
+alarm/ARC coverage, test execution and real OLT interoperability are
+incomplete; see
 [the implementation matrix](docs/implementation.md).
+
+## Platform boundary
+
+OMCI is required in addition to the xPON kernel data path. The daemon owns the
+G.988 protocol, ONU MIB and OLT-facing state machines. Platform helpers own
+only privileged Airoha and OpenWrt operations: GEM/T-CONT programming,
+Ethernet/VLAN application, alarms, reboot/time control and persistent software
+slots. This keeps proprietary SDK source out of the protocol repository while
+still allowing the required hardware ABI to be implemented independently.
+
+The helper contracts are documented in
+[the platform ABI](docs/platform-abi.md). XG2010G software-slot storage and
+power-loss recovery are described in
+[the software lifecycle](docs/software-lifecycle.md).
 
 ## Development
 

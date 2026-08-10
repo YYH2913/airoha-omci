@@ -18,6 +18,12 @@ type Snapshot struct {
 	MIBDataSync          uint8     `json:"mib_data_sync"`
 	MIBEntries           int       `json:"mib_entries"`
 	PlatformBackend      string    `json:"platform_backend"`
+	SoftwareBackend      string    `json:"software_backend"`
+	SoftwarePhase        string    `json:"software_phase"`
+	SoftwareImageID      uint16    `json:"software_image_id"`
+	SoftwareBytes        uint32    `json:"software_bytes"`
+	SoftwareImageSize    uint32    `json:"software_image_size"`
+	SoftwareImageHash    string    `json:"software_image_hash,omitempty"`
 	RXFrames             uint64    `json:"rx_frames"`
 	TXFrames             uint64    `json:"tx_frames"`
 	DecodeErrors         uint64    `json:"decode_errors"`

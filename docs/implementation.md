@@ -14,7 +14,7 @@ and extended messages.  A successful build or reaching GPON O5 is not enough.
 | Equipment | ONU-G, ONU2-G, ANI-G, four speed-specific Ethernet UNIs, software images | in progress |
 | Traffic | 8 T-CONTs/schedulers, 96 queues, GEM CTP/IW validation and hardware apply | in progress |
 | Ethernet service | bridge, mapper, VLAN and extended VLAN rules | pending |
-| Lifecycle | reboot, time sync, software download/activate/commit | in progress |
+| Lifecycle | reboot, time sync, software download/activate/commit | implemented; OLT verification pending |
 | Platform | multi-T-CONT/GEM Airoha ABI and transactional Linux backend | in progress |
 | OpenWrt | package, procd, UCI, rpcd/ubus and LuCI | in progress |
 | Verification | unit/fuzz/race/cross-build plus physical OLT traces | pending |
@@ -31,8 +31,16 @@ the four Ethernet carrier states into validated Alarm/AVC frames. Full optical
 threshold monitoring, alarm reporting control (ARC) suppression and execution
 of requested tests are still required.
 
+Software download now implements baseline and extended sections, negotiated
+windows, duplicate no-response section replay, G.988 CRC-32A, MD5 ImageHash,
+and persistent activate/commit through the software helper. The XG2010G
+backend stages an OpenWrt FIT in an inactive UBI volume and uses a boot guard
+to roll back an activated but uncommitted image. Physical OLT software
+download and deliberate power-loss testing remain required.
+
 The current Airoha Ethernet metadata ABI exposes only one data GEM to Linux.
 The OpenWrt backend records all OLT-provisioned GEM CTPs but selects one
 bidirectional GEM for the `pon` netdev and reports the limitation through
 ubus/LuCI. Multi-GEM representors, complete optical alarm/ARC behavior, test
-execution and software image download/activation remain completion blockers.
+execution and physical baseline/extended OLT interoperability remain
+completion blockers.

@@ -107,8 +107,8 @@ func XG2010G(identity Identity) ([]mib.Instance, error) {
 			me.CircuitPack_TotalTContBufferNumber:   uint8(defaultTContCount),
 			me.CircuitPack_TotalPriorityQueueNumber: uint8(defaultTContCount * 8),
 		}),
-		softwareImage(softwareImageAID, identity.Version, true),
-		softwareImage(softwareImageBID, "standby", false),
+		softwareImage(softwareImageAID, identity.Version, true, true),
+		softwareImage(softwareImageBID, "standby", false, false),
 	}
 
 	for index := 0; index < defaultTContCount; index++ {
@@ -175,17 +175,22 @@ func instance(classID me.ClassID, entityID uint16, attributes me.AttributeValueM
 	}
 }
 
-func softwareImage(entityID uint16, version string, active bool) mib.Instance {
+func softwareImage(entityID uint16, version string, active, valid bool) mib.Instance {
 	flag := uint8(0)
 	if active {
 		flag = 1
+	}
+	validFlag := uint8(0)
+	if valid {
+		validFlag = 1
 	}
 	return instance(me.SoftwareImageClassID, entityID, me.AttributeValueMap{
 		me.SoftwareImage_Version:     octets(version, 14),
 		me.SoftwareImage_IsCommitted: flag,
 		me.SoftwareImage_IsActive:    flag,
-		me.SoftwareImage_IsValid:     uint8(1),
+		me.SoftwareImage_IsValid:     validFlag,
 		me.SoftwareImage_ProductCode: octets("XG2010G", 25),
+		me.SoftwareImage_ImageHash:   make([]byte, 16),
 	})
 }
 
