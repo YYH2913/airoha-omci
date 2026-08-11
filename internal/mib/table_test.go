@@ -368,6 +368,290 @@ func TestSetTableMulticastAddressesRejectInvalidRowsAtomically(t *testing.T) {
 	}
 }
 
+func TestSetTableMulticastACLPartsReplaceDeleteClearAndSort(t *testing.T) {
+	store := newMulticastOperationsStore(t)
+	key := Key{ClassID: me.MulticastOperationsProfileClassID, EntityID: 0x700}
+	part0Key20 := multicastACLPart0(1, 0x20, 201, 100, 0x100, 0x1ff)
+	part1Key20 := multicastACLPart1(1, 0x20, 2)
+	part2Key20 := multicastACLPart2(1, 0x20, []byte{
+		0xff, 0x3e, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	})
+	// The test bit is accepted for capability probing but always reads back zero
+	// because this ONU supports all three ACL row parts.
+	control := binary.BigEndian.Uint16(part2Key20[:2]) | tableTestMask
+	binary.BigEndian.PutUint16(part2Key20[:2], control)
+	part0Key10 := multicastACLPart0(1, 0x10, 200, 100, 0xe1000000, 0xe10000ff)
+	setTable(t, store, key, 0x0200,
+		me.MulticastOperationsProfile_DynamicAccessControlListTable,
+		append(append(append(append([]byte(nil), part2Key20...), part1Key20...), part0Key20...), part0Key10...))
+
+	rows := getTable(t, store, key, 0x0200,
+		me.MulticastOperationsProfile_DynamicAccessControlListTable)
+	if rows.NumRows != 4 {
+		t.Fatalf("multicast ACL row count = %d, want 4", rows.NumRows)
+	}
+	wantControls := []uint16{0x0010, 0x0020, 0x0820, 0x1020}
+	for index, want := range wantControls {
+		if got := binary.BigEndian.Uint16(rows.Rows[index*multicastACLRowSize:]); got != want {
+			t.Fatalf("multicast ACL control[%d] = %#x, want %#x; rows=%x", index, got, want, rows.Rows)
+		}
+	}
+
+	reset := multicastACLPart1(1, 0x20, 255)
+	binary.BigEndian.PutUint16(reset[14:16], 90)
+	setTable(t, store, key, 0x0200,
+		me.MulticastOperationsProfile_DynamicAccessControlListTable, reset)
+	rows = getTable(t, store, key, 0x0200,
+		me.MulticastOperationsProfile_DynamicAccessControlListTable)
+	storedPart1 := rows.Rows[2*multicastACLRowSize : 3*multicastACLRowSize]
+	if binary.BigEndian.Uint16(storedPart1[14:16]) != 90 ||
+		binary.BigEndian.Uint16(storedPart1[20:22]) != 2 {
+		t.Fatalf("preview reset action was persisted instead of preserving policy: %x", storedPart1)
+	}
+
+	setTable(t, store, key, 0x0200,
+		me.MulticastOperationsProfile_DynamicAccessControlListTable,
+		multicastACLControlRow(2, 2, 0x20))
+	rows = getTable(t, store, key, 0x0200,
+		me.MulticastOperationsProfile_DynamicAccessControlListTable)
+	if rows.NumRows != 1 || binary.BigEndian.Uint16(rows.Rows[:2]) != 0x10 {
+		t.Fatalf("multicast ACL delete did not remove all row parts: %x", rows.Rows)
+	}
+
+	setTable(t, store, key, 0x0200,
+		me.MulticastOperationsProfile_DynamicAccessControlListTable,
+		multicastACLControlRow(3, 0, 0))
+	rows = getTable(t, store, key, 0x0200,
+		me.MulticastOperationsProfile_DynamicAccessControlListTable)
+	if rows.NumRows != 0 || len(rows.Rows) != 0 {
+		t.Fatalf("multicast ACL clear left rows: %x", rows.Rows)
+	}
+}
+
+func TestSetTableMulticastACLStaticTableUsesSameControlFormat(t *testing.T) {
+	store := newMulticastOperationsStore(t)
+	key := Key{ClassID: me.MulticastOperationsProfileClassID, EntityID: 0x700}
+	part0 := multicastACLPart0(1, 7, 200, 0xffff, 0xe8000000, 0xe80000ff)
+	part1 := multicastACLPart1(1, 7, 25)
+	setTable(t, store, key, 0x0100,
+		me.MulticastOperationsProfile_StaticAccessControlListTable,
+		append(part0, part1...))
+	rows := getTable(t, store, key, 0x0100,
+		me.MulticastOperationsProfile_StaticAccessControlListTable)
+	if rows.NumRows != 2 || binary.BigEndian.Uint16(rows.Rows[:2]) != 7 ||
+		binary.BigEndian.Uint16(rows.Rows[multicastACLRowSize:]) != 0x0807 {
+		t.Fatalf("stored static multicast ACL rows = %x", rows.Rows)
+	}
+}
+
+func TestSetTableMulticastACLRejectsInvalidRowsAtomically(t *testing.T) {
+	validPart0 := func() []byte {
+		return multicastACLPart0(1, 1, 200, 100, 0xe1000000, 0xe10000ff)
+	}
+	tests := []struct {
+		name string
+		rows []byte
+	}{
+		{name: "reserved set control", rows: multicastACLPart0(0, 1, 200, 100, 0xe1000000, 0xe10000ff)},
+		{name: "reserved row part", rows: multicastACLControlRow(1, 3, 1)},
+		{name: "GEM Port-ID", rows: multicastACLPart0(1, 1, 4096, 100, 0xe1000000, 0xe10000ff)},
+		{name: "reserved VLAN", rows: multicastACLPart0(1, 1, 200, 4096, 0xe1000000, 0xe10000ff)},
+		{name: "IPv4 unicast", rows: multicastACLPart0(1, 1, 200, 100, 0x0a000001, 0x0a000002)},
+		{name: "IPv4 reversed", rows: multicastACLPart0(1, 1, 200, 100, 0xe1000002, 0xe1000001)},
+		{name: "part 0 reserved", rows: func() []byte {
+			row := validPart0()
+			row[23] = 1
+			return row
+		}()},
+		{name: "preview reset", rows: multicastACLPart1(1, 1, 25)},
+		{name: "part 1 reserved", rows: func() []byte {
+			row := multicastACLPart1(1, 1, 2)
+			row[22] = 1
+			return row
+		}()},
+		{name: "IPv6 unicast", rows: func() []byte {
+			part2 := multicastACLPart2(1, 1, []byte{0x20, 1, 0xdb, 8, 0, 0, 0, 0, 0, 0, 0, 0})
+			return append(validPart0(), part2...)
+		}()},
+		{name: "part 2 reserved", rows: func() []byte {
+			row := multicastACLPart2(1, 1, []byte{0xff, 0x3e, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0})
+			row[14] = 1
+			return row
+		}()},
+		{name: "overlap", rows: append(
+			multicastACLPart0(1, 1, 200, 100, 0xe1000000, 0xe10000ff),
+			multicastACLPart0(1, 2, 201, 200, 0xe1000080, 0xe10001ff)...),
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := newMulticastOperationsStore(t)
+			err := store.SetTable(Key{ClassID: me.MulticastOperationsProfileClassID, EntityID: 0x700},
+				0x0200, me.AttributeValueMap{
+					me.MulticastOperationsProfile_DynamicAccessControlListTable: me.TableRows{
+						NumRows: len(test.rows) / multicastACLRowSize,
+						Rows:    test.rows,
+					},
+				})
+			var result *ResultError
+			if !errors.As(err, &result) || result.Result != me.ParameterError {
+				t.Fatalf("SetTable() error = %#v, want ParameterError", err)
+			}
+			if store.DataSync() != 1 {
+				t.Fatalf("DataSync() = %d after rejected ACL, want 1", store.DataSync())
+			}
+			rows := getTable(t, store,
+				Key{ClassID: me.MulticastOperationsProfileClassID, EntityID: 0x700},
+				0x0200, me.MulticastOperationsProfile_DynamicAccessControlListTable)
+			if rows.NumRows != 0 || len(rows.Rows) != 0 {
+				t.Fatalf("rejected ACL committed rows: %x", rows.Rows)
+			}
+		})
+	}
+}
+
+func TestSetTableMulticastServicePackageControlAndValidation(t *testing.T) {
+	store := newMulticastSubscriberStore(t)
+	key := Key{ClassID: me.MulticastSubscriberConfigInfoClassID, EntityID: 0x500}
+	row20 := multicastServiceRow(1, 20, 100, 32, 20_000_000, 0x702)
+	row10 := multicastServiceRow(1, 10, 4096, 16, 10_000_000, 0x701)
+	setTable(t, store, key, 0x0400,
+		me.MulticastSubscriberConfigInfo_MulticastServicePackageTable,
+		append(row20, row10...))
+	rows := getTable(t, store, key, 0x0400,
+		me.MulticastSubscriberConfigInfo_MulticastServicePackageTable)
+	if rows.NumRows != 2 || binary.BigEndian.Uint16(rows.Rows[:2]) != 10 ||
+		binary.BigEndian.Uint16(rows.Rows[multicastServiceRowSize:]) != 20 {
+		t.Fatalf("stored multicast service rows = %x", rows.Rows)
+	}
+
+	setTable(t, store, key, 0x0400,
+		me.MulticastSubscriberConfigInfo_MulticastServicePackageTable,
+		multicastServiceControlRow(2, 10))
+	rows = getTable(t, store, key, 0x0400,
+		me.MulticastSubscriberConfigInfo_MulticastServicePackageTable)
+	if rows.NumRows != 1 || binary.BigEndian.Uint16(rows.Rows[:2]) != 20 {
+		t.Fatalf("multicast service delete left rows = %x", rows.Rows)
+	}
+
+	setTable(t, store, key, 0x0400,
+		me.MulticastSubscriberConfigInfo_MulticastServicePackageTable,
+		multicastServiceControlRow(3, 0))
+	rows = getTable(t, store, key, 0x0400,
+		me.MulticastSubscriberConfigInfo_MulticastServicePackageTable)
+	if rows.NumRows != 0 {
+		t.Fatalf("multicast service clear left rows = %x", rows.Rows)
+	}
+}
+
+func TestSetTableAllowedPreviewNormalizesTimeLeftAndDeletesParts(t *testing.T) {
+	store := newMulticastSubscriberStore(t)
+	key := Key{ClassID: me.MulticastSubscriberConfigInfoClassID, EntityID: 0x500}
+	part0 := allowedPreviewPart0(1, 7, []byte{192, 0, 2, 1}, 100, 200)
+	part1 := allowedPreviewPart1(1, 7, []byte{239, 1, 2, 3}, 60, 999)
+	setTable(t, store, key, 0x0200,
+		me.MulticastSubscriberConfigInfo_AllowedPreviewGroupsTable,
+		append(part1, part0...))
+	rows := getTable(t, store, key, 0x0200,
+		me.MulticastSubscriberConfigInfo_AllowedPreviewGroupsTable)
+	if rows.NumRows != 2 || binary.BigEndian.Uint16(rows.Rows[:2]) != 7 ||
+		binary.BigEndian.Uint16(rows.Rows[multicastPreviewRowSize:]) != 1<<11|7 ||
+		binary.BigEndian.Uint16(rows.Rows[multicastPreviewRowSize+20:]) != 60 {
+		t.Fatalf("stored allowed-preview rows = %x", rows.Rows)
+	}
+
+	part1 = allowedPreviewPart1(1, 7, []byte{239, 1, 2, 3}, 90, 1)
+	setTable(t, store, key, 0x0200,
+		me.MulticastSubscriberConfigInfo_AllowedPreviewGroupsTable, part1)
+	rows = getTable(t, store, key, 0x0200,
+		me.MulticastSubscriberConfigInfo_AllowedPreviewGroupsTable)
+	if got := binary.BigEndian.Uint16(rows.Rows[multicastPreviewRowSize+20:]); got != 90 {
+		t.Fatalf("allowed-preview duration extension time left = %d, want 90", got)
+	}
+
+	setTable(t, store, key, 0x0200,
+		me.MulticastSubscriberConfigInfo_AllowedPreviewGroupsTable,
+		allowedPreviewControlRow(2, 1, 7))
+	rows = getTable(t, store, key, 0x0200,
+		me.MulticastSubscriberConfigInfo_AllowedPreviewGroupsTable)
+	if rows.NumRows != 0 {
+		t.Fatalf("allowed-preview delete did not remove both parts: %x", rows.Rows)
+	}
+}
+
+func TestSetTableMulticastSubscriberRejectsInvalidRowsAtomically(t *testing.T) {
+	serviceTests := []struct {
+		name string
+		row  []byte
+	}{
+		{name: "service control", row: multicastServiceRow(0, 1, 100, 1, 1, 0x700)},
+		{name: "service reserved control", row: func() []byte {
+			row := multicastServiceRow(1, 1, 100, 1, 1, 0x700)
+			binary.BigEndian.PutUint16(row[:2], binary.BigEndian.Uint16(row[:2])|1<<10)
+			return row
+		}()},
+		{name: "service VLAN", row: multicastServiceRow(1, 1, 4098, 1, 1, 0x700)},
+		{name: "service profile", row: multicastServiceRow(1, 1, 100, 1, 1, 0)},
+		{name: "service reserved", row: func() []byte {
+			row := multicastServiceRow(1, 1, 100, 1, 1, 0x700)
+			row[12] = 1
+			return row
+		}()},
+	}
+	for _, test := range serviceTests {
+		t.Run(test.name, func(t *testing.T) {
+			store := newMulticastSubscriberStore(t)
+			err := store.SetTable(Key{ClassID: me.MulticastSubscriberConfigInfoClassID, EntityID: 0x500},
+				0x0400, me.AttributeValueMap{
+					me.MulticastSubscriberConfigInfo_MulticastServicePackageTable: me.TableRows{
+						NumRows: 1, Rows: test.row,
+					},
+				})
+			assertRejectedEmptyTable(t, store, err, 0x0400,
+				me.MulticastSubscriberConfigInfo_MulticastServicePackageTable)
+		})
+	}
+
+	previewTests := []struct {
+		name string
+		row  []byte
+	}{
+		{name: "preview control", row: allowedPreviewPart0(0, 1, []byte{192, 0, 2, 1}, 1, 1)},
+		{name: "preview part", row: allowedPreviewControlRow(1, 2, 1)},
+		{name: "preview VLAN", row: allowedPreviewPart0(1, 1, []byte{192, 0, 2, 1}, 4096, 1)},
+		{name: "preview destination", row: allowedPreviewPart1(1, 1, []byte{192, 0, 2, 1}, 1, 1)},
+	}
+	for _, test := range previewTests {
+		t.Run(test.name, func(t *testing.T) {
+			store := newMulticastSubscriberStore(t)
+			err := store.SetTable(Key{ClassID: me.MulticastSubscriberConfigInfoClassID, EntityID: 0x500},
+				0x0200, me.AttributeValueMap{
+					me.MulticastSubscriberConfigInfo_AllowedPreviewGroupsTable: me.TableRows{
+						NumRows: 1, Rows: test.row,
+					},
+				})
+			assertRejectedEmptyTable(t, store, err, 0x0200,
+				me.MulticastSubscriberConfigInfo_AllowedPreviewGroupsTable)
+		})
+	}
+}
+
+func assertRejectedEmptyTable(t *testing.T, store *Store, err error, mask uint16, name string) {
+	t.Helper()
+	var result *ResultError
+	if !errors.As(err, &result) || result.Result != me.ParameterError {
+		t.Fatalf("SetTable() error = %#v, want ParameterError", err)
+	}
+	if store.DataSync() != 1 {
+		t.Fatalf("DataSync() = %d after rejected row, want 1", store.DataSync())
+	}
+	rows := getTable(t, store,
+		Key{ClassID: me.MulticastSubscriberConfigInfoClassID, EntityID: 0x500}, mask, name)
+	if rows.NumRows != 0 || len(rows.Rows) != 0 {
+		t.Fatalf("rejected table committed rows: %x", rows.Rows)
+	}
+}
+
 func newMulticastTableStore(t *testing.T) *Store {
 	t.Helper()
 	store, err := New([]Instance{{
@@ -387,6 +671,43 @@ func newMulticastTableStore(t *testing.T) *Store {
 			me.MulticastGemInterworkingTerminationPoint_NotUsed2:                             uint8(0),
 		}); err != nil {
 		t.Fatalf("Create(multicast GEM IW) error = %v", err)
+	}
+	return store
+}
+
+func newMulticastOperationsStore(t *testing.T) *Store {
+	t.Helper()
+	store, err := New([]Instance{{
+		Key:        Key{ClassID: me.OnuDataClassID, EntityID: 0},
+		Attributes: me.AttributeValueMap{me.OnuData_MibDataSync: uint8(0)},
+	}})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	if err := store.Create(me.MulticastOperationsProfileClassID, 0x700, me.AttributeValueMap{
+		me.MulticastOperationsProfile_IgmpVersion:    uint8(3),
+		me.MulticastOperationsProfile_IgmpFunction:   uint8(0),
+		me.MulticastOperationsProfile_ImmediateLeave: uint8(0),
+	}); err != nil {
+		t.Fatalf("Create(multicast operations profile) error = %v", err)
+	}
+	return store
+}
+
+func newMulticastSubscriberStore(t *testing.T) *Store {
+	t.Helper()
+	store, err := New([]Instance{{
+		Key:        Key{ClassID: me.OnuDataClassID, EntityID: 0},
+		Attributes: me.AttributeValueMap{me.OnuData_MibDataSync: uint8(0)},
+	}})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	if err := store.Create(me.MulticastSubscriberConfigInfoClassID, 0x500, me.AttributeValueMap{
+		me.MulticastSubscriberConfigInfo_MeType:                            uint8(0),
+		me.MulticastSubscriberConfigInfo_MulticastOperationsProfilePointer: uint16(0x700),
+	}); err != nil {
+		t.Fatalf("Create(multicast subscriber) error = %v", err)
 	}
 	return store
 }
@@ -485,6 +806,71 @@ func multicastIPv6Row(gem, secondary uint16, start, stop uint32) []byte {
 	binary.BigEndian.PutUint32(row[4:8], start)
 	binary.BigEndian.PutUint32(row[8:12], stop)
 	row[12] = 0xff
+	return row
+}
+
+func multicastACLControlRow(setControl, part uint16, key uint16) []byte {
+	row := make([]byte, multicastACLRowSize)
+	binary.BigEndian.PutUint16(row[:2], setControl<<14|part<<11|key)
+	return row
+}
+
+func multicastACLPart0(setControl, key, gem, vlan uint16, start, stop uint32) []byte {
+	row := multicastACLControlRow(setControl, 0, key)
+	binary.BigEndian.PutUint16(row[2:4], gem)
+	binary.BigEndian.PutUint16(row[4:6], vlan)
+	binary.BigEndian.PutUint32(row[10:14], start)
+	binary.BigEndian.PutUint32(row[14:18], stop)
+	binary.BigEndian.PutUint32(row[18:22], 1_000_000)
+	return row
+}
+
+func multicastACLPart1(setControl, key, reset uint16) []byte {
+	row := multicastACLControlRow(setControl, 1, key)
+	binary.BigEndian.PutUint16(row[20:22], reset)
+	return row
+}
+
+func multicastACLPart2(setControl, key uint16, prefix []byte) []byte {
+	row := multicastACLControlRow(setControl, 2, key)
+	copy(row[2:14], prefix)
+	return row
+}
+
+func multicastServiceControlRow(setControl, key uint16) []byte {
+	row := make([]byte, multicastServiceRowSize)
+	binary.BigEndian.PutUint16(row[:2], setControl<<14|key)
+	return row
+}
+
+func multicastServiceRow(setControl, key, vlan, groups uint16, bandwidth uint32, profile uint16) []byte {
+	row := multicastServiceControlRow(setControl, key)
+	binary.BigEndian.PutUint16(row[2:4], vlan)
+	binary.BigEndian.PutUint16(row[4:6], groups)
+	binary.BigEndian.PutUint32(row[6:10], bandwidth)
+	binary.BigEndian.PutUint16(row[10:12], profile)
+	return row
+}
+
+func allowedPreviewControlRow(setControl, part, key uint16) []byte {
+	row := make([]byte, multicastPreviewRowSize)
+	binary.BigEndian.PutUint16(row[:2], setControl<<14|part<<11|key)
+	return row
+}
+
+func allowedPreviewPart0(setControl, key uint16, source []byte, aniVLAN, uniVLAN uint16) []byte {
+	row := allowedPreviewControlRow(setControl, 0, key)
+	copy(row[18-len(source):18], source)
+	binary.BigEndian.PutUint16(row[18:20], aniVLAN)
+	binary.BigEndian.PutUint16(row[20:22], uniVLAN)
+	return row
+}
+
+func allowedPreviewPart1(setControl, key uint16, destination []byte, duration, timeLeft uint16) []byte {
+	row := allowedPreviewControlRow(setControl, 1, key)
+	copy(row[18-len(destination):18], destination)
+	binary.BigEndian.PutUint16(row[18:20], duration)
+	binary.BigEndian.PutUint16(row[20:22], timeLeft)
 	return row
 }
 

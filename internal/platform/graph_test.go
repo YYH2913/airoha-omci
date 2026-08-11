@@ -158,6 +158,43 @@ func TestBuildServiceGraphResolvesMulticastGEMAndSubscriber(t *testing.T) {
 	binary.BigEndian.PutUint32(ipv6[8:12], 0x1ff)
 	ipv6[12] = 0xff
 	ipv6[13] = 0x3e
+	dynamicACL := make([]byte, 3*24)
+	binary.BigEndian.PutUint16(dynamicACL[0:2], 9)
+	binary.BigEndian.PutUint16(dynamicACL[2:4], 203)
+	binary.BigEndian.PutUint16(dynamicACL[4:6], 100)
+	binary.BigEndian.PutUint32(dynamicACL[6:10], 1)
+	binary.BigEndian.PutUint32(dynamicACL[10:14], 0x100)
+	binary.BigEndian.PutUint32(dynamicACL[14:18], 0x1ff)
+	binary.BigEndian.PutUint32(dynamicACL[18:22], 2_000_000)
+	binary.BigEndian.PutUint16(dynamicACL[24:26], 1<<11|9)
+	copy(dynamicACL[26:38], []byte{0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0})
+	binary.BigEndian.PutUint16(dynamicACL[38:40], 60)
+	binary.BigEndian.PutUint16(dynamicACL[40:42], 3600)
+	binary.BigEndian.PutUint16(dynamicACL[42:44], 2)
+	binary.BigEndian.PutUint16(dynamicACL[44:46], 3)
+	binary.BigEndian.PutUint16(dynamicACL[48:50], 2<<11|9)
+	copy(dynamicACL[50:62], []byte{0xff, 0x3e, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0})
+	staticACL := make([]byte, 24)
+	binary.BigEndian.PutUint16(staticACL[0:2], 10)
+	binary.BigEndian.PutUint16(staticACL[2:4], 202)
+	binary.BigEndian.PutUint16(staticACL[4:6], 0xffff)
+	binary.BigEndian.PutUint32(staticACL[10:14], 0xe2000000)
+	binary.BigEndian.PutUint32(staticACL[14:18], 0xe20000ff)
+	servicePackage := make([]byte, 20)
+	binary.BigEndian.PutUint16(servicePackage[0:2], 5)
+	binary.BigEndian.PutUint16(servicePackage[2:4], 4096)
+	binary.BigEndian.PutUint16(servicePackage[4:6], 8)
+	binary.BigEndian.PutUint32(servicePackage[6:10], 8_000_000)
+	binary.BigEndian.PutUint16(servicePackage[10:12], multicastProfile)
+	allowedPreview := make([]byte, 44)
+	binary.BigEndian.PutUint16(allowedPreview[0:2], 6)
+	copy(allowedPreview[14:18], []byte{192, 0, 2, 10})
+	binary.BigEndian.PutUint16(allowedPreview[18:20], 100)
+	binary.BigEndian.PutUint16(allowedPreview[20:22], 200)
+	binary.BigEndian.PutUint16(allowedPreview[22:24], 1<<11|6)
+	copy(allowedPreview[36:40], []byte{239, 1, 2, 3})
+	binary.BigEndian.PutUint16(allowedPreview[40:42], 30)
+	binary.BigEndian.PutUint16(allowedPreview[42:44], 25)
 	snapshot = append(snapshot,
 		mib.Instance{
 			Key: mib.Key{ClassID: me.MulticastGemInterworkingTerminationPointClassID,
@@ -181,14 +218,18 @@ func TestBuildServiceGraphResolvesMulticastGEMAndSubscriber(t *testing.T) {
 		mib.Instance{
 			Key: mib.Key{ClassID: me.MulticastOperationsProfileClassID, EntityID: multicastProfile},
 			Attributes: me.AttributeValueMap{
-				me.MulticastOperationsProfile_IgmpVersion:                      uint8(3),
-				me.MulticastOperationsProfile_IgmpFunction:                     uint8(0),
-				me.MulticastOperationsProfile_ImmediateLeave:                   uint8(1),
-				me.MulticastOperationsProfile_UpstreamIgmpTci:                  uint16(0),
-				me.MulticastOperationsProfile_UpstreamIgmpTagControl:           uint8(0),
-				me.MulticastOperationsProfile_UpstreamIgmpRate:                 uint32(0),
-				me.MulticastOperationsProfile_DynamicAccessControlListTable:    me.TableRows{},
-				me.MulticastOperationsProfile_StaticAccessControlListTable:     me.TableRows{},
+				me.MulticastOperationsProfile_IgmpVersion:            uint8(3),
+				me.MulticastOperationsProfile_IgmpFunction:           uint8(0),
+				me.MulticastOperationsProfile_ImmediateLeave:         uint8(1),
+				me.MulticastOperationsProfile_UpstreamIgmpTci:        uint16(0),
+				me.MulticastOperationsProfile_UpstreamIgmpTagControl: uint8(0),
+				me.MulticastOperationsProfile_UpstreamIgmpRate:       uint32(0),
+				me.MulticastOperationsProfile_DynamicAccessControlListTable: me.TableRows{
+					NumRows: 3, Rows: dynamicACL,
+				},
+				me.MulticastOperationsProfile_StaticAccessControlListTable: me.TableRows{
+					NumRows: 1, Rows: staticACL,
+				},
 				me.MulticastOperationsProfile_DownstreamIgmpAndMulticastTci:    []byte{0, 0, 0},
 				me.MulticastOperationsProfile_UnauthorizedJoinRequestBehaviour: uint8(0),
 			},
@@ -201,8 +242,12 @@ func TestBuildServiceGraphResolvesMulticastGEMAndSubscriber(t *testing.T) {
 				me.MulticastSubscriberConfigInfo_MaxSimultaneousGroups:             uint16(64),
 				me.MulticastSubscriberConfigInfo_MaxMulticastBandwidth:             uint32(0),
 				me.MulticastSubscriberConfigInfo_BandwidthEnforcement:              uint8(0),
-				me.MulticastSubscriberConfigInfo_MulticastServicePackageTable:      me.TableRows{},
-				me.MulticastSubscriberConfigInfo_AllowedPreviewGroupsTable:         me.TableRows{},
+				me.MulticastSubscriberConfigInfo_MulticastServicePackageTable: me.TableRows{
+					NumRows: 1, Rows: servicePackage,
+				},
+				me.MulticastSubscriberConfigInfo_AllowedPreviewGroupsTable: me.TableRows{
+					NumRows: 2, Rows: allowedPreview,
+				},
 			},
 		},
 	)
@@ -223,10 +268,25 @@ func TestBuildServiceGraphResolvesMulticastGEMAndSubscriber(t *testing.T) {
 		iw.IPv6Ranges[0].Start != "ff3e::100" || iw.IPv6Ranges[0].Stop != "ff3e::1ff" {
 		t.Fatalf("multicast GEM IW = %#v", iw)
 	}
-	if graph.MulticastProfiles[0].IGMPVersion != 3 ||
-		graph.MulticastProfiles[0].ImmediateLeave != 1 ||
+	profile := graph.MulticastProfiles[0]
+	if profile.IGMPVersion != 3 || profile.ImmediateLeave != 1 ||
+		len(profile.DynamicACL) != 1 || len(profile.StaticACL) != 1 ||
+		profile.DynamicACL[0].RowKey != 9 || profile.DynamicACL[0].IPVersion != 6 ||
+		profile.DynamicACL[0].GEMPortID != 203 || profile.DynamicACL[0].Source != "2001:db8::1" ||
+		profile.DynamicACL[0].Start != "ff3e::100" || profile.DynamicACL[0].Stop != "ff3e::1ff" ||
+		profile.DynamicACL[0].ImputedBandwidth != 2_000_000 ||
+		profile.DynamicACL[0].PreviewLength != 60 || profile.DynamicACL[0].PreviewResetTime != 3 ||
+		profile.StaticACL[0].IPVersion != 4 || profile.StaticACL[0].Start != "226.0.0.0" ||
+		profile.StaticACL[0].Stop != "226.0.0.255" ||
 		graph.MulticastSubscribers[0].EntityID != uniBridgePort ||
-		graph.MulticastSubscribers[0].MaxSimultaneousGroups != 64 {
+		graph.MulticastSubscribers[0].MaxSimultaneousGroups != 64 ||
+		len(graph.MulticastSubscribers[0].ServicePackages) != 1 ||
+		graph.MulticastSubscribers[0].ServicePackages[0].RowKey != 5 ||
+		graph.MulticastSubscribers[0].ServicePackages[0].OperationsProfile != multicastProfile ||
+		len(graph.MulticastSubscribers[0].AllowedPreviewGroups) != 1 ||
+		graph.MulticastSubscribers[0].AllowedPreviewGroups[0].Source != "192.0.2.10" ||
+		graph.MulticastSubscribers[0].AllowedPreviewGroups[0].Destination != "239.1.2.3" ||
+		graph.MulticastSubscribers[0].AllowedPreviewGroups[0].TimeLeft != 25 {
 		t.Fatalf("multicast policy = %#v/%#v", graph.MulticastProfiles, graph.MulticastSubscribers)
 	}
 }

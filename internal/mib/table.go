@@ -19,6 +19,14 @@ const (
 	enhancedExtendedVLANRowSize = 28
 	multicastIPv4RowSize        = 12
 	multicastIPv6RowSize        = 24
+	multicastACLRowSize         = 24
+	multicastServiceRowSize     = 20
+	multicastPreviewRowSize     = 22
+
+	tableSetControlMask = uint16(0xc000)
+	tableRowPartMask    = uint16(0x3800)
+	tableTestMask       = uint16(0x0400)
+	tableRowKeyMask     = uint16(0x03ff)
 )
 
 var extendedVLANDefaultRows = []byte{
@@ -122,8 +130,13 @@ func (s *Store) SetTable(key Key, mask uint16, attributes me.AttributeValueMap) 
 }
 
 func (s *Store) applyTableRows(classID me.ClassID, name string, existing, updates me.TableRows) (me.TableRows, error) {
-	if classID == me.MulticastGemInterworkingTerminationPointClassID {
+	switch classID {
+	case me.MulticastGemInterworkingTerminationPointClassID:
 		return applyMulticastAddressRows(name, existing, updates)
+	case me.MulticastOperationsProfileClassID:
+		return applyMulticastACLRows(name, existing, updates)
+	case me.MulticastSubscriberConfigInfoClassID:
+		return applyMulticastSubscriberRows(name, existing, updates)
 	}
 	if classID != me.ExtendedVlanTaggingOperationConfigurationDataClassID {
 		return me.TableRows{}, &ResultError{Result: me.NotSupported,
@@ -206,6 +219,424 @@ func applyMulticastAddressRows(name string, existing, updates me.TableRows) (me.
 	rows := applyKeyedRows(existing.Rows, updates.Rows, rowSize, 4,
 		func(row []byte) bool { return allBytes(row[4:], 0) })
 	return me.TableRows{NumRows: len(rows) / rowSize, Rows: rows}, nil
+}
+
+type multicastACLRowKey struct {
+	key  uint16
+	part uint8
+}
+
+type multicastACLRange struct {
+	key   uint16
+	ipv6  bool
+	start [16]byte
+	stop  [16]byte
+}
+
+func applyMulticastACLRows(name string, existing, updates me.TableRows) (me.TableRows, error) {
+	isStatic := false
+	switch name {
+	case me.MulticastOperationsProfile_DynamicAccessControlListTable:
+	case me.MulticastOperationsProfile_StaticAccessControlListTable:
+		isStatic = true
+	default:
+		return me.TableRows{}, &ResultError{Result: me.NotSupported,
+			Cause: fmt.Errorf("SetTable policy for class %#x attribute %s is not implemented",
+				me.MulticastOperationsProfileClassID, name)}
+	}
+
+	rows := make(map[multicastACLRowKey][]byte,
+		len(existing.Rows)/multicastACLRowSize+len(updates.Rows)/multicastACLRowSize)
+	for offset := 0; offset < len(existing.Rows); offset += multicastACLRowSize {
+		row := append([]byte(nil), existing.Rows[offset:offset+multicastACLRowSize]...)
+		control := binary.BigEndian.Uint16(row[:2])
+		part := uint8((control & tableRowPartMask) >> 11)
+		if control&(tableSetControlMask|tableTestMask) != 0 || part > 2 {
+			return me.TableRows{}, &ResultError{Result: me.ProcessingError,
+				Cause: fmt.Errorf("committed multicast ACL table contains invalid control %#x", control)}
+		}
+		key := control & tableRowKeyMask
+		if err := validateMulticastACLPart(key, part, row, isStatic); err != nil {
+			return me.TableRows{}, &ResultError{Result: me.ProcessingError, Cause: err}
+		}
+		rows[multicastACLRowKey{key: key, part: part}] = row
+	}
+
+	for offset := 0; offset < len(updates.Rows); offset += multicastACLRowSize {
+		row := updates.Rows[offset : offset+multicastACLRowSize]
+		control := binary.BigEndian.Uint16(row[:2])
+		setControl := (control & tableSetControlMask) >> 14
+		key := control & tableRowKeyMask
+		part := uint8((control & tableRowPartMask) >> 11)
+		switch setControl {
+		case 1:
+			if part > 2 {
+				return me.TableRows{}, multicastACLParameterError(key,
+					fmt.Sprintf("uses reserved row part %d", part))
+			}
+			stored := append([]byte(nil), row...)
+			binary.BigEndian.PutUint16(stored[:2], uint16(part)<<11|key)
+			if err := validateMulticastACLPart(key, part, stored, isStatic); err != nil {
+				return me.TableRows{}, err
+			}
+			rowKey := multicastACLRowKey{key: key, part: part}
+			if !isStatic && part == 1 && binary.BigEndian.Uint16(stored[20:22]) == 255 {
+				reset := uint16(0)
+				if previous := rows[rowKey]; previous != nil {
+					reset = binary.BigEndian.Uint16(previous[20:22])
+				}
+				binary.BigEndian.PutUint16(stored[20:22], reset)
+			}
+			rows[rowKey] = stored
+		case 2:
+			for candidate := range rows {
+				if candidate.key == key {
+					delete(rows, candidate)
+				}
+			}
+		case 3:
+			clear(rows)
+		default:
+			return me.TableRows{}, multicastACLParameterError(key, "uses reserved set control")
+		}
+	}
+
+	if err := validateMulticastACLRows(rows); err != nil {
+		return me.TableRows{}, err
+	}
+	keys := make([]multicastACLRowKey, 0, len(rows))
+	for key := range rows {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].key != keys[j].key {
+			return keys[i].key < keys[j].key
+		}
+		return keys[i].part < keys[j].part
+	})
+	result := make([]byte, 0, len(rows)*multicastACLRowSize)
+	for _, key := range keys {
+		result = append(result, rows[key]...)
+	}
+	return me.TableRows{NumRows: len(rows), Rows: result}, nil
+}
+
+func validateMulticastACLPart(key uint16, part uint8, row []byte, isStatic bool) error {
+	switch part {
+	case 0:
+		gemPortID := binary.BigEndian.Uint16(row[2:4])
+		if gemPortID > 0x0fff {
+			return multicastACLParameterError(key,
+				fmt.Sprintf("has out-of-range GEM Port-ID %d", gemPortID))
+		}
+		vlanID := binary.BigEndian.Uint16(row[4:6])
+		if vlanID == 4096 || vlanID > 4097 && vlanID != 0xffff {
+			return multicastACLParameterError(key, fmt.Sprintf("has invalid ANI VLAN ID %d", vlanID))
+		}
+		if !allBytes(row[22:24], 0) {
+			return multicastACLParameterError(key, "has non-zero reserved bytes in row part 0")
+		}
+	case 1:
+		if !isStatic {
+			reset := binary.BigEndian.Uint16(row[20:22])
+			if reset > 24 && reset < 241 {
+				return multicastACLParameterError(key,
+					fmt.Sprintf("has reserved preview reset time %d", reset))
+			}
+		}
+		if !allBytes(row[22:24], 0) {
+			return multicastACLParameterError(key, "has non-zero reserved bytes in row part 1")
+		}
+	case 2:
+		if !allBytes(row[14:24], 0) {
+			return multicastACLParameterError(key, "has non-zero reserved bytes in row part 2")
+		}
+	}
+	return nil
+}
+
+func validateMulticastACLRows(rows map[multicastACLRowKey][]byte) error {
+	ranges := make([]multicastACLRange, 0, len(rows))
+	for rowKey, part0 := range rows {
+		if rowKey.part != 0 {
+			continue
+		}
+		part2 := rows[multicastACLRowKey{key: rowKey.key, part: 2}]
+		value, err := multicastACLAddressRange(rowKey.key, part0, part2)
+		if err != nil {
+			return err
+		}
+		for _, previous := range ranges {
+			if previous.ipv6 != value.ipv6 || bytes.Compare(previous.stop[:], value.start[:]) < 0 ||
+				bytes.Compare(value.stop[:], previous.start[:]) < 0 {
+				continue
+			}
+			return multicastACLParameterError(rowKey.key,
+				fmt.Sprintf("destination range overlaps row key %d", previous.key))
+		}
+		ranges = append(ranges, value)
+	}
+	return nil
+}
+
+func multicastACLAddressRange(key uint16, part0, part2 []byte) (multicastACLRange, error) {
+	result := multicastACLRange{key: key}
+	if part2 == nil || ipv4CompatiblePrefix(part2[2:14]) {
+		copy(result.start[12:], part0[10:14])
+		copy(result.stop[12:], part0[14:18])
+		if result.start[12]>>4 != 0xe || result.stop[12]>>4 != 0xe ||
+			bytes.Compare(result.start[:], result.stop[:]) > 0 {
+			return multicastACLRange{}, multicastACLParameterError(key,
+				fmt.Sprintf("has invalid IPv4 multicast range %x..%x", part0[10:14], part0[14:18]))
+		}
+		return result, nil
+	}
+
+	result.ipv6 = true
+	copy(result.start[:12], part2[2:14])
+	copy(result.stop[:12], part2[2:14])
+	copy(result.start[12:], part0[10:14])
+	copy(result.stop[12:], part0[14:18])
+	if result.start[0] != 0xff || bytes.Compare(result.start[:], result.stop[:]) > 0 {
+		return multicastACLRange{}, multicastACLParameterError(key,
+			fmt.Sprintf("has invalid IPv6 multicast range %x..%x", result.start, result.stop))
+	}
+	return result, nil
+}
+
+func ipv4CompatiblePrefix(prefix []byte) bool {
+	return allBytes(prefix[:10], 0) &&
+		((prefix[10] == 0 && prefix[11] == 0) || (prefix[10] == 0xff && prefix[11] == 0xff))
+}
+
+func multicastACLParameterError(key uint16, detail string) error {
+	return &ResultError{Result: me.ParameterError,
+		Cause: fmt.Errorf("multicast ACL row key %d %s", key, detail)}
+}
+
+func applyMulticastSubscriberRows(name string, existing, updates me.TableRows) (me.TableRows, error) {
+	switch name {
+	case me.MulticastSubscriberConfigInfo_MulticastServicePackageTable:
+		return applyMulticastServiceRows(existing.Rows, updates.Rows)
+	case me.MulticastSubscriberConfigInfo_AllowedPreviewGroupsTable:
+		return applyAllowedPreviewRows(existing.Rows, updates.Rows)
+	default:
+		return me.TableRows{}, &ResultError{Result: me.NotSupported,
+			Cause: fmt.Errorf("SetTable policy for class %#x attribute %s is not implemented",
+				me.MulticastSubscriberConfigInfoClassID, name)}
+	}
+}
+
+func applyMulticastServiceRows(existing, updates []byte) (me.TableRows, error) {
+	rows := make(map[uint16][]byte, len(existing)/multicastServiceRowSize+len(updates)/multicastServiceRowSize)
+	for offset := 0; offset < len(existing); offset += multicastServiceRowSize {
+		row := append([]byte(nil), existing[offset:offset+multicastServiceRowSize]...)
+		control := binary.BigEndian.Uint16(row[:2])
+		if control&^tableRowKeyMask != 0 {
+			return me.TableRows{}, &ResultError{Result: me.ProcessingError,
+				Cause: fmt.Errorf("committed multicast service table contains invalid control %#x", control)}
+		}
+		key := control & tableRowKeyMask
+		if err := validateMulticastServiceRow(key, row); err != nil {
+			return me.TableRows{}, &ResultError{Result: me.ProcessingError, Cause: err}
+		}
+		rows[key] = row
+	}
+	for offset := 0; offset < len(updates); offset += multicastServiceRowSize {
+		row := updates[offset : offset+multicastServiceRowSize]
+		control := binary.BigEndian.Uint16(row[:2])
+		setControl := (control & tableSetControlMask) >> 14
+		key := control & tableRowKeyMask
+		switch setControl {
+		case 1:
+			if control&0x3c00 != 0 {
+				return me.TableRows{}, multicastSubscriberParameterError(key,
+					"service row has non-zero reserved control bits")
+			}
+			stored := append([]byte(nil), row...)
+			binary.BigEndian.PutUint16(stored[:2], key)
+			if err := validateMulticastServiceRow(key, stored); err != nil {
+				return me.TableRows{}, err
+			}
+			rows[key] = stored
+		case 2:
+			delete(rows, key)
+		case 3:
+			clear(rows)
+		default:
+			return me.TableRows{}, multicastSubscriberParameterError(key,
+				"service row uses reserved set control")
+		}
+	}
+	keys := make([]int, 0, len(rows))
+	for key := range rows {
+		keys = append(keys, int(key))
+	}
+	sort.Ints(keys)
+	result := make([]byte, 0, len(rows)*multicastServiceRowSize)
+	for _, key := range keys {
+		result = append(result, rows[uint16(key)]...)
+	}
+	return me.TableRows{NumRows: len(rows), Rows: result}, nil
+}
+
+func validateMulticastServiceRow(key uint16, row []byte) error {
+	vlanID := binary.BigEndian.Uint16(row[2:4])
+	if vlanID > 4097 && vlanID != 0xffff {
+		return multicastSubscriberParameterError(key,
+			fmt.Sprintf("service row has invalid UNI VLAN ID %d", vlanID))
+	}
+	profile := binary.BigEndian.Uint16(row[10:12])
+	if profile == 0 || profile == 0xffff {
+		return multicastSubscriberParameterError(key,
+			fmt.Sprintf("service row has reserved operations profile pointer %#x", profile))
+	}
+	if !allBytes(row[12:20], 0) {
+		return multicastSubscriberParameterError(key, "service row has non-zero reserved bytes")
+	}
+	return nil
+}
+
+func applyAllowedPreviewRows(existing, updates []byte) (me.TableRows, error) {
+	rows := make(map[multicastACLRowKey][]byte,
+		len(existing)/multicastPreviewRowSize+len(updates)/multicastPreviewRowSize)
+	for offset := 0; offset < len(existing); offset += multicastPreviewRowSize {
+		row := append([]byte(nil), existing[offset:offset+multicastPreviewRowSize]...)
+		control := binary.BigEndian.Uint16(row[:2])
+		part := uint8((control & tableRowPartMask) >> 11)
+		if control&(tableSetControlMask|tableTestMask) != 0 || part > 1 {
+			return me.TableRows{}, &ResultError{Result: me.ProcessingError,
+				Cause: fmt.Errorf("committed allowed-preview table contains invalid control %#x", control)}
+		}
+		key := control & tableRowKeyMask
+		var err error
+		if part == 0 {
+			err = validateAllowedPreviewPart0(key, row)
+		} else {
+			err = validateAllowedPreviewPart1(key, row)
+		}
+		if err != nil {
+			return me.TableRows{}, &ResultError{Result: me.ProcessingError, Cause: err}
+		}
+		rows[multicastACLRowKey{key: key, part: part}] = row
+	}
+
+	for offset := 0; offset < len(updates); offset += multicastPreviewRowSize {
+		row := updates[offset : offset+multicastPreviewRowSize]
+		control := binary.BigEndian.Uint16(row[:2])
+		setControl := (control & tableSetControlMask) >> 14
+		key := control & tableRowKeyMask
+		part := uint8((control & tableRowPartMask) >> 11)
+		switch setControl {
+		case 1:
+			if control&tableTestMask != 0 || part > 1 {
+				return me.TableRows{}, multicastSubscriberParameterError(key,
+					fmt.Sprintf("preview row has invalid row part/control %d/%#x", part, control))
+			}
+			stored := append([]byte(nil), row...)
+			binary.BigEndian.PutUint16(stored[:2], uint16(part)<<11|key)
+			rowKey := multicastACLRowKey{key: key, part: part}
+			if part == 0 {
+				if err := validateAllowedPreviewPart0(key, stored); err != nil {
+					return me.TableRows{}, err
+				}
+			} else {
+				if err := validateAllowedPreviewPart1(key, stored); err != nil {
+					return me.TableRows{}, err
+				}
+				duration := binary.BigEndian.Uint16(stored[18:20])
+				timeLeft := duration
+				if previous := rows[rowKey]; previous != nil {
+					oldDuration := binary.BigEndian.Uint16(previous[18:20])
+					oldTimeLeft := binary.BigEndian.Uint16(previous[20:22])
+					if oldDuration != 0 && duration != 0 {
+						adjusted := int64(oldTimeLeft) + int64(duration) - int64(oldDuration)
+						if adjusted < 0 {
+							adjusted = 0
+						}
+						if adjusted > 0xffff {
+							adjusted = 0xffff
+						}
+						timeLeft = uint16(adjusted)
+					}
+				}
+				binary.BigEndian.PutUint16(stored[20:22], timeLeft)
+				if duration != 0 && timeLeft == 0 {
+					for candidate := range rows {
+						if candidate.key == key {
+							delete(rows, candidate)
+						}
+					}
+					continue
+				}
+			}
+			rows[rowKey] = stored
+		case 2:
+			for candidate := range rows {
+				if candidate.key == key {
+					delete(rows, candidate)
+				}
+			}
+		case 3:
+			clear(rows)
+		default:
+			return me.TableRows{}, multicastSubscriberParameterError(key,
+				"preview row uses reserved set control")
+		}
+	}
+
+	keys := make([]multicastACLRowKey, 0, len(rows))
+	for key := range rows {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].key != keys[j].key {
+			return keys[i].key < keys[j].key
+		}
+		return keys[i].part < keys[j].part
+	})
+	result := make([]byte, 0, len(rows)*multicastPreviewRowSize)
+	for _, key := range keys {
+		result = append(result, rows[key]...)
+	}
+	return me.TableRows{NumRows: len(rows), Rows: result}, nil
+}
+
+func validateAllowedPreviewPart0(key uint16, row []byte) error {
+	for _, offset := range []int{18, 20} {
+		if vlanID := binary.BigEndian.Uint16(row[offset : offset+2]); vlanID > 4095 {
+			return multicastSubscriberParameterError(key,
+				fmt.Sprintf("preview row has invalid VLAN ID %d", vlanID))
+		}
+	}
+	return validatePreviewAddress(key, "source", row[2:18], false)
+}
+
+func validateAllowedPreviewPart1(key uint16, row []byte) error {
+	return validatePreviewAddress(key, "destination", row[2:18], true)
+}
+
+func validatePreviewAddress(key uint16, field string, value []byte, multicast bool) error {
+	if allBytes(value, 0) && !multicast {
+		return nil
+	}
+	ipv4 := allBytes(value[:12], 0)
+	valid := false
+	if ipv4 {
+		valid = !multicast || value[12]>>4 == 0xe
+	} else {
+		valid = !multicast || value[0] == 0xff
+	}
+	if !valid {
+		return multicastSubscriberParameterError(key,
+			fmt.Sprintf("preview row has invalid %s IP address %x", field, value))
+	}
+	return nil
+}
+
+func multicastSubscriberParameterError(key uint16, detail string) error {
+	return &ResultError{Result: me.ParameterError,
+		Cause: fmt.Errorf("multicast subscriber row key %d %s", key, detail)}
 }
 
 func tableRows(value interface{}, rowSize int) (me.TableRows, error) {

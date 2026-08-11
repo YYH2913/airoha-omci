@@ -124,30 +124,68 @@ type MulticastIPv6Range struct {
 }
 
 type MulticastOperationsProfile struct {
-	EntityID                  uint16 `json:"entity_id"`
-	IGMPVersion               uint8  `json:"igmp_version"`
-	IGMPFunction              uint8  `json:"igmp_function"`
-	ImmediateLeave            uint8  `json:"immediate_leave"`
-	UpstreamTCI               uint16 `json:"upstream_tci"`
-	UpstreamTagControl        uint8  `json:"upstream_tag_control"`
-	UpstreamRate              uint32 `json:"upstream_rate"`
-	Robustness                uint8  `json:"robustness"`
-	QuerierIPAddress          uint32 `json:"querier_ip_address"`
-	QueryInterval             uint32 `json:"query_interval"`
-	QueryMaxResponseTime      uint32 `json:"query_max_response_time"`
-	LastMemberQueryInterval   uint32 `json:"last_member_query_interval"`
-	UnauthorizedJoinBehaviour uint8  `json:"unauthorized_join_behaviour"`
-	DownstreamTagControl      uint8  `json:"downstream_tag_control"`
-	DownstreamTCI             uint16 `json:"downstream_tci"`
+	EntityID                  uint16              `json:"entity_id"`
+	IGMPVersion               uint8               `json:"igmp_version"`
+	IGMPFunction              uint8               `json:"igmp_function"`
+	ImmediateLeave            uint8               `json:"immediate_leave"`
+	UpstreamTCI               uint16              `json:"upstream_tci"`
+	UpstreamTagControl        uint8               `json:"upstream_tag_control"`
+	UpstreamRate              uint32              `json:"upstream_rate"`
+	DynamicACL                []MulticastACLEntry `json:"dynamic_acl"`
+	StaticACL                 []MulticastACLEntry `json:"static_acl"`
+	Robustness                uint8               `json:"robustness"`
+	QuerierIPAddress          uint32              `json:"querier_ip_address"`
+	QueryInterval             uint32              `json:"query_interval"`
+	QueryMaxResponseTime      uint32              `json:"query_max_response_time"`
+	LastMemberQueryInterval   uint32              `json:"last_member_query_interval"`
+	UnauthorizedJoinBehaviour uint8               `json:"unauthorized_join_behaviour"`
+	DownstreamTagControl      uint8               `json:"downstream_tag_control"`
+	DownstreamTCI             uint16              `json:"downstream_tci"`
+}
+
+type MulticastACLEntry struct {
+	RowKey             uint16 `json:"row_key"`
+	IPVersion          uint8  `json:"ip_version"`
+	GEMPortID          uint16 `json:"gem_port_id"`
+	VLANID             uint16 `json:"vlan_id"`
+	Source             string `json:"source"`
+	Start              string `json:"start"`
+	Stop               string `json:"stop"`
+	ImputedBandwidth   uint32 `json:"imputed_bandwidth"`
+	PreviewLength      uint16 `json:"preview_length"`
+	PreviewRepeatTime  uint16 `json:"preview_repeat_time"`
+	PreviewRepeatCount uint16 `json:"preview_repeat_count"`
+	PreviewResetTime   uint16 `json:"preview_reset_time"`
 }
 
 type MulticastSubscriberConfigInfo struct {
-	EntityID              uint16 `json:"entity_id"`
-	METype                uint8  `json:"me_type"`
-	Profile               uint16 `json:"profile"`
+	EntityID              uint16                    `json:"entity_id"`
+	METype                uint8                     `json:"me_type"`
+	Profile               uint16                    `json:"profile"`
+	MaxSimultaneousGroups uint16                    `json:"max_simultaneous_groups"`
+	MaxMulticastBandwidth uint32                    `json:"max_multicast_bandwidth"`
+	BandwidthEnforcement  uint8                     `json:"bandwidth_enforcement"`
+	ServicePackages       []MulticastServicePackage `json:"service_packages"`
+	AllowedPreviewGroups  []AllowedPreviewGroup     `json:"allowed_preview_groups"`
+}
+
+type MulticastServicePackage struct {
+	RowKey                uint16 `json:"row_key"`
+	VLANID                uint16 `json:"vlan_id"`
 	MaxSimultaneousGroups uint16 `json:"max_simultaneous_groups"`
 	MaxMulticastBandwidth uint32 `json:"max_multicast_bandwidth"`
-	BandwidthEnforcement  uint8  `json:"bandwidth_enforcement"`
+	OperationsProfile     uint16 `json:"operations_profile"`
+}
+
+type AllowedPreviewGroup struct {
+	RowKey      uint16 `json:"row_key"`
+	IPVersion   uint8  `json:"ip_version"`
+	Source      string `json:"source"`
+	Destination string `json:"destination"`
+	ANIVLAN     uint16 `json:"ani_vlan"`
+	UNIVLAN     uint16 `json:"uni_vlan"`
+	Duration    uint16 `json:"duration_minutes"`
+	TimeLeft    uint16 `json:"time_left_minutes"`
 }
 
 type PBitMapper struct {
@@ -1253,18 +1291,13 @@ func buildMulticastOperationsProfile(instance mib.Instance) (MulticastOperations
 		return MulticastOperationsProfile{}, err
 	}
 
-	for name, rowSize := range map[string]int{
-		me.MulticastOperationsProfile_DynamicAccessControlListTable: 24,
-		me.MulticastOperationsProfile_StaticAccessControlListTable:  24,
-	} {
-		rows, tableErr := tableAttributeDefault(instance, name, rowSize)
-		if tableErr != nil {
-			return MulticastOperationsProfile{}, tableErr
-		}
-		if rows.NumRows != 0 {
-			return MulticastOperationsProfile{}, fmt.Errorf("multicast operations profile %#x %s requires a native ACL backend",
-				instance.EntityID, name)
-		}
+	if profile.DynamicACL, err = multicastACL(instance,
+		me.MulticastOperationsProfile_DynamicAccessControlListTable); err != nil {
+		return MulticastOperationsProfile{}, err
+	}
+	if profile.StaticACL, err = multicastACL(instance,
+		me.MulticastOperationsProfile_StaticAccessControlListTable); err != nil {
+		return MulticastOperationsProfile{}, err
 	}
 	if profile.Robustness, err = uint8AttributeDefault(instance,
 		me.MulticastOperationsProfile_Robustness, 0); err != nil {
@@ -1309,6 +1342,157 @@ func buildMulticastOperationsProfile(instance mib.Instance) (MulticastOperations
 	return profile, nil
 }
 
+func multicastACL(instance mib.Instance, name string) ([]MulticastACLEntry, error) {
+	const rowSize = 24
+	rows, err := tableAttributeDefault(instance, name, rowSize)
+	if err != nil {
+		return nil, err
+	}
+	type parts [3][]byte
+	logical := make(map[uint16]parts)
+	for offset := 0; offset < len(rows.Rows); offset += rowSize {
+		row := rows.Rows[offset : offset+rowSize]
+		control := binary.BigEndian.Uint16(row[:2])
+		part := uint8((control >> 11) & 0x07)
+		key := control & 0x03ff
+		if control&0xc400 != 0 || part > 2 {
+			return nil, fmt.Errorf("multicast operations profile %#x %s row has invalid stored control %#x",
+				instance.EntityID, name, control)
+		}
+		entry := logical[key]
+		if entry[part] != nil {
+			return nil, fmt.Errorf("multicast operations profile %#x %s repeats row key/part %d/%d",
+				instance.EntityID, name, key, part)
+		}
+		entry[part] = append([]byte(nil), row...)
+		logical[key] = entry
+	}
+
+	keys := make([]int, 0, len(logical))
+	for key := range logical {
+		keys = append(keys, int(key))
+	}
+	sort.Ints(keys)
+	result := make([]MulticastACLEntry, 0, len(keys))
+	for _, keyValue := range keys {
+		key := uint16(keyValue)
+		entry := logical[key]
+		if entry[0] == nil {
+			// A multi-part table is updated one part at a time. Extension parts
+			// have no forwarding meaning until row part 0 is present.
+			continue
+		}
+		resolved, err := resolveMulticastACLEntry(instance, name, key, entry)
+		if err != nil {
+			return nil, err
+		}
+		for _, previous := range result {
+			if previous.IPVersion != resolved.IPVersion {
+				continue
+			}
+			previousStart := netip.MustParseAddr(previous.Start)
+			previousStop := netip.MustParseAddr(previous.Stop)
+			start := netip.MustParseAddr(resolved.Start)
+			stop := netip.MustParseAddr(resolved.Stop)
+			if previousStop.Compare(start) < 0 || stop.Compare(previousStart) < 0 {
+				continue
+			}
+			return nil, fmt.Errorf("multicast operations profile %#x %s row key %d overlaps row key %d",
+				instance.EntityID, name, key, previous.RowKey)
+		}
+		result = append(result, resolved)
+	}
+	return result, nil
+}
+
+func resolveMulticastACLEntry(instance mib.Instance, name string, key uint16,
+	parts [3][]byte) (MulticastACLEntry, error) {
+	part0 := parts[0]
+	result := MulticastACLEntry{
+		RowKey:           key,
+		GEMPortID:        binary.BigEndian.Uint16(part0[2:4]),
+		VLANID:           binary.BigEndian.Uint16(part0[4:6]),
+		ImputedBandwidth: binary.BigEndian.Uint32(part0[18:22]),
+	}
+	if result.GEMPortID > 0x0fff {
+		return MulticastACLEntry{}, fmt.Errorf("multicast operations profile %#x %s row key %d has invalid GEM Port-ID %d",
+			instance.EntityID, name, key, result.GEMPortID)
+	}
+	if result.VLANID == 4096 || result.VLANID > 4097 && result.VLANID != 0xffff {
+		return MulticastACLEntry{}, fmt.Errorf("multicast operations profile %#x %s row key %d has invalid VLAN ID %d",
+			instance.EntityID, name, key, result.VLANID)
+	}
+	if !zeroBytes(part0[22:24]) {
+		return MulticastACLEntry{}, fmt.Errorf("multicast operations profile %#x %s row key %d has non-zero part 0 reserved bytes",
+			instance.EntityID, name, key)
+	}
+
+	source, _ := multicastACLAddress(parts[1], part0[6:10])
+	start, destinationIPv6 := multicastACLAddress(parts[2], part0[10:14])
+	stop, stopIPv6 := multicastACLAddress(parts[2], part0[14:18])
+	if destinationIPv6 != stopIPv6 || start.Compare(stop) > 0 ||
+		(!destinationIPv6 && !start.Is4() || !destinationIPv6 && !stop.Is4()) ||
+		(destinationIPv6 && !start.Is6() || destinationIPv6 && !stop.Is6()) ||
+		!start.IsMulticast() || !stop.IsMulticast() {
+		return MulticastACLEntry{}, fmt.Errorf("multicast operations profile %#x %s row key %d has invalid destination range %s..%s",
+			instance.EntityID, name, key, start, stop)
+	}
+	result.IPVersion = 4
+	if destinationIPv6 {
+		result.IPVersion = 6
+	}
+	result.Source = source.String()
+	result.Start = start.String()
+	result.Stop = stop.String()
+
+	if part1 := parts[1]; part1 != nil {
+		if !zeroBytes(part1[22:24]) {
+			return MulticastACLEntry{}, fmt.Errorf("multicast operations profile %#x %s row key %d has non-zero part 1 reserved bytes",
+				instance.EntityID, name, key)
+		}
+		result.PreviewLength = binary.BigEndian.Uint16(part1[14:16])
+		result.PreviewRepeatTime = binary.BigEndian.Uint16(part1[16:18])
+		result.PreviewRepeatCount = binary.BigEndian.Uint16(part1[18:20])
+		result.PreviewResetTime = binary.BigEndian.Uint16(part1[20:22])
+		if name == me.MulticastOperationsProfile_DynamicAccessControlListTable &&
+			result.PreviewResetTime > 24 && result.PreviewResetTime < 241 {
+			return MulticastACLEntry{}, fmt.Errorf("multicast operations profile %#x %s row key %d has reserved preview reset time %d",
+				instance.EntityID, name, key, result.PreviewResetTime)
+		}
+	}
+	if part2 := parts[2]; part2 != nil && !zeroBytes(part2[14:24]) {
+		return MulticastACLEntry{}, fmt.Errorf("multicast operations profile %#x %s row key %d has non-zero part 2 reserved bytes",
+			instance.EntityID, name, key)
+	}
+	return result, nil
+}
+
+func multicastACLAddress(prefixPart, low []byte) (netip.Addr, bool) {
+	if prefixPart == nil || ipv4AddressPrefix(prefixPart[2:14]) {
+		var value [4]byte
+		copy(value[:], low)
+		return netip.AddrFrom4(value), false
+	}
+	var value [16]byte
+	copy(value[:12], prefixPart[2:14])
+	copy(value[12:], low)
+	return netip.AddrFrom16(value), true
+}
+
+func ipv4AddressPrefix(prefix []byte) bool {
+	return zeroBytes(prefix[:10]) &&
+		((prefix[10] == 0 && prefix[11] == 0) || (prefix[10] == 0xff && prefix[11] == 0xff))
+}
+
+func zeroBytes(value []byte) bool {
+	for _, current := range value {
+		if current != 0 {
+			return false
+		}
+	}
+	return true
+}
+
 func buildMulticastSubscriber(instance mib.Instance, bridgePorts map[uint16]MACBridgePort,
 	mappers map[uint16]PBitMapper, profiles map[uint16]MulticastOperationsProfile) (MulticastSubscriberConfigInfo, error) {
 	subscriber := MulticastSubscriberConfigInfo{EntityID: instance.EntityID}
@@ -1337,10 +1521,6 @@ func buildMulticastSubscriber(instance mib.Instance, bridgePorts map[uint16]MACB
 		me.MulticastSubscriberConfigInfo_MulticastOperationsProfilePointer); err != nil {
 		return MulticastSubscriberConfigInfo{}, err
 	}
-	if _, exists := profiles[subscriber.Profile]; !exists {
-		return MulticastSubscriberConfigInfo{}, fmt.Errorf("multicast subscriber %#x references missing operations profile %#x",
-			instance.EntityID, subscriber.Profile)
-	}
 	if subscriber.MaxSimultaneousGroups, err = uint16AttributeDefault(instance,
 		me.MulticastSubscriberConfigInfo_MaxSimultaneousGroups, 0); err != nil {
 		return MulticastSubscriberConfigInfo{}, err
@@ -1353,20 +1533,138 @@ func buildMulticastSubscriber(instance mib.Instance, bridgePorts map[uint16]MACB
 		me.MulticastSubscriberConfigInfo_BandwidthEnforcement, 0); err != nil {
 		return MulticastSubscriberConfigInfo{}, err
 	}
-	for name, rowSize := range map[string]int{
-		me.MulticastSubscriberConfigInfo_MulticastServicePackageTable: 20,
-		me.MulticastSubscriberConfigInfo_AllowedPreviewGroupsTable:    22,
-	} {
-		rows, tableErr := tableAttributeDefault(instance, name, rowSize)
-		if tableErr != nil {
-			return MulticastSubscriberConfigInfo{}, tableErr
-		}
-		if rows.NumRows != 0 {
-			return MulticastSubscriberConfigInfo{}, fmt.Errorf("multicast subscriber %#x %s requires a native service-package backend",
-				instance.EntityID, name)
+	if subscriber.ServicePackages, err = multicastServicePackages(instance, profiles); err != nil {
+		return MulticastSubscriberConfigInfo{}, err
+	}
+	if len(subscriber.ServicePackages) == 0 {
+		if _, exists := profiles[subscriber.Profile]; !exists {
+			return MulticastSubscriberConfigInfo{}, fmt.Errorf("multicast subscriber %#x references missing operations profile %#x",
+				instance.EntityID, subscriber.Profile)
 		}
 	}
+	if subscriber.AllowedPreviewGroups, err = allowedPreviewGroups(instance); err != nil {
+		return MulticastSubscriberConfigInfo{}, err
+	}
 	return subscriber, nil
+}
+
+func multicastServicePackages(instance mib.Instance,
+	profiles map[uint16]MulticastOperationsProfile) ([]MulticastServicePackage, error) {
+	const rowSize = 20
+	rows, err := tableAttributeDefault(instance,
+		me.MulticastSubscriberConfigInfo_MulticastServicePackageTable, rowSize)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]MulticastServicePackage, 0, rows.NumRows)
+	seen := make(map[uint16]struct{}, rows.NumRows)
+	for offset := 0; offset < len(rows.Rows); offset += rowSize {
+		row := rows.Rows[offset : offset+rowSize]
+		control := binary.BigEndian.Uint16(row[:2])
+		key := control & 0x03ff
+		if control&0xfc00 != 0 {
+			return nil, fmt.Errorf("multicast subscriber %#x service package has invalid stored control %#x",
+				instance.EntityID, control)
+		}
+		if _, duplicate := seen[key]; duplicate {
+			return nil, fmt.Errorf("multicast subscriber %#x repeats service package row key %d",
+				instance.EntityID, key)
+		}
+		seen[key] = struct{}{}
+		entry := MulticastServicePackage{
+			RowKey:                key,
+			VLANID:                binary.BigEndian.Uint16(row[2:4]),
+			MaxSimultaneousGroups: binary.BigEndian.Uint16(row[4:6]),
+			MaxMulticastBandwidth: binary.BigEndian.Uint32(row[6:10]),
+			OperationsProfile:     binary.BigEndian.Uint16(row[10:12]),
+		}
+		if entry.VLANID > 4097 && entry.VLANID != 0xffff {
+			return nil, fmt.Errorf("multicast subscriber %#x service package row key %d has invalid VLAN ID %d",
+				instance.EntityID, key, entry.VLANID)
+		}
+		if _, exists := profiles[entry.OperationsProfile]; !exists {
+			return nil, fmt.Errorf("multicast subscriber %#x service package row key %d references missing operations profile %#x",
+				instance.EntityID, key, entry.OperationsProfile)
+		}
+		if !zeroBytes(row[12:20]) {
+			return nil, fmt.Errorf("multicast subscriber %#x service package row key %d has non-zero reserved bytes",
+				instance.EntityID, key)
+		}
+		result = append(result, entry)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].RowKey < result[j].RowKey })
+	return result, nil
+}
+
+func allowedPreviewGroups(instance mib.Instance) ([]AllowedPreviewGroup, error) {
+	const rowSize = 22
+	rows, err := tableAttributeDefault(instance,
+		me.MulticastSubscriberConfigInfo_AllowedPreviewGroupsTable, rowSize)
+	if err != nil {
+		return nil, err
+	}
+	type parts [2][]byte
+	logical := make(map[uint16]parts)
+	for offset := 0; offset < len(rows.Rows); offset += rowSize {
+		row := rows.Rows[offset : offset+rowSize]
+		control := binary.BigEndian.Uint16(row[:2])
+		part := uint8((control >> 11) & 0x07)
+		key := control & 0x03ff
+		if control&0xc400 != 0 || part > 1 {
+			return nil, fmt.Errorf("multicast subscriber %#x preview row has invalid stored control %#x",
+				instance.EntityID, control)
+		}
+		entry := logical[key]
+		if entry[part] != nil {
+			return nil, fmt.Errorf("multicast subscriber %#x repeats preview row key/part %d/%d",
+				instance.EntityID, key, part)
+		}
+		entry[part] = append([]byte(nil), row...)
+		logical[key] = entry
+	}
+	keys := make([]int, 0, len(logical))
+	for key := range logical {
+		keys = append(keys, int(key))
+	}
+	sort.Ints(keys)
+	result := make([]AllowedPreviewGroup, 0, len(keys))
+	for _, keyValue := range keys {
+		key := uint16(keyValue)
+		parts := logical[key]
+		if parts[0] == nil || parts[1] == nil {
+			continue
+		}
+		source, _ := multicastTableAddress(parts[0][2:18])
+		destination, ipv6 := multicastTableAddress(parts[1][2:18])
+		aniVLAN := binary.BigEndian.Uint16(parts[0][18:20])
+		uniVLAN := binary.BigEndian.Uint16(parts[0][20:22])
+		if aniVLAN > 4095 || uniVLAN > 4095 || !destination.IsMulticast() {
+			return nil, fmt.Errorf("multicast subscriber %#x preview row key %d has invalid VLAN/address",
+				instance.EntityID, key)
+		}
+		ipVersion := uint8(4)
+		if ipv6 {
+			ipVersion = 6
+		}
+		result = append(result, AllowedPreviewGroup{
+			RowKey: key, IPVersion: ipVersion, Source: source.String(), Destination: destination.String(),
+			ANIVLAN: aniVLAN, UNIVLAN: uniVLAN,
+			Duration: binary.BigEndian.Uint16(parts[1][18:20]),
+			TimeLeft: binary.BigEndian.Uint16(parts[1][20:22]),
+		})
+	}
+	return result, nil
+}
+
+func multicastTableAddress(value []byte) (netip.Addr, bool) {
+	if zeroBytes(value[:12]) {
+		var ipv4 [4]byte
+		copy(ipv4[:], value[12:16])
+		return netip.AddrFrom4(ipv4), false
+	}
+	var ipv6 [16]byte
+	copy(ipv6[:], value)
+	return netip.AddrFrom16(ipv6), true
 }
 
 func validateBridgePortTP(entityID, bridgeID uint16, tpType uint8, pointer uint16,

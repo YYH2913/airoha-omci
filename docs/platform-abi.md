@@ -41,12 +41,12 @@ an OLT may retransmit a request.
 ## Other helpers
 
 The apply helper receives a complete, resolved candidate service graph on
-stdin and must apply it transactionally. ABI version 3 has this top-level
+stdin and must apply it transactionally. ABI version 4 has this top-level
 shape:
 
 ```json
 {
-  "version": 3,
+  "version": 4,
   "operation": "set-table",
   "mib_data_sync": 17,
   "service_graph": {
@@ -87,8 +87,10 @@ The graph contains validated and deterministically ordered references. Raw
 managed-entity attributes are not part of this ABI; interpreting G.988 remains
 the daemon's responsibility. Extended VLAN tables are emitted as named filter
 and treatment fields, including enhanced row keys and directions; no encoded
-table rows cross this boundary. Unknown ABI versions must be rejected before
-any platform state is changed.
+table rows cross this boundary. ABI 4 likewise emits class 309 ACLs and class
+310 service-package/allowed-preview rows as normalized logical entries. Set
+control, row-part, test and reserved bits never cross the boundary. Unknown ABI
+versions must be rejected before any platform state is changed.
 
 OMCI traffic management is part of the same transaction. The XG2010G OpenWrt
 backend applies the following native mapping atomically before acknowledging

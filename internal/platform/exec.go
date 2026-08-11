@@ -16,7 +16,7 @@ import (
 
 const defaultApplyTimeout = 10 * time.Second
 
-const ApplyABIVersion = 3
+const ApplyABIVersion = 4
 
 // ApplyRequest is the versioned boundary between the G.988 engine and a
 // privileged platform helper. The helper consumes resolved connectivity, not
