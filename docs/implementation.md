@@ -15,7 +15,7 @@ and extended messages.  A successful build or reaching GPON O5 is not enough.
 | Traffic | 8 advertised T-CONTs, scheduler/queue graph, GEM CTP/IW validation and hardware apply | upstream SP/WRR/TRTCM implemented; physical verification pending |
 | Performance | common 15-minute engine, GEM CTP and Ethernet UNI/frame PM | class 341, 24, 296, 321 and 322 counters, threshold data 1/2 and TCA implemented; physical verification pending |
 | Ethernet service | resolved bridge, mapper, VLAN and extended VLAN graph | UNI, bridge-port, mapper and GEM-IW associations implemented; advanced treatment pending |
-| Multicast | multicast GEM-IW, IGMP/MLD policy, subscriber limits and live groups | class 281 and class 309/310 tables, ACL/preview enforcement, native report interception and class 311 monitoring implemented; proxy querier and physical OLT verification pending |
+| Multicast | multicast GEM-IW, IGMP/MLD policy, subscriber limits and live groups | class 281 and class 309/310 tables, ACL/preview enforcement, native report/query interception, proxy querier and class 311 monitoring implemented; sampled bandwidth and physical OLT verification pending |
 | Lifecycle | reboot, time sync, software download/activate/commit | implemented; OLT verification pending |
 | Platform | multi-T-CONT/GEM Airoha ABI and transactional Linux backend | GEM and 16-channel GPON QDMA QoS, UNI VLAN, bridge FDB limit and multi-profile MAC bridge implemented; Ethernet offload pending |
 | OpenWrt | package, procd, UCI, rpcd/ubus and LuCI | optical configuration, live service status and automatic/manual service handover implemented |
@@ -143,9 +143,8 @@ IPv6 address tables, including keyed replacement and deletion. MAC bridge port
 TP type 6 joins a multicast GEM-IW to the same profile-specific ANI endpoint
 used by unicast service. Address-table GEM Port-IDs that have no explicit GEM
 CTP are programmed as downstream-only flows, and their receive marks are
-dispatched to that ANI endpoint. The OpenWrt backend enables Linux bridge
-multicast snooping and maps class 309 immediate leave plus the class 310
-per-subscriber group limit to bridge-port controls.
+dispatched to that ANI endpoint. The OpenWrt backend disables Linux bridge
+multicast snooping so the native G.988 runtime is the sole membership authority.
 
 The native `airoha-mcastd` backend consumes the committed ABI 4 graph and
 intercepts IGMPv1/v2/v3 and MLDv1/v2 reports before Linux bridge snooping. It
@@ -160,11 +159,20 @@ TCI DEI rewrite cannot be represented.
 
 The runtime aggregates first-join/final-leave reports for SPR/proxy profiles,
 tracks each client independently, expires preview delivery, and atomically
-publishes the live class 311 tables. Current multicast bandwidth remains the
-G.988 imputed-bandwidth estimate rather than a sampled data-plane rate.
-Periodic proxy querier operation, delayed last-member leave processing,
-class-310 allowed-preview `time-left` write-back, direct mapper attachments
-without a profile ANI, and downstream DEI rewrite still require implementation.
+publishes the live class 311 tables. Proxy profiles originate periodic general
+queries and age silent listeners using the RFC membership interval. A non-fast
+leave sends the configured robustness count of group or group-and-source
+specific queries before replication and the aggregate upstream membership are
+withdrawn. A zero robustness value follows QRV learned from valid downstream
+IGMPv3/MLDv2 queries and otherwise uses the RFC default. OLT-originated queries
+are admitted by the default-deny tc chain and receive class-309 downstream tag
+control; locally generated queries use a reserved skb mark to avoid applying
+the transformation twice.
+
+Current multicast bandwidth remains the G.988 imputed-bandwidth estimate rather
+than a sampled data-plane rate. Class-310 allowed-preview `time-left` write-back,
+direct mapper attachments without a profile ANI, and downstream DEI rewrite
+still require implementation.
 Real baseline and extended OLT traces and sustained multicast traffic tests
 remain deployment gates.
 

@@ -61,7 +61,7 @@ func CaptureMembership(ctx context.Context, interfaceName string,
 			return err
 		}
 		link, ok := address.(*unix.SockaddrLinklayer)
-		if !ok || link.Pkttype == unix.PACKET_OUTGOING {
+		if !ok {
 			continue
 		}
 		frame := append([]byte(nil), data[:length]...)
@@ -76,6 +76,7 @@ func CaptureMembership(ctx context.Context, interfaceName string,
 		if err != nil {
 			continue
 		}
+		message.Downstream = link.Pkttype == unix.PACKET_OUTGOING
 		if err := handle(message); err != nil {
 			return err
 		}

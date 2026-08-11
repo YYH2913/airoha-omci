@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"net/netip"
 )
 
@@ -44,14 +45,18 @@ type VLANTag struct {
 }
 
 type MembershipMessage struct {
-	Kind           MessageKind
-	Version        uint8
-	VLAN           VLAN
-	Client         netip.Addr
-	SourceMAC      [6]byte
-	DestinationMAC [6]byte
-	Tags           []VLANTag
-	Records        []MembershipRecord
+	Kind                 MessageKind
+	Version              uint8
+	Downstream           bool
+	VLAN                 VLAN
+	Client               netip.Addr
+	SourceMAC            [6]byte
+	DestinationMAC       [6]byte
+	QueryRobustness      uint8
+	QueryInterval        uint32
+	QueryMaxResponseTime uint32
+	Tags                 []VLANTag
+	Records              []MembershipRecord
 }
 
 // ParseMembershipFrame validates one Ethernet IGMP or MLD frame. One or two
@@ -121,12 +126,39 @@ func parseIGMP(packet []byte, result *MembershipMessage) error {
 	switch payload[0] {
 	case 0x11:
 		result.Kind = MessageQuery
-		result.Version = 3
 		group := netip.AddrFrom4([4]byte(payload[4:8]))
 		if group != netip.IPv4Unspecified() && !group.IsMulticast() {
 			return fmt.Errorf("IGMP query group %s is not multicast", group)
 		}
-		result.Records = []MembershipRecord{{Group: group}}
+		record := MembershipRecord{Group: group}
+		switch len(payload) {
+		case 8:
+			if payload[1] == 0 {
+				result.Version = 1
+			} else {
+				result.Version = 2
+				result.QueryMaxResponseTime = uint32(payload[1])
+			}
+		default:
+			if len(payload) < 12 {
+				return fmt.Errorf("IGMP query has invalid length")
+			}
+			sourceCount := int(binary.BigEndian.Uint16(payload[10:12]))
+			if len(payload) != 12+sourceCount*4 {
+				return fmt.Errorf("IGMPv3 query source list is truncated or has trailing bytes")
+			}
+			result.Version = 3
+			result.QueryRobustness = payload[8] & 7
+			result.QueryInterval = decodeFloating8(payload[9])
+			result.QueryMaxResponseTime = decodeFloating8(payload[1])
+			record.Sources = make([]netip.Addr, 0, sourceCount)
+			for index := 0; index < sourceCount; index++ {
+				start := 12 + index*4
+				record.Sources = append(record.Sources,
+					netip.AddrFrom4([4]byte(payload[start:start+4])))
+			}
+		}
+		result.Records = []MembershipRecord{record}
 		return nil
 	case 0x12, 0x16, 0x17:
 		group := netip.AddrFrom4([4]byte(payload[4:8]))
@@ -243,8 +275,32 @@ func parseMLD(packet []byte, result *MembershipMessage) error {
 			return fmt.Errorf("MLD query group %s is not multicast", group)
 		}
 		result.Kind = MessageQuery
-		result.Version = 17
-		result.Records = []MembershipRecord{{Group: group}}
+		record := MembershipRecord{Group: group}
+		if len(payload) == 24 {
+			result.Version = 16
+			milliseconds := uint32(binary.BigEndian.Uint16(payload[4:6]))
+			result.QueryMaxResponseTime = (milliseconds + 99) / 100
+		} else {
+			if len(payload) < 28 {
+				return fmt.Errorf("MLDv2 query is truncated")
+			}
+			sourceCount := int(binary.BigEndian.Uint16(payload[26:28]))
+			if len(payload) != 28+sourceCount*16 {
+				return fmt.Errorf("MLDv2 query source list is truncated or has trailing bytes")
+			}
+			result.Version = 17
+			result.QueryRobustness = payload[24] & 7
+			result.QueryInterval = decodeFloating8(payload[25])
+			milliseconds := decodeFloating16(binary.BigEndian.Uint16(payload[4:6]))
+			result.QueryMaxResponseTime = uint32(min((milliseconds+99)/100, uint64(math.MaxUint32)))
+			record.Sources = make([]netip.Addr, 0, sourceCount)
+			for index := 0; index < sourceCount; index++ {
+				start := 28 + index*16
+				record.Sources = append(record.Sources,
+					netip.AddrFrom16([16]byte(payload[start:start+16])))
+			}
+		}
+		result.Records = []MembershipRecord{record}
 		return nil
 	case 131, 132:
 		if len(payload) != 24 {

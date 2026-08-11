@@ -13,6 +13,7 @@ type recordingRuntimeBackend struct {
 	configureError error
 	changes        []ReplicationChange
 	reports        []UpstreamReport
+	queries        []DownstreamQuery
 }
 
 func (b *recordingRuntimeBackend) Configure(Config) error {
@@ -29,11 +30,17 @@ func (b *recordingRuntimeBackend) SendReport(report UpstreamReport) error {
 	return nil
 }
 
+func (b *recordingRuntimeBackend) SendQuery(query DownstreamQuery) error {
+	b.queries = append(b.queries, query)
+	return nil
+}
+
 func TestRuntimeSPRTracksClientsAndAggregatesReports(t *testing.T) {
 	now := time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)
 	backend := &recordingRuntimeBackend{}
 	configured := profile(1, acl(1, "239.1.0.1", "239.1.0.1", 100))
 	configured.IGMPFunction = 1
+	configured.ImmediateLeave = true
 	configured.DynamicACL[0].ImputedBandwidth = 1000
 	runtime, err := NewRuntime(Config{
 		Profiles: []Profile{configured},
@@ -82,8 +89,10 @@ func TestRuntimeSourceSpecificMembershipTransition(t *testing.T) {
 	backend := &recordingRuntimeBackend{}
 	entry := acl(1, "239.1.0.1", "239.1.0.1", 100)
 	entry.Source = addr("192.0.2.1")
+	configured := profile(1, entry)
+	configured.ImmediateLeave = true
 	runtime, err := NewRuntime(Config{
-		Profiles: []Profile{profile(1, entry)},
+		Profiles: []Profile{configured},
 		Subscribers: []Subscriber{{EntityID: 10, Profile: 1,
 			Attachments: []Attachment{{Interface: "lan1"}}}},
 	}, backend, nil)
@@ -179,6 +188,173 @@ func TestRuntimeEquivalentConfigurePreservesMembership(t *testing.T) {
 	}
 	if monitor := runtime.Monitor(10); len(monitor.Groups) != 1 || monitor.JoinMessages != 1 {
 		t.Fatalf("equivalent configure reset state: %+v", monitor)
+	}
+}
+
+func TestRuntimeDelayedLastMemberLeaveQueriesBeforeRemoval(t *testing.T) {
+	now := time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)
+	backend := &recordingRuntimeBackend{}
+	configured := profile(1, acl(1, "239.1.0.1", "239.1.0.1", 100))
+	configured.IGMPFunction = 1
+	configured.Robustness = 2
+	configured.LastMemberQueryInterval = 1
+	runtime, err := NewRuntime(Config{
+		Profiles: []Profile{configured},
+		Subscribers: []Subscriber{{EntityID: 10, Profile: 1,
+			Attachments: []Attachment{{Interface: "lan1", BridgeEntity: 0x100}}}},
+	}, backend, func() time.Time { return now })
+	if err != nil {
+		t.Fatalf("NewRuntime() error = %v", err)
+	}
+	message := membershipMessage("192.0.2.10", [6]byte{2, 0, 0, 0, 0, 10}, ModeIsExclude)
+	if err := runtime.Handle("lan1", message); err != nil {
+		t.Fatalf("Handle(join) error = %v", err)
+	}
+	message.Records[0].Type = ChangeToIncludeMode
+	if err := runtime.Handle("lan1", message); err != nil {
+		t.Fatalf("Handle(leave) error = %v", err)
+	}
+	if len(backend.queries) != 1 || len(backend.changes) != 1 || len(backend.reports) != 1 ||
+		len(runtime.Monitor(10).Groups) != 1 {
+		t.Fatalf("initial last-member state: queries=%d changes=%+v reports=%+v monitor=%+v",
+			len(backend.queries), backend.changes, backend.reports, runtime.Monitor(10))
+	}
+
+	now = now.Add(100 * time.Millisecond)
+	if err := runtime.Expire(); err != nil {
+		t.Fatalf("Expire(repeat query) error = %v", err)
+	}
+	if len(backend.queries) != 2 || len(backend.changes) != 1 {
+		t.Fatalf("repeat query state: queries=%d changes=%+v", len(backend.queries), backend.changes)
+	}
+	now = now.Add(100 * time.Millisecond)
+	if err := runtime.Expire(); err != nil {
+		t.Fatalf("Expire(final leave) error = %v", err)
+	}
+	if len(runtime.Monitor(10).Groups) != 0 || len(backend.changes) != 2 || backend.changes[1].Enable ||
+		len(backend.reports) != 2 || backend.reports[1].Join {
+		t.Fatalf("final delayed leave: monitor=%+v changes=%+v reports=%+v",
+			runtime.Monitor(10), backend.changes, backend.reports)
+	}
+}
+
+func TestRuntimeReportCancelsPendingLastMemberLeave(t *testing.T) {
+	now := time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)
+	backend := &recordingRuntimeBackend{}
+	configured := profile(1, acl(1, "239.1.0.1", "239.1.0.1", 100))
+	configured.IGMPFunction = 2
+	configured.Robustness = 1
+	configured.LastMemberQueryInterval = 1
+	runtime, err := NewRuntime(Config{
+		Profiles: []Profile{configured},
+		Subscribers: []Subscriber{{EntityID: 10, Profile: 1,
+			Attachments: []Attachment{{Interface: "lan1", BridgeEntity: 0x100}}}},
+	}, backend, func() time.Time { return now })
+	if err != nil {
+		t.Fatalf("NewRuntime() error = %v", err)
+	}
+	message := membershipMessage("192.0.2.10", [6]byte{2, 0, 0, 0, 0, 10}, ModeIsExclude)
+	if err := runtime.Handle("lan1", message); err != nil {
+		t.Fatalf("Handle(join) error = %v", err)
+	}
+	message.Records[0].Type = ChangeToIncludeMode
+	if err := runtime.Handle("lan1", message); err != nil {
+		t.Fatalf("Handle(leave) error = %v", err)
+	}
+	message.Records[0].Type = ModeIsExclude
+	now = now.Add(50 * time.Millisecond)
+	if err := runtime.Handle("lan1", message); err != nil {
+		t.Fatalf("Handle(query response) error = %v", err)
+	}
+	now = now.Add(100 * time.Millisecond)
+	if err := runtime.Expire(); err != nil {
+		t.Fatalf("Expire() error = %v", err)
+	}
+	if len(runtime.Monitor(10).Groups) != 1 || len(backend.changes) != 1 {
+		t.Fatalf("query response did not cancel leave: monitor=%+v changes=%+v",
+			runtime.Monitor(10), backend.changes)
+	}
+}
+
+func TestRuntimeProxyGeneralQueryAndMembershipAgeing(t *testing.T) {
+	now := time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)
+	backend := &recordingRuntimeBackend{}
+	configured := profile(1, acl(1, "239.1.0.1", "239.1.0.1", 100))
+	configured.IGMPFunction = 2
+	configured.Robustness = 1
+	configured.QueryInterval = 1
+	configured.QueryMaxResponseTime = 1
+	runtime, err := NewRuntime(Config{
+		Profiles: []Profile{configured},
+		Subscribers: []Subscriber{{EntityID: 10, Profile: 1,
+			Attachments: []Attachment{{Interface: "lan1", BridgeEntity: 0x100}}}},
+	}, backend, func() time.Time { return now })
+	if err != nil {
+		t.Fatalf("NewRuntime() error = %v", err)
+	}
+	if err := runtime.Handle("lan1", membershipMessage("192.0.2.10",
+		[6]byte{2, 0, 0, 0, 0, 10}, ModeIsExclude)); err != nil {
+		t.Fatalf("Handle(join) error = %v", err)
+	}
+	if err := runtime.Expire(); err != nil {
+		t.Fatalf("Expire(initial query) error = %v", err)
+	}
+	if len(backend.queries) != 1 || backend.queries[0].Group.IsValid() {
+		t.Fatalf("initial general queries = %+v", backend.queries)
+	}
+	now = now.Add(1100 * time.Millisecond)
+	if err := runtime.Expire(); err != nil {
+		t.Fatalf("Expire(ageing) error = %v", err)
+	}
+	if len(runtime.Monitor(10).Groups) != 0 || len(backend.changes) != 2 || backend.changes[1].Enable ||
+		len(backend.reports) != 2 || backend.reports[1].Join {
+		t.Fatalf("proxy membership did not age out: monitor=%+v changes=%+v reports=%+v",
+			runtime.Monitor(10), backend.changes, backend.reports)
+	}
+}
+
+func TestRuntimeCopiesRobustnessFromDownstreamQuery(t *testing.T) {
+	now := time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)
+	backend := &recordingRuntimeBackend{}
+	configured := profile(1, acl(1, "239.1.0.1", "239.1.0.1", 100))
+	configured.IGMPFunction = 1
+	configured.LastMemberQueryInterval = 1
+	runtime, err := NewRuntime(Config{
+		Profiles: []Profile{configured},
+		Subscribers: []Subscriber{{EntityID: 10, Profile: 1,
+			Attachments: []Attachment{{Interface: "lan1", BridgeEntity: 0x100}}}},
+	}, backend, func() time.Time { return now })
+	if err != nil {
+		t.Fatalf("NewRuntime() error = %v", err)
+	}
+	if err := runtime.Handle("lan1", MembershipMessage{Kind: MessageQuery, Version: 3,
+		Downstream: true, QueryRobustness: 3}); err != nil {
+		t.Fatalf("Handle(downstream query) error = %v", err)
+	}
+	message := membershipMessage("192.0.2.10", [6]byte{2, 0, 0, 0, 0, 10}, ModeIsExclude)
+	if err := runtime.Handle("lan1", message); err != nil {
+		t.Fatalf("Handle(join) error = %v", err)
+	}
+	message.Records[0].Type = ChangeToIncludeMode
+	if err := runtime.Handle("lan1", message); err != nil {
+		t.Fatalf("Handle(leave) error = %v", err)
+	}
+	for index := 0; index < 2; index++ {
+		now = now.Add(100 * time.Millisecond)
+		if err := runtime.Expire(); err != nil {
+			t.Fatalf("Expire(query %d) error = %v", index, err)
+		}
+	}
+	if len(backend.queries) != 3 || len(runtime.Monitor(10).Groups) != 1 {
+		t.Fatalf("learned robustness was not used: queries=%d monitor=%+v",
+			len(backend.queries), runtime.Monitor(10))
+	}
+	now = now.Add(100 * time.Millisecond)
+	if err := runtime.Expire(); err != nil {
+		t.Fatalf("Expire(final) error = %v", err)
+	}
+	if len(runtime.Monitor(10).Groups) != 0 {
+		t.Fatalf("membership survived learned robustness window: %+v", runtime.Monitor(10))
 	}
 }
 

@@ -21,6 +21,7 @@ import (
 const (
 	multicastDownstreamChain = 2013
 	normalDownstreamChain    = 2012
+	proxyQueryMark           = 0xa17f0001
 )
 
 type CommandRunner interface {
@@ -49,19 +50,22 @@ func (r ExecCommandRunner) Run(name string, arguments ...string) error {
 }
 
 type LinuxBackendOptions struct {
-	TC     string
-	Runner CommandRunner
-	Sender func(string, []byte) error
+	TC          string
+	Runner      CommandRunner
+	Sender      func(string, []byte) error
+	QuerySender func(string, []byte) error
 }
 
 type LinuxBackend struct {
 	mu sync.Mutex
 
-	tc      string
-	runner  CommandRunner
-	sender  func(string, []byte) error
-	static  map[string][]downstreamRule
-	dynamic map[dynamicRuleKey]downstreamRule
+	tc          string
+	runner      CommandRunner
+	sender      func(string, []byte) error
+	querySender func(string, []byte) error
+	control     map[string][]downstreamRule
+	static      map[string][]downstreamRule
+	dynamic     map[dynamicRuleKey]downstreamRule
 }
 
 type downstreamRule struct {
@@ -92,8 +96,15 @@ func NewLinuxBackend(options LinuxBackendOptions) *LinuxBackend {
 	if options.Sender == nil {
 		options.Sender = sendEthernetFrame
 	}
+	if options.QuerySender == nil {
+		options.QuerySender = func(interfaceName string, frame []byte) error {
+			return sendEthernetFrameMarked(interfaceName, frame, proxyQueryMark)
+		}
+	}
 	return &LinuxBackend{tc: options.TC, runner: options.Runner, sender: options.Sender,
-		static: make(map[string][]downstreamRule), dynamic: make(map[dynamicRuleKey]downstreamRule)}
+		querySender: options.QuerySender,
+		control:     make(map[string][]downstreamRule), static: make(map[string][]downstreamRule),
+		dynamic: make(map[dynamicRuleKey]downstreamRule)}
 }
 
 func (b *LinuxBackend) Configure(config Config) error {
@@ -107,6 +118,7 @@ func (b *LinuxBackend) Configure(config Config) error {
 		profiles[profile.EntityID] = profile
 	}
 	candidate := make(map[string][]downstreamRule)
+	candidateControl := make(map[string][]downstreamRule)
 	for _, subscriber := range config.Subscribers {
 		for _, attachment := range subscriber.Attachments {
 			if attachment.BridgeEntity == 0 {
@@ -115,6 +127,8 @@ func (b *LinuxBackend) Configure(config Config) error {
 			}
 			if len(subscriber.ServicePackages) == 0 {
 				profile := profiles[subscriber.Profile]
+				candidateControl[attachment.Interface] = append(candidateControl[attachment.Interface],
+					controlDownstreamRules(attachment.Interface, VLAN{}, profile)...)
 				candidate[attachment.Interface] = append(candidate[attachment.Interface],
 					staticDownstreamRules(attachment.Interface, VLAN{}, profile)...)
 				continue
@@ -122,24 +136,35 @@ func (b *LinuxBackend) Configure(config Config) error {
 			for _, service := range subscriber.ServicePackages {
 				profile := profiles[service.OperationsProfile]
 				uniVLAN := servicePacketVLAN(service.VLANID)
+				candidateControl[attachment.Interface] = append(candidateControl[attachment.Interface],
+					controlDownstreamRules(attachment.Interface, uniVLAN, profile)...)
 				candidate[attachment.Interface] = append(candidate[attachment.Interface],
 					staticDownstreamRules(attachment.Interface, uniVLAN, profile)...)
 			}
 		}
 	}
-	interfaces := make(map[string]struct{}, len(b.static)+len(candidate))
+	interfaces := make(map[string]struct{}, len(b.static)+len(candidate)+len(b.control)+len(candidateControl))
+	for interfaceName := range b.control {
+		interfaces[interfaceName] = struct{}{}
+	}
 	for interfaceName := range b.static {
 		interfaces[interfaceName] = struct{}{}
 	}
 	for interfaceName := range candidate {
 		interfaces[interfaceName] = struct{}{}
 	}
+	for interfaceName := range candidateControl {
+		interfaces[interfaceName] = struct{}{}
+	}
+	previousControl := b.control
 	previousStatic := b.static
 	previousDynamic := b.dynamic
+	b.control = candidateControl
 	b.static = candidate
 	b.dynamic = make(map[dynamicRuleKey]downstreamRule)
 	for interfaceName := range interfaces {
 		if err := b.rebuildLocked(interfaceName); err != nil {
+			b.control = previousControl
 			b.static = previousStatic
 			b.dynamic = previousDynamic
 			for rollbackInterface := range interfaces {
@@ -172,6 +197,26 @@ func staticDownstreamRules(interfaceName string, uniVLAN VLAN, profile Profile) 
 		result = append(result, downstreamRule{interfaceName: interfaceName,
 			aniVLAN: entry.VLANID, uniVLAN: uniVLAN, source: entry.Source,
 			start: entry.Start, stop: entry.Stop, profile: profile})
+	}
+	return result
+}
+
+func controlDownstreamRules(interfaceName string, uniVLAN VLAN, profile Profile) []downstreamRule {
+	seen := make(map[uint16]struct{})
+	result := make([]downstreamRule, 0)
+	for _, entries := range [][]ACLEntry{profile.DynamicACL, profile.StaticACL} {
+		for _, entry := range entries {
+			if _, exists := seen[entry.VLANID]; exists {
+				continue
+			}
+			seen[entry.VLANID] = struct{}{}
+			result = append(result, downstreamRule{interfaceName: interfaceName,
+				aniVLAN: entry.VLANID, uniVLAN: uniVLAN, profile: profile})
+		}
+	}
+	if len(result) == 0 {
+		result = append(result, downstreamRule{interfaceName: interfaceName,
+			aniVLAN: math.MaxUint16, uniVLAN: uniVLAN, profile: profile})
 	}
 	return result
 }
@@ -229,10 +274,63 @@ func (b *LinuxBackend) SendReport(report UpstreamReport) error {
 	return nil
 }
 
+func (b *LinuxBackend) SendQuery(query DownstreamQuery) error {
+	device, err := net.InterfaceByName(query.Attachment.Interface)
+	if err != nil {
+		return fmt.Errorf("resolve query interface %s: %w", query.Attachment.Interface, err)
+	}
+	if len(device.HardwareAddr) != 6 {
+		return fmt.Errorf("query interface %s has invalid hardware address", query.Attachment.Interface)
+	}
+	var sourceMAC [6]byte
+	copy(sourceMAC[:], device.HardwareAddr)
+	frame, err := BuildDownstreamQueryFrame(query, sourceMAC)
+	if err != nil {
+		return err
+	}
+	if err := b.querySender(query.Attachment.Interface, frame); err != nil {
+		return fmt.Errorf("send query on %s: %w", query.Attachment.Interface, err)
+	}
+	return nil
+}
+
 func (b *LinuxBackend) rebuildLocked(interfaceName string) error {
 	// Deleting a missing chain is expected on first configuration.
 	_ = b.runner.Run(b.tc, "filter", "del", "dev", interfaceName, "egress",
 		"chain", strconv.Itoa(multicastDownstreamChain))
+	if err := b.runner.Run(b.tc, "filter", "replace", "dev", interfaceName, "egress",
+		"chain", strconv.Itoa(multicastDownstreamChain), "protocol", "all", "pref", "1",
+		"handle", fmt.Sprintf("%#x", proxyQueryMark), "fw", "action", "pass"); err != nil {
+		return err
+	}
+	control := append([]downstreamRule(nil), b.control[interfaceName]...)
+	sort.Slice(control, func(i, j int) bool {
+		if control[i].profile.EntityID != control[j].profile.EntityID {
+			return control[i].profile.EntityID < control[j].profile.EntityID
+		}
+		if control[i].aniVLAN != control[j].aniVLAN {
+			return control[i].aniVLAN < control[j].aniVLAN
+		}
+		return control[i].uniVLAN.ID < control[j].uniVLAN.ID
+	})
+	preference := 10
+	for _, rule := range control {
+		ipv4 := rule.profile.IGMPVersion <= 3
+		for _, variant := range downstreamVariants(rule.aniVLAN, ipv4) {
+			arguments, err := downstreamControlFilterArguments(interfaceName, preference, rule, variant)
+			if err != nil {
+				return err
+			}
+			if err := b.runner.Run(b.tc, arguments...); err != nil {
+				return err
+			}
+			preference++
+			if preference >= 1000 {
+				return fmt.Errorf("multicast control filter count exceeds reserved tc preference space")
+			}
+		}
+	}
+
 	rules := append([]downstreamRule(nil), b.static[interfaceName]...)
 	for key, rule := range b.dynamic {
 		if key.interfaceName == interfaceName {
@@ -248,7 +346,7 @@ func (b *LinuxBackend) rebuildLocked(interfaceName string) error {
 		}
 		return rules[i].profile.EntityID < rules[j].profile.EntityID
 	})
-	preference := 100
+	preference = 1000
 	for _, rule := range rules {
 		prefixes, err := addressRangePrefixes(rule.start, rule.stop)
 		if err != nil {
@@ -275,6 +373,38 @@ func (b *LinuxBackend) rebuildLocked(interfaceName string) error {
 	return b.runner.Run(b.tc, "filter", "replace", "dev", interfaceName, "egress",
 		"chain", strconv.Itoa(multicastDownstreamChain), "protocol", "all", "pref", "65000",
 		"flower", "skip_hw", "action", "drop")
+}
+
+func downstreamControlFilterArguments(interfaceName string, preference int, rule downstreamRule,
+	variant downstreamVariant) ([]string, error) {
+	arguments := []string{"filter", "replace", "dev", interfaceName, "egress", "chain",
+		strconv.Itoa(multicastDownstreamChain), "protocol", variant.protocol,
+		"pref", strconv.Itoa(preference), "flower", "skip_hw"}
+	if variant.tagged {
+		arguments = append(arguments, "num_of_vlans", strconv.Itoa(variant.tags))
+		if rule.aniVLAN <= 4095 {
+			arguments = append(arguments, "vlan_id", strconv.Itoa(int(rule.aniVLAN)))
+		}
+		encapsulated := "vlan_ethtype"
+		if variant.tags == 2 {
+			encapsulated = "cvlan_ethtype"
+		}
+		if rule.profile.IGMPVersion <= 3 {
+			arguments = append(arguments, encapsulated, "ip")
+		} else {
+			arguments = append(arguments, encapsulated, "ipv6")
+		}
+	}
+	if rule.profile.IGMPVersion <= 3 {
+		arguments = append(arguments, "ip_proto", "2")
+	} else {
+		arguments = append(arguments, "ip_proto", "icmpv6", "type", "130")
+	}
+	actions, err := downstreamActions(rule.profile, rule.uniVLAN, variant.tagged)
+	if err != nil {
+		return nil, err
+	}
+	return append(arguments, actions...), nil
 }
 
 type downstreamVariant struct {
@@ -486,6 +616,10 @@ func increment16(value [16]byte) ([16]byte, bool) {
 }
 
 func sendEthernetFrame(interfaceName string, frame []byte) error {
+	return sendEthernetFrameMarked(interfaceName, frame, 0)
+}
+
+func sendEthernetFrameMarked(interfaceName string, frame []byte, mark uint32) error {
 	device, err := net.InterfaceByName(interfaceName)
 	if err != nil {
 		return err
@@ -495,6 +629,11 @@ func sendEthernetFrame(interfaceName string, frame []byte) error {
 		return err
 	}
 	defer unix.Close(fd)
+	if mark != 0 {
+		if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_MARK, int(mark)); err != nil {
+			return err
+		}
+	}
 	return unix.Sendto(fd, frame, 0, &unix.SockaddrLinklayer{
 		Protocol: htons(unix.ETH_P_ALL), Ifindex: device.Index,
 	})

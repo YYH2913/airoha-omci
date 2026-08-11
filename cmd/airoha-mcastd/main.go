@@ -105,7 +105,8 @@ func run(opts options) error {
 	}
 	ticker := time.NewTicker(opts.poll)
 	defer ticker.Stop()
-	expiry := time.NewTicker(time.Second)
+	// Class 309 expresses last-member query intervals in 0.1 s units.
+	expiry := time.NewTicker(100 * time.Millisecond)
 	defer expiry.Stop()
 	var applied [sha256.Size]byte
 	loaded := false
@@ -151,7 +152,7 @@ func run(opts options) error {
 			reload()
 		case <-expiry.C:
 			if err := runtime.Expire(); err != nil {
-				log.Printf("expire multicast previews: %v", err)
+				log.Printf("advance multicast timers: %v", err)
 			}
 			if err := publishMonitors(opts.stateDir, runtime); err != nil {
 				log.Printf("publish multicast monitors: %v", err)

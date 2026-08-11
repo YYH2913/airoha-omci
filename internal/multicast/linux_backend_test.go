@@ -4,10 +4,25 @@ package multicast
 
 import (
 	"net/netip"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
 )
+
+func TestSendEthernetFrameMarkedIntegration(t *testing.T) {
+	interfaceName := os.Getenv("AIROHA_MCAST_TEST_INTERFACE")
+	if interfaceName == "" {
+		t.Skip("set AIROHA_MCAST_TEST_INTERFACE inside an isolated network namespace")
+	}
+	frame := make([]byte, 60)
+	copy(frame[0:6], []byte{0x01, 0x00, 0x5e, 0, 0, 1})
+	copy(frame[6:12], []byte{0x02, 0, 0, 0, 0, 1})
+	frame[12], frame[13] = 0x08, 0x00
+	if err := sendEthernetFrameMarked(interfaceName, frame, proxyQueryMark); err != nil {
+		t.Fatalf("sendEthernetFrameMarked() error = %v", err)
+	}
+}
 
 type recordedCommand struct {
 	name      string
@@ -61,12 +76,39 @@ func TestLinuxBackendBuildsStaticRangeAndDefaultDrop(t *testing.T) {
 	joined := commandLines(runner.commands)
 	for _, expected := range []string{
 		"tc-test filter del dev lan1 egress chain 2013",
+		"handle 0xa17f0001 fw action pass",
+		"ip_proto 2 action goto chain 2012",
 		"dst_ip 239.1.0.1/32 action goto chain 2012",
 		"dst_ip 239.1.0.2/32 action goto chain 2012",
 		"protocol all pref 65000 flower skip_hw action drop",
 	} {
 		if !strings.Contains(joined, expected) {
 			t.Fatalf("commands do not contain %q:\n%s", expected, joined)
+		}
+	}
+}
+
+func TestLinuxBackendAppliesDownstreamControlToOLTQueries(t *testing.T) {
+	runner := &recordingCommandRunner{}
+	backend := NewLinuxBackend(LinuxBackendOptions{TC: "tc-test", Runner: runner})
+	configured := profile(1, acl(1, "239.1.0.1", "239.1.0.1", 100))
+	configured.DynamicACL = append(configured.DynamicACL, acl(2, "239.1.0.2", "239.1.0.2", 0))
+	configured.DownstreamTagControl = 3
+	configured.DownstreamTCI = 0xa123
+	if err := backend.Configure(Config{
+		Profiles: []Profile{configured},
+		Subscribers: []Subscriber{{EntityID: 10, Profile: 1,
+			Attachments: []Attachment{{Interface: "lan1", BridgeEntity: 0x100}}}},
+	}); err != nil {
+		t.Fatalf("Configure() error = %v", err)
+	}
+	joined := commandLines(runner.commands)
+	for _, expected := range []string{
+		"vlan_id 100 vlan_ethtype ip ip_proto 2 action vlan modify id 291 priority 5",
+		"protocol ip pref 10 flower skip_hw ip_proto 2 action vlan push protocol 802.1Q id 291 priority 5",
+	} {
+		if !strings.Contains(joined, expected) {
+			t.Fatalf("query filters do not contain %q:\n%s", expected, joined)
 		}
 	}
 }
