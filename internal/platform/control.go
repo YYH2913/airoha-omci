@@ -8,10 +8,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/netip"
 	"os/exec"
 	"strings"
 	"time"
 
+	"github.com/xg2010g/airoha-omci/internal/multicast"
 	"github.com/xg2010g/airoha-omci/internal/optical"
 	"github.com/xg2010g/airoha-omci/internal/performance"
 )
@@ -22,11 +24,12 @@ type ExecController struct {
 }
 
 type controlRequest struct {
-	Action           string  `json:"action"`
-	UnixTime         int64   `json:"unix_time,omitempty"`
-	RebootCondition  uint8   `json:"reboot_condition,omitempty"`
-	GEMPortID        *uint16 `json:"gem_port_id,omitempty"`
-	EthernetEntityID *uint16 `json:"ethernet_entity_id,omitempty"`
+	Action                string  `json:"action"`
+	UnixTime              int64   `json:"unix_time,omitempty"`
+	RebootCondition       uint8   `json:"reboot_condition,omitempty"`
+	GEMPortID             *uint16 `json:"gem_port_id,omitempty"`
+	EthernetEntityID      *uint16 `json:"ethernet_entity_id,omitempty"`
+	MulticastSubscriberID *uint16 `json:"multicast_subscriber_id,omitempty"`
 }
 
 type ethernetDirectionResponse struct {
@@ -149,6 +152,94 @@ func decodeEthernetDirection(name string,
 		OversizeFrames:  *value.OversizeFrames,
 		SizeBuckets:     *value.SizeBuckets,
 	}, nil
+}
+
+func (c ExecController) SubscriberMonitor(entityID uint16) (multicast.Monitor, error) {
+	output, err := c.execute(controlRequest{
+		Action: "multicast-subscriber-monitor", MulticastSubscriberID: &entityID,
+	})
+	if err != nil {
+		return multicast.Monitor{}, err
+	}
+	type groupResponse struct {
+		Source           *string    `json:"source"`
+		Group            *string    `json:"group"`
+		Client           *string    `json:"client"`
+		UNITagged        *bool      `json:"uni_tagged"`
+		UNIVLAN          *uint16    `json:"uni_vlan"`
+		ANIVLAN          *uint16    `json:"ani_vlan"`
+		ProfileID        *uint16    `json:"profile_id"`
+		ACLRowKey        *uint16    `json:"acl_row_key"`
+		GEMPortID        *uint16    `json:"gem_port_id"`
+		ImputedBandwidth *uint32    `json:"imputed_bandwidth"`
+		TimeSinceJoin    *uint32    `json:"time_since_join"`
+		PreviewUntil     *time.Time `json:"preview_until,omitempty"`
+	}
+	type response struct {
+		SubscriberID      *uint16          `json:"multicast_subscriber_id"`
+		CurrentBandwidth  *uint32          `json:"current_bandwidth"`
+		JoinMessages      *uint32          `json:"join_messages"`
+		BandwidthExceeded *uint32          `json:"bandwidth_exceeded"`
+		Groups            *[]groupResponse `json:"groups"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(output))
+	decoder.DisallowUnknownFields()
+	var value response
+	if err := decoder.Decode(&value); err != nil {
+		return multicast.Monitor{}, fmt.Errorf("decode multicast subscriber monitor: %w", err)
+	}
+	var trailing interface{}
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return multicast.Monitor{}, fmt.Errorf("decode multicast subscriber monitor: trailing JSON value")
+		}
+		return multicast.Monitor{}, fmt.Errorf("decode multicast subscriber monitor: %w", err)
+	}
+	if value.SubscriberID == nil || *value.SubscriberID != entityID ||
+		value.CurrentBandwidth == nil || value.JoinMessages == nil ||
+		value.BandwidthExceeded == nil || value.Groups == nil {
+		return multicast.Monitor{}, fmt.Errorf("decode multicast subscriber monitor: required or matching field is missing")
+	}
+	result := multicast.Monitor{
+		CurrentBandwidth: *value.CurrentBandwidth, JoinMessages: *value.JoinMessages,
+		BandwidthExceeded: *value.BandwidthExceeded,
+		Groups:            make([]multicast.ActiveGroup, 0, len(*value.Groups)),
+	}
+	for index, group := range *value.Groups {
+		if group.Source == nil || group.Group == nil || group.Client == nil ||
+			group.UNITagged == nil || group.UNIVLAN == nil || group.ANIVLAN == nil ||
+			group.ProfileID == nil || group.ACLRowKey == nil || group.GEMPortID == nil ||
+			group.ImputedBandwidth == nil || group.TimeSinceJoin == nil {
+			return multicast.Monitor{}, fmt.Errorf("decode multicast subscriber monitor: group %d is incomplete", index)
+		}
+		source, err := netip.ParseAddr(*group.Source)
+		if err != nil {
+			return multicast.Monitor{}, fmt.Errorf("decode multicast subscriber monitor: group %d source: %w", index, err)
+		}
+		destination, err := netip.ParseAddr(*group.Group)
+		if err != nil {
+			return multicast.Monitor{}, fmt.Errorf("decode multicast subscriber monitor: group %d destination: %w", index, err)
+		}
+		var client netip.Addr
+		if *group.Client != "" {
+			client, err = netip.ParseAddr(*group.Client)
+			if err != nil {
+				return multicast.Monitor{}, fmt.Errorf("decode multicast subscriber monitor: group %d client: %w", index, err)
+			}
+		}
+		active := multicast.ActiveGroup{
+			Source: source, Group: destination, Client: client,
+			UNIVLAN: multicast.VLAN{Tagged: *group.UNITagged, ID: *group.UNIVLAN},
+			ANIVLAN: *group.ANIVLAN, ProfileID: *group.ProfileID,
+			ACLRowKey: *group.ACLRowKey, GEMPortID: *group.GEMPortID,
+			ImputedBandwidth: *group.ImputedBandwidth, TimeSinceJoin: *group.TimeSinceJoin,
+		}
+		if group.PreviewUntil != nil {
+			active.PreviewUntil = *group.PreviewUntil
+		}
+		result.Groups = append(result.Groups, active)
+	}
+	return result, nil
 }
 
 func (c ExecController) SynchronizeTime(value time.Time) error {

@@ -11,6 +11,7 @@ import (
 	me "github.com/opencord/omci-lib-go/v2/generated"
 	"github.com/xg2010g/airoha-omci/internal/mib"
 	"github.com/xg2010g/airoha-omci/internal/model"
+	"github.com/xg2010g/airoha-omci/internal/multicast"
 )
 
 const (
@@ -288,6 +289,22 @@ func TestBuildServiceGraphResolvesMulticastGEMAndSubscriber(t *testing.T) {
 		graph.MulticastSubscribers[0].AllowedPreviewGroups[0].Destination != "239.1.2.3" ||
 		graph.MulticastSubscribers[0].AllowedPreviewGroups[0].TimeLeft != 25 {
 		t.Fatalf("multicast policy = %#v/%#v", graph.MulticastProfiles, graph.MulticastSubscribers)
+	}
+	policy, err := graph.MulticastPolicy()
+	if err != nil {
+		t.Fatalf("MulticastPolicy() error = %v", err)
+	}
+	if len(policy.Profiles) != 1 || len(policy.Subscribers) != 1 ||
+		len(policy.Profiles[0].DynamicACL) != 1 ||
+		policy.Profiles[0].DynamicACL[0].Start.String() != "ff3e::100" ||
+		len(policy.Subscribers[0].Attachments) != 1 ||
+		policy.Subscribers[0].Attachments[0].Interface != "lan1" ||
+		policy.Subscribers[0].Attachments[0].BridgeEntity != testBridge ||
+		policy.Subscribers[0].Attachments[0].BridgePortEntity != uniBridgePort {
+		t.Fatalf("native multicast policy = %#v", policy)
+	}
+	if _, err := multicast.New(policy, nil); err != nil {
+		t.Fatalf("native multicast policy validation error = %v", err)
 	}
 }
 

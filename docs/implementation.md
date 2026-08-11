@@ -15,7 +15,7 @@ and extended messages.  A successful build or reaching GPON O5 is not enough.
 | Traffic | 8 advertised T-CONTs, scheduler/queue graph, GEM CTP/IW validation and hardware apply | upstream SP/WRR/TRTCM implemented; physical verification pending |
 | Performance | common 15-minute engine, GEM CTP and Ethernet UNI/frame PM | class 341, 24, 296, 321 and 322 counters, threshold data 1/2 and TCA implemented; physical verification pending |
 | Ethernet service | resolved bridge, mapper, VLAN and extended VLAN graph | UNI, bridge-port, mapper and GEM-IW associations implemented; advanced treatment pending |
-| Multicast | multicast GEM-IW, IGMP/MLD policy, subscriber limits and live groups | class 281 and class 309/310 table protocol implemented; ACL/proxy/policing data plane and class 311 monitoring pending |
+| Multicast | multicast GEM-IW, IGMP/MLD policy, subscriber limits and live groups | class 281 and class 309/310 tables, ACL/preview enforcement, native report interception and class 311 monitoring implemented; proxy querier and physical OLT verification pending |
 | Lifecycle | reboot, time sync, software download/activate/commit | implemented; OLT verification pending |
 | Platform | multi-T-CONT/GEM Airoha ABI and transactional Linux backend | GEM and 16-channel GPON QDMA QoS, UNI VLAN, bridge FDB limit and multi-profile MAC bridge implemented; Ethernet offload pending |
 | OpenWrt | package, procd, UCI, rpcd/ubus and LuCI | optical configuration, live service status and automatic/manual service handover implemented |
@@ -147,14 +147,26 @@ dispatched to that ANI endpoint. The OpenWrt backend enables Linux bridge
 multicast snooping and maps class 309 immediate leave plus the class 310
 per-subscriber group limit to bridge-port controls.
 
-This is transparent snooping, not a complete multicast OMCI implementation.
-Class 309 dynamic/static ACL and class 310 service-package/allowed-preview
-SetTable control, multi-part row assembly, address validation and normalized
-platform representation are implemented. Their forwarding, preview timers,
-IGMP/MLD SPR or proxy operation, multicast VLAN tag control and bandwidth
-policing are still rejected because no equivalent backend exists yet. Class
-311 live active-group monitoring also remains to be implemented. Real baseline
-and extended OLT multicast traces are required before this path is deployable.
+The native `airoha-mcastd` backend consumes the committed ABI 4 graph and
+intercepts IGMPv1/v2/v3 and MLDv1/v2 reports before Linux bridge snooping. It
+enforces class 309 dynamic/static ACL ranges and class 310 service-package,
+allowed-preview, group and imputed-bandwidth policy per UNI. Static ranges and
+accepted dynamic streams are compiled into a default-deny tc egress chain;
+source-specific entries remain source-specific. Upstream tag-control modes
+0-3 preserve up to two subscriber VLAN tags and upstream rate limits are
+applied before reports are reinjected through the profile ANI. Downstream
+tag-control modes 0-7 use tc VLAN actions, with an explicit rejection when a
+TCI DEI rewrite cannot be represented.
+
+The runtime aggregates first-join/final-leave reports for SPR/proxy profiles,
+tracks each client independently, expires preview delivery, and atomically
+publishes the live class 311 tables. Current multicast bandwidth remains the
+G.988 imputed-bandwidth estimate rather than a sampled data-plane rate.
+Periodic proxy querier operation, delayed last-member leave processing,
+class-310 allowed-preview `time-left` write-back, direct mapper attachments
+without a profile ANI, and downstream DEI rewrite still require implementation.
+Real baseline and extended OLT traces and sustained multicast traffic tests
+remain deployment gates.
 
 XG2010G defaults keep `lan1` through `lan4` in the user's `br-lan` and expose
 `pon` as a routed WAN. Transparent PPTP-UNI service therefore requires the

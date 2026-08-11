@@ -92,6 +92,41 @@ table rows cross this boundary. ABI 4 likewise emits class 309 ACLs and class
 control, row-part, test and reserved bits never cross the boundary. Unknown ABI
 versions must be rejected before any platform state is changed.
 
+`airoha-mcastd -validate FILE` applies the same strict JSON decoder, graph
+resolution and G.988 multicast policy compiler without opening packet sockets
+or changing Linux state. The transactional OpenWrt apply helper runs this
+validation before programming a candidate graph.
+
+At runtime the multicast daemon watches the atomically replaced
+`/var/run/airoha-omcid/desired.json`. For each configured subscriber it writes
+one atomic class-311 monitor document to
+`/var/run/airoha-omci/multicast/ENTITY.json`:
+
+```json
+{
+  "multicast_subscriber_id": 1280,
+  "current_bandwidth": 1000000,
+  "join_messages": 2,
+  "bandwidth_exceeded": 0,
+  "groups": [{
+    "source": "0.0.0.0",
+    "group": "239.1.1.1",
+    "client": "192.0.2.10",
+    "uni_tagged": true,
+    "uni_vlan": 100,
+    "ani_vlan": 200,
+    "profile_id": 1792,
+    "acl_row_key": 1,
+    "gem_port_id": 201,
+    "imputed_bandwidth": 1000000,
+    "time_since_join": 15
+  }]
+}
+```
+
+The control helper verifies the requested entity ID against the document and
+the daemon-side controller rejects unknown, missing or trailing JSON fields.
+
 OMCI traffic management is part of the same transaction. The XG2010G OpenWrt
 backend applies the following native mapping atomically before acknowledging
 the OMCI mutation:

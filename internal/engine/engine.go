@@ -17,6 +17,7 @@ import (
 	me "github.com/opencord/omci-lib-go/v2/generated"
 	"github.com/xg2010g/airoha-omci/internal/checksum"
 	"github.com/xg2010g/airoha-omci/internal/mib"
+	"github.com/xg2010g/airoha-omci/internal/multicast"
 	"github.com/xg2010g/airoha-omci/internal/optical"
 	"github.com/xg2010g/airoha-omci/internal/performance"
 	"github.com/xg2010g/airoha-omci/internal/software"
@@ -95,6 +96,7 @@ type Engine struct {
 	performanceTCA         map[mib.Key][28]byte
 	performanceNext        time.Time
 	performanceIntervalEnd uint8
+	multicast              multicast.Controller
 }
 
 func New(store *mib.Store) *Engine {
@@ -127,6 +129,9 @@ func NewWithControllers(store *mib.Store, controller Controller, softwareControl
 	}
 	if ethernetController, ok := controller.(performance.EthernetController); ok {
 		result.ethernetPerformance = ethernetController
+	}
+	if multicastController, ok := controller.(multicast.Controller); ok {
+		result.multicast = multicastController
 	}
 	return result
 }
@@ -396,11 +401,25 @@ func (e *Engine) dispatch(packet gopacket.Packet, header *omci.OMCI) ([]byte, er
 		if err != nil {
 			return nil, err
 		}
-		instance, operationError := e.mib.Get(mib.Key{
+		key := mib.Key{
 			ClassID:  request.EntityClass,
 			EntityID: request.EntityInstance,
-		}, request.AttributeMask)
+		}
+		instance, operationError := e.mib.Get(key, request.AttributeMask)
+		if instance.Attributes != nil && request.EntityClass == me.MulticastSubscriberMonitorClassID &&
+			request.AttributeMask&0x7c00 != 0 {
+			var monitorError error
+			instance, monitorError = e.getMulticastMonitorLocked(instance, request.AttributeMask)
+			if monitorError != nil {
+				operationError = monitorError
+			}
+		}
 		result, failed, unsupported := operationResult(operationError)
+		responseMask := request.AttributeMask &^ unsupported &^ failed
+		if result != me.Success && result != me.AttributeFailure {
+			responseMask = 0
+			instance.Attributes = nil
+		}
 		if instance.Attributes != nil {
 			if err := e.prepareTableGet(&instance, request.AttributeMask, header.DeviceIdentifier); err != nil {
 				return nil, err
@@ -413,7 +432,7 @@ func (e *Engine) dispatch(packet gopacket.Packet, header *omci.OMCI) ([]byte, er
 				Extended:       extended,
 			},
 			Result:                   result,
-			AttributeMask:            request.AttributeMask &^ unsupported &^ failed,
+			AttributeMask:            responseMask,
 			Attributes:               instance.Attributes,
 			FailedAttributeMask:      failed,
 			UnsupportedAttributeMask: unsupported,

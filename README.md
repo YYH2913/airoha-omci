@@ -21,7 +21,9 @@ notification path. Software download, CRC-32A and ImageHash validation,
 activation and commit are implemented through a fixed platform helper ABI.
 ANI-G optical alarms and ARC, extended SetTable handling, the resolved
 Ethernet service graph, and the common multi-profile Linux bridge/VLAN/TC
-data path are implemented. The daemon is not yet ready for operator deployment
+data path are implemented. The native multicast runtime parses IGMPv1/v2/v3
+and MLDv1/v2, enforces class 309/310 policy, and publishes live class 311
+state. The daemon is not yet ready for operator deployment
 because advanced VLAN/bridge associations, hardware offload and real OLT
 interoperability are incomplete; see
 [the implementation matrix](docs/implementation.md).

@@ -3,6 +3,7 @@
 package platform
 
 import (
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -146,5 +147,49 @@ func TestExecControllerRejectsIncompleteEthernetCounters(t *testing.T) {
 	if _, err := (ExecController{Path: helper}).EthernetCounters(0x0101); err == nil ||
 		!strings.Contains(err.Error(), "required received field") {
 		t.Fatalf("EthernetCounters() error = %v", err)
+	}
+}
+
+func TestExecControllerReadsMulticastSubscriberMonitor(t *testing.T) {
+	directory := t.TempDir()
+	requestPath := filepath.Join(directory, "request.json")
+	helper := filepath.Join(directory, "control")
+	response := `{"multicast_subscriber_id":1280,"current_bandwidth":1000000,"join_messages":7,"bandwidth_exceeded":2,"groups":[{"source":"0.0.0.0","group":"239.1.2.3","client":"192.0.2.10","uni_tagged":true,"uni_vlan":100,"ani_vlan":200,"profile_id":1792,"acl_row_key":9,"gem_port_id":203,"imputed_bandwidth":1000000,"time_since_join":45}]}`
+	script := "#!/bin/sh\ncat > " + requestPath + "\n" +
+		"printf '%s\\n' '" + response + "'\n"
+	if err := os.WriteFile(helper, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile(helper) error = %v", err)
+	}
+	monitor, err := (ExecController{Path: helper}).SubscriberMonitor(1280)
+	if err != nil {
+		t.Fatalf("SubscriberMonitor() error = %v", err)
+	}
+	if monitor.CurrentBandwidth != 1_000_000 || monitor.JoinMessages != 7 ||
+		monitor.BandwidthExceeded != 2 || len(monitor.Groups) != 1 ||
+		monitor.Groups[0].Group != netip.MustParseAddr("239.1.2.3") ||
+		monitor.Groups[0].Client != netip.MustParseAddr("192.0.2.10") ||
+		!monitor.Groups[0].UNIVLAN.Tagged || monitor.Groups[0].UNIVLAN.ID != 100 ||
+		monitor.Groups[0].GEMPortID != 203 {
+		t.Fatalf("multicast monitor = %#v", monitor)
+	}
+	payload, err := os.ReadFile(requestPath)
+	if err != nil {
+		t.Fatalf("ReadFile(request) error = %v", err)
+	}
+	if !strings.Contains(string(payload), `"action":"multicast-subscriber-monitor"`) ||
+		!strings.Contains(string(payload), `"multicast_subscriber_id":1280`) {
+		t.Fatalf("request = %s", payload)
+	}
+}
+
+func TestExecControllerRejectsIncompleteMulticastSubscriberMonitor(t *testing.T) {
+	helper := filepath.Join(t.TempDir(), "control")
+	response := `{"multicast_subscriber_id":1280,"current_bandwidth":0,"join_messages":0,"bandwidth_exceeded":0,"groups":[{}]}`
+	if err := os.WriteFile(helper, []byte("#!/bin/sh\nprintf '%s\\n' '"+response+"'\n"), 0o755); err != nil {
+		t.Fatalf("WriteFile(helper) error = %v", err)
+	}
+	if _, err := (ExecController{Path: helper}).SubscriberMonitor(1280); err == nil ||
+		!strings.Contains(err.Error(), "group 0 is incomplete") {
+		t.Fatalf("SubscriberMonitor() error = %v", err)
 	}
 }

@@ -3,6 +3,7 @@
 package platform
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -12,6 +13,24 @@ import (
 	me "github.com/opencord/omci-lib-go/v2/generated"
 	"github.com/xg2010g/airoha-omci/internal/mib"
 )
+
+func TestDecodeApplyRequestIsStrict(t *testing.T) {
+	valid := `{"version":4,"operation":"reset","mib_data_sync":0,"service_graph":{"unis":[],"tconts":[],"traffic_descriptors":[],"gem_ports":[],"gem_interworking":[],"multicast_gem_interworking":[],"multicast_operations_profiles":[],"multicast_subscribers":[],"pbit_mappers":[],"bridges":[],"vlan_filters":[],"vlan_operations":[],"extended_vlans":[]}}`
+	request, err := DecodeApplyRequest(bytes.NewBufferString(valid))
+	if err != nil || request.Operation != mib.OperationReset {
+		t.Fatalf("DecodeApplyRequest(valid) = %#v, %v", request, err)
+	}
+	for _, document := range []string{
+		strings.Replace(valid, `"version":4`, `"version":3`, 1),
+		strings.Replace(valid, `"operation":"reset"`, `"operation":"other"`, 1),
+		strings.Replace(valid, `"mib_data_sync":0`, `"mib_data_sync":0,"unknown":1`, 1),
+		valid + `{}`,
+	} {
+		if _, err := DecodeApplyRequest(bytes.NewBufferString(document)); err == nil {
+			t.Fatalf("DecodeApplyRequest(%s) unexpectedly succeeded", document)
+		}
+	}
+}
 
 func TestExecApplierPassesCandidateAsJSON(t *testing.T) {
 	directory := t.TempDir()
