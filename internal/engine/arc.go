@@ -3,7 +3,6 @@
 package engine
 
 import (
-	"fmt"
 	"sort"
 	"time"
 
@@ -58,7 +57,7 @@ func (e *Engine) pollARCKeyLocked(key mib.Key, device omci.DeviceIdent) ([][]byt
 		delete(e.arcFreeSince, key)
 		return nil, nil
 	}
-	if e.alarms[key] != ([28]byte{}) {
+	if e.arcGroupHasAlarmLocked(key) {
 		delete(e.arcFreeSince, key)
 		return nil, nil
 	}
@@ -80,8 +79,63 @@ func (e *Engine) pollARCKeyLocked(key mib.Key, device omci.DeviceIdent) ([][]byt
 }
 
 func (e *Engine) arcEnabledLocked(key mib.Key) bool {
-	enabled, _, supported, err := e.arcConfigurationLocked(key)
+	owner, supported, err := e.arcOwnerLocked(key)
+	if err != nil || !supported {
+		return false
+	}
+	enabled, _, supported, err := e.arcConfigurationLocked(owner)
 	return err == nil && supported && enabled
+}
+
+func (e *Engine) arcOwnerLocked(key mib.Key) (mib.Key, bool, error) {
+	_, _, supported, err := e.arcConfigurationLocked(key)
+	if err != nil || supported {
+		return key, supported, err
+	}
+
+	var owner mib.Key
+	switch {
+	case isEthernetPerformanceClass(key.ClassID):
+		entityID, resolveErr := e.resolveEthernetPerformanceUNILocked(key)
+		if resolveErr != nil {
+			return mib.Key{}, false, resolveErr
+		}
+		owner = mib.Key{
+			ClassID:  me.PhysicalPathTerminationPointEthernetUniClassID,
+			EntityID: entityID,
+		}
+	case key.ClassID == me.GemPortNetworkCtpPerformanceMonitoringHistoryDataClassID:
+		for _, instance := range e.mib.Snapshot() {
+			if instance.ClassID != me.AniGClassID {
+				continue
+			}
+			if owner != (mib.Key{}) {
+				return key, false, nil
+			}
+			owner = instance.Key
+		}
+		if owner == (mib.Key{}) {
+			return key, false, nil
+		}
+	default:
+		return key, false, nil
+	}
+
+	_, _, supported, err = e.arcConfigurationLocked(owner)
+	return owner, supported, err
+}
+
+func (e *Engine) arcGroupHasAlarmLocked(owner mib.Key) bool {
+	for key, bitmap := range e.alarms {
+		if bitmap == ([28]byte{}) {
+			continue
+		}
+		candidate, supported, err := e.arcOwnerLocked(key)
+		if err == nil && supported && candidate == owner {
+			return true
+		}
+	}
+	return false
 }
 
 func (e *Engine) arcConfigurationLocked(key mib.Key) (bool, uint8, bool, error) {
@@ -100,9 +154,12 @@ func (e *Engine) arcConfigurationLocked(key mib.Key) (bool, uint8, bool, error) 
 		return false, 0, true, err
 	}
 	arc, arcPresent := instance.Attributes[arcAttribute].(uint8)
+	if !arcPresent {
+		arc = 0
+	}
 	interval, intervalPresent := instance.Attributes[arcIntervalAttribute].(uint8)
-	if !arcPresent || !intervalPresent {
-		return false, 0, true, fmt.Errorf("ARC attributes are missing from %v/%#x", key.ClassID, key.EntityID)
+	if !intervalPresent {
+		interval = 0
 	}
 	return arc == 1, interval, true, nil
 }
@@ -117,7 +174,7 @@ func (e *Engine) afterSetLocked(key mib.Key, attributes me.AttributeValueMap,
 			return nil, err
 		}
 		if supported && enabled {
-			if e.alarms[key] == ([28]byte{}) {
+			if !e.arcGroupHasAlarmLocked(key) {
 				if _, started := e.arcFreeSince[key]; !started {
 					e.arcFreeSince[key] = e.now()
 				}

@@ -8,10 +8,10 @@ and extended messages.  A successful build or reaching GPON O5 is not enough.
 | OMCC transport | raw RX/TX, cancellation, frame bounds, counters | implemented; physical adapter verification pending |
 | Transactions | per-priority scheduling, stop-and-wait replay and TCI validation | implemented; physical saturation verification pending |
 | MIB | ONU defaults, platform-gated create/delete/set, reset, data sync | implemented; physical OLT verification pending |
-| MIB upload | baseline fragmentation and extended multi-ME packing | in progress |
+| MIB upload | baseline fragmentation and extended multi-ME packing | implemented; physical OLT verification pending |
 | Tables | stable Get/Get Next cache and baseline/enhanced extended Set Table | implemented; OLT verification pending |
-| Notifications | alarm audit/sequence, event-driven Alarm/AVC, requested optical tests and ARC | in progress |
-| Equipment | ONU-G, ONU2-G, ANI-G, four speed-specific Ethernet UNIs, software images | in progress |
+| Notifications | alarm audit/sequence, event-driven Alarm/AVC, requested optical tests and ARC | implemented; physical OLT verification pending |
+| Equipment | ONU-G, ONU2-G, ANI-G, four speed-specific Ethernet UNIs, software images | implemented; physical OLT verification pending |
 | Traffic | 8 advertised T-CONTs, scheduler/queue graph, GEM CTP/IW validation and hardware apply | upstream SP/WRR/TRTCM implemented; physical verification pending |
 | Performance | common 15-minute engine, GEM CTP and Ethernet UNI/frame PM | class 341, 24, 296, 321 and 322 counters, threshold data 1/2 and TCA implemented; physical verification pending |
 | Ethernet service | resolved bridge, mapper, VLAN and extended VLAN graph | UNI, bridge-port, mapper, GEM-IW and static/copy tag treatment implemented; packet-dependent treatment pending |
@@ -27,6 +27,9 @@ The daemon now provides valid error responses for unknown managed entities,
 transactional platform commits, baseline table transfer, extended MIB upload
 packing, alarm audits, time synchronization and scheduled reboot. The factory
 MIB advertises the two 10G, one 2.5G and one 1G Ethernet UNIs independently.
+Its 96 priority queues and eight traffic schedulers are assigned to their
+Ethernet and ANI circuit packs, while ONU2-G reports zero unassigned global
+resources to avoid counting the same hardware twice.
 
 Acknowledged commands follow the G.988 stop-and-wait rules: baseline low and
 high priority retain independent last-command TCI/response state, while the
@@ -59,7 +62,10 @@ inactivity limit. Each valid MIB upload next request, including a retransmission
 refreshes the deadline. An expired or out-of-range baseline request receives a
 zero class/entity/mask body, while its extended equivalent receives a zero-length
 message contents field. Managed entity/attribute definition MEs, table attributes
-and PM measurement counters are omitted from the snapshot.
+and PM measurement counters are omitted from the snapshot. PM control blocks are
+retained by attribute semantics rather than by a fixed attribute index. Extended
+packing accounts for the eight-octet per-ME entry header and is bounded by the
+maximum extended frame length.
 
 MIB data sync follows the command outcome rather than the arrival of a command.
 Create, delete, Set and SetTable advance the counter only when the committed MIB
@@ -102,7 +108,13 @@ optical diagnostics and the four Ethernet carrier states into validated
 Alarm/AVC state. ANI-G optical line supervision tests return all five G.988
 result types in baseline and extended format. Dynamic ANI-G optical attributes,
 OLT and internal thresholds, clear hysteresis, ARC suppression/cancellation and
-ARC-aware alarm audits are implemented; physical OLT verification remains.
+ARC-aware alarm audits are implemented. Get all alarms uses a stable one-minute
+snapshot, validates the retrieval mode, and packs multiple alarm entries into an
+extended response from the requested ME index. An ONU-G administrative lock
+suppresses autonomous alarms, TCAs, AVCs and self-initiated test results without
+incrementing the alarm sequence; alarm conditions remain available to Get all
+alarms. Circuit-pack, Ethernet PPTP and UNI-G locks suppress their Ethernet port
+and dependent PM notifications. Physical OLT verification remains.
 
 Software download now implements baseline and extended sections, negotiated
 maximum windows, shorter OLT-selected windows and complete-window retry without
@@ -145,6 +157,13 @@ therefore share one physical PON without merging learning domains. FDB
 learning, unknown-unicast flooding, UNI isolation and the G.988 VLAN filter
 `j` action are enforced. Candidate failure restores GEM, TC, VLAN and bridge
 state from the last committed graph.
+
+The service graph exports an Ethernet UNI's effective administrative state. A
+port is unlocked only when ONU-G, its circuit pack, its Ethernet PPTP and the
+same-ID UNI-G are all unlocked. This lets the existing OpenWrt helper take all
+four LAN interfaces down for an ONU-level lock while leaving PON and OMCC
+management reachable. Removing the ONU-level lock restores each port's own
+administrative policy instead of overwriting it.
 
 Multicast GEM interworking termination points support the class 281 IPv4 and
 IPv6 address tables, including keyed replacement and deletion. MAC bridge port

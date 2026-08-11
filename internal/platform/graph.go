@@ -310,6 +310,7 @@ func BuildServiceGraph(snapshot []mib.Instance) (ServiceGraph, error) {
 	tcontIndexes := make(map[uint16]int)
 
 	trafficManagementOption := uint8(0)
+	onuAdministrativeState := uint8(0)
 	if onu, found := instances[mib.Key{ClassID: me.OnuGClassID, EntityID: 0}]; found {
 		var err error
 		trafficManagementOption, err = uint8AttributeDefault(onu, me.OnuG_TrafficManagementOption, 0)
@@ -319,6 +320,14 @@ func BuildServiceGraph(snapshot []mib.Instance) (ServiceGraph, error) {
 		if trafficManagementOption > 2 {
 			return ServiceGraph{}, fmt.Errorf("ONU-G has invalid traffic management option %d", trafficManagementOption)
 		}
+		onuAdministrativeState, err = administrativeState(onu, me.OnuG_AdministrativeState)
+		if err != nil {
+			return ServiceGraph{}, err
+		}
+	}
+	circuitPackStates, err := circuitPackAdministrativeStates(instances)
+	if err != nil {
+		return ServiceGraph{}, err
 	}
 
 	for _, instance := range snapshot {
@@ -332,6 +341,23 @@ func BuildServiceGraph(snapshot []mib.Instance) (ServiceGraph, error) {
 				me.PhysicalPathTerminationPointEthernetUni_AdministrativeState, 0)
 			if err != nil {
 				return ServiceGraph{}, err
+			}
+			if administrative > 1 {
+				return ServiceGraph{}, fmt.Errorf("Ethernet UNI %#x has invalid administrative state %d",
+					instance.EntityID, administrative)
+			}
+			if uniG, found := instances[mib.Key{ClassID: me.UniGClassID, EntityID: instance.EntityID}]; found {
+				uniGAdministrative, stateErr := administrativeState(uniG, me.UniG_AdministrativeState)
+				if stateErr != nil {
+					return ServiceGraph{}, stateErr
+				}
+				if uniGAdministrative == 1 {
+					administrative = 1
+				}
+			}
+			if circuitPackStates[uint8(instance.EntityID>>8)] == 1 ||
+				onuAdministrativeState == 1 {
+				administrative = 1
 			}
 			operational, err := uint8AttributeDefault(instance,
 				me.PhysicalPathTerminationPointEthernetUni_OperationalState, 1)
@@ -734,6 +760,37 @@ func BuildServiceGraph(snapshot []mib.Instance) (ServiceGraph, error) {
 	}
 	sortServiceGraph(&graph)
 	return graph, nil
+}
+
+func circuitPackAdministrativeStates(instances map[mib.Key]mib.Instance) (map[uint8]uint8, error) {
+	states := make(map[uint8]uint8)
+	for _, instance := range instances {
+		if instance.ClassID != me.CircuitPackClassID {
+			continue
+		}
+		slot := uint8(instance.EntityID)
+		if _, exists := states[slot]; exists {
+			return nil, fmt.Errorf("multiple circuit packs declare slot %d", slot)
+		}
+		state, err := administrativeState(instance, me.CircuitPack_AdministrativeState)
+		if err != nil {
+			return nil, err
+		}
+		states[slot] = state
+	}
+	return states, nil
+}
+
+func administrativeState(instance mib.Instance, name string) (uint8, error) {
+	state, err := uint8AttributeDefault(instance, name, 0)
+	if err != nil {
+		return 0, err
+	}
+	if state > 1 {
+		return 0, fmt.Errorf("managed entity %d/%#x has invalid administrative state %d",
+			instance.ClassID, instance.EntityID, state)
+	}
+	return state, nil
 }
 
 func buildVLANOperation(instance mib.Instance, instances map[mib.Key]mib.Instance) (VLANOperation, error) {

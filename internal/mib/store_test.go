@@ -511,6 +511,37 @@ func TestANIGRejectsInvalidThresholdAndARCCombinations(t *testing.T) {
 	}
 }
 
+func TestONURejectsInvalidAdministrativeState(t *testing.T) {
+	store, err := New([]Instance{
+		{
+			Key:        Key{ClassID: me.OnuDataClassID, EntityID: 0},
+			Attributes: me.AttributeValueMap{me.OnuData_MibDataSync: uint8(0)},
+		},
+		{
+			Key: Key{ClassID: me.OnuGClassID, EntityID: 0},
+			Attributes: me.AttributeValueMap{
+				me.OnuG_VendorId:            []byte("TEST"),
+				me.OnuG_Version:             make([]byte, 14),
+				me.OnuG_SerialNumber:        make([]byte, 8),
+				me.OnuG_AdministrativeState: uint8(0),
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	err = store.Set(Key{ClassID: me.OnuGClassID, EntityID: 0}, me.AttributeValueMap{
+		me.OnuG_AdministrativeState: uint8(2),
+	})
+	var result *ResultError
+	if !errors.As(err, &result) || result.Result != me.AttributeFailure || result.FailedMask != 0x0200 {
+		t.Fatalf("Set(invalid administrative state) error = %#v, want masked AttributeFailure", err)
+	}
+	if store.DataSync() != 0 {
+		t.Fatalf("invalid Set data sync = %d, want 0", store.DataSync())
+	}
+}
+
 func newANIGStore(t *testing.T) *Store {
 	t.Helper()
 	store, err := New([]Instance{

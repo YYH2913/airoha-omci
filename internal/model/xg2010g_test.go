@@ -24,14 +24,22 @@ func TestXG2010GFactoryMIB(t *testing.T) {
 	var schedulers int
 	var queues int
 	configurations := make(map[uint16]uint8)
+	sensedTypes := make(map[uint16]uint8)
 	var ani mib.Instance
+	var onu2 mib.Instance
+	circuitPacks := make(map[uint16]mib.Instance)
 	for _, item := range store.Snapshot() {
 		switch item.ClassID {
 		case me.AniGClassID:
 			ani = item
+		case me.Onu2GClassID:
+			onu2 = item
+		case me.CircuitPackClassID:
+			circuitPacks[item.EntityID] = item
 		case me.PhysicalPathTerminationPointEthernetUniClassID:
 			ethernetUNIs++
 			configurations[item.EntityID] = item.Attributes[me.PhysicalPathTerminationPointEthernetUni_ConfigurationInd].(uint8)
+			sensedTypes[item.EntityID] = item.Attributes[me.PhysicalPathTerminationPointEthernetUni_SensedType].(uint8)
 		case me.TContClassID:
 			tconts++
 		case me.TrafficSchedulerClassID:
@@ -61,10 +69,31 @@ func TestXG2010GFactoryMIB(t *testing.T) {
 	if queues != wantQueues {
 		t.Fatalf("priority queue count = %d, want %d", queues, wantQueues)
 	}
+	if onu2.Attributes[me.Onu2G_TotalPriorityQueueNumber] != uint16(0) ||
+		onu2.Attributes[me.Onu2G_TotalTrafficSchedulerNumber] != uint8(0) {
+		t.Fatalf("ONU2-G global QoS resources = %#v, want no resources outside circuit packs", onu2.Attributes)
+	}
+	if got := circuitPacks[ethernetCardID].Attributes[me.CircuitPack_TotalPriorityQueueNumber]; got != uint8(len(ethernetConfiguration)*queuesPerPort) {
+		t.Fatalf("Ethernet circuit-pack queues = %#v, want %d", got,
+			len(ethernetConfiguration)*queuesPerPort)
+	}
+	if got := circuitPacks[ethernetCardID].Attributes[me.CircuitPack_Type]; got != uint8(45) {
+		t.Fatalf("Ethernet circuit-pack type = %#v, want mixed services equipment", got)
+	}
+	if got := circuitPacks[aniCardID].Attributes[me.CircuitPack_TotalPriorityQueueNumber]; got != uint8(defaultTContCount*queuesPerPort) {
+		t.Fatalf("ANI circuit-pack queues = %#v, want %d", got, defaultTContCount*queuesPerPort)
+	}
+	if got := circuitPacks[aniCardID].Attributes[me.CircuitPack_TotalTrafficSchedulerNumber]; got != uint8(defaultTContCount) {
+		t.Fatalf("ANI circuit-pack schedulers = %#v, want %d", got, defaultTContCount)
+	}
 	for index, want := range ethernetConfiguration {
 		entityID := uint16(ethernetCardID + index)
 		if got := configurations[entityID]; got != want {
 			t.Fatalf("Ethernet UNI %#x configuration = %d, want %d", entityID, got, want)
+		}
+		if got := sensedTypes[entityID]; got != ethernetSensedType[index] {
+			t.Fatalf("Ethernet UNI %#x sensed type = %d, want %d",
+				entityID, got, ethernetSensedType[index])
 		}
 	}
 }

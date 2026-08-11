@@ -27,6 +27,13 @@ var ethernetConfiguration = [...]uint8{
 	3, // LAN4: 1G full duplex
 }
 
+var ethernetSensedType = [...]uint8{
+	49, // LAN1: 10GBASE-T
+	49, // LAN2: 10GBASE-T
+	50, // LAN3: 2.5GBASE-T
+	47, // LAN4: 10/100/1000BASE-T
+}
+
 type Identity struct {
 	SerialNumber string
 	Version      string
@@ -65,8 +72,8 @@ func XG2010G(identity Identity) ([]mib.Instance, error) {
 			me.Onu2G_VendorProductCode:                                        uint16(0x2010),
 			me.Onu2G_SecurityCapability:                                       uint8(1),
 			me.Onu2G_SecurityMode:                                             uint8(1),
-			me.Onu2G_TotalPriorityQueueNumber:                                 uint16((defaultTContCount + len(ethernetConfiguration)) * queuesPerPort),
-			me.Onu2G_TotalTrafficSchedulerNumber:                              uint8(defaultTContCount),
+			me.Onu2G_TotalPriorityQueueNumber:                                 uint16(0),
+			me.Onu2G_TotalTrafficSchedulerNumber:                              uint8(0),
 			me.Onu2G_Deprecated:                                               uint8(1),
 			me.Onu2G_TotalGemPortIdNumber:                                     uint16(256),
 			me.Onu2G_ConnectivityCapability:                                   uint16(0x007f),
@@ -93,7 +100,7 @@ func XG2010G(identity Identity) ([]mib.Instance, error) {
 			me.AniG_UpperTransmitPowerThreshold: uint8(0x81),
 		}),
 		instance(me.CircuitPackClassID, ethernetCardID, me.AttributeValueMap{
-			me.CircuitPack_Type:                        uint8(0x2f),
+			me.CircuitPack_Type:                        uint8(45),
 			me.CircuitPack_NumberOfPorts:               uint8(4),
 			me.CircuitPack_SerialNumber:                cloneBytes(serial),
 			me.CircuitPack_Version:                     octets(identity.Version, 14),
@@ -106,16 +113,17 @@ func XG2010G(identity Identity) ([]mib.Instance, error) {
 			me.CircuitPack_TotalTrafficSchedulerNumber: uint8(0),
 		}),
 		instance(me.CircuitPackClassID, aniCardID, me.AttributeValueMap{
-			me.CircuitPack_Type:                     uint8(0xf5),
-			me.CircuitPack_NumberOfPorts:            uint8(1),
-			me.CircuitPack_SerialNumber:             cloneBytes(serial),
-			me.CircuitPack_Version:                  octets(identity.Version, 14),
-			me.CircuitPack_VendorId:                 cloneBytes(vendor),
-			me.CircuitPack_AdministrativeState:      uint8(0),
-			me.CircuitPack_OperationalState:         uint8(0),
-			me.CircuitPack_EquipmentId:              octets(identity.EquipmentID+" GPON", 20),
-			me.CircuitPack_TotalTContBufferNumber:   uint8(defaultTContCount),
-			me.CircuitPack_TotalPriorityQueueNumber: uint8(defaultTContCount * 8),
+			me.CircuitPack_Type:                        uint8(0xf5),
+			me.CircuitPack_NumberOfPorts:               uint8(1),
+			me.CircuitPack_SerialNumber:                cloneBytes(serial),
+			me.CircuitPack_Version:                     octets(identity.Version, 14),
+			me.CircuitPack_VendorId:                    cloneBytes(vendor),
+			me.CircuitPack_AdministrativeState:         uint8(0),
+			me.CircuitPack_OperationalState:            uint8(0),
+			me.CircuitPack_EquipmentId:                 octets(identity.EquipmentID+" GPON", 20),
+			me.CircuitPack_TotalTContBufferNumber:      uint8(defaultTContCount),
+			me.CircuitPack_TotalPriorityQueueNumber:    uint8(defaultTContCount * 8),
+			me.CircuitPack_TotalTrafficSchedulerNumber: uint8(defaultTContCount),
 		}),
 		softwareImage(softwareImageAID, identity.Version, true, true),
 		softwareImage(softwareImageBID, "standby", false, false),
@@ -143,7 +151,7 @@ func XG2010G(identity Identity) ([]mib.Instance, error) {
 		instances = append(instances,
 			instance(me.PhysicalPathTerminationPointEthernetUniClassID, entityID, me.AttributeValueMap{
 				me.PhysicalPathTerminationPointEthernetUni_ExpectedType:               uint8(0),
-				me.PhysicalPathTerminationPointEthernetUni_SensedType:                 uint8(0x2f),
+				me.PhysicalPathTerminationPointEthernetUni_SensedType:                 ethernetSensedType[port-1],
 				me.PhysicalPathTerminationPointEthernetUni_AutoDetectionConfiguration: uint8(0),
 				me.PhysicalPathTerminationPointEthernetUni_AdministrativeState:        uint8(0),
 				me.PhysicalPathTerminationPointEthernetUni_OperationalState:           uint8(1),

@@ -425,6 +425,57 @@ func TestEthernetPerformanceThresholdCrossingAlertLifecycle(t *testing.T) {
 	}
 }
 
+func TestEthernetPerformanceTCAHonorsParentUNIARC(t *testing.T) {
+	protocol, store, controller := newEthernetPerformanceEngine(t, false)
+	thresholdID := uint16(0x911)
+	if err := store.Create(me.ThresholdData1ClassID, thresholdID, me.AttributeValueMap{
+		me.ThresholdData1_ThresholdValue1: uint32(1),
+	}); err != nil {
+		t.Fatalf("Create(TCA ThresholdData1) error = %v", err)
+	}
+	if err := store.Set(mib.Key{
+		ClassID: me.PhysicalPathTerminationPointEthernetUniClassID, EntityID: testGEMEntity,
+	}, me.AttributeValueMap{
+		me.PhysicalPathTerminationPointEthernetUni_Arc:         uint8(1),
+		me.PhysicalPathTerminationPointEthernetUni_ArcInterval: uint8(255),
+	}); err != nil {
+		t.Fatalf("Set(parent UNI ARC) error = %v", err)
+	}
+	createEthernetPerformanceWithThreshold(t, protocol,
+		me.EthernetPerformanceMonitoringHistoryData3ClassID, testGEMEntity, thresholdID, 0x641)
+	pollPerformance(t, protocol)
+
+	controller.ethernetCounters.Received.DropEvents = 1
+	if frames := pollPerformance(t, protocol); len(frames) != 0 {
+		t.Fatalf("ARC-suppressed child TCA frames = %d, want 0", len(frames))
+	}
+	if protocol.alarmSequence != 0 {
+		t.Fatalf("ARC-suppressed child TCA sequence = %d, want 0", protocol.alarmSequence)
+	}
+	key := mib.Key{
+		ClassID: me.EthernetPerformanceMonitoringHistoryData3ClassID, EntityID: testGEMEntity,
+	}
+	if protocol.alarms[key][0] != 0x80 {
+		t.Fatalf("ARC-suppressed child TCA was not recorded: %x", protocol.alarms[key])
+	}
+
+	for mode, want := range map[byte]uint16{0: 1, 1: 0} {
+		request := encodeRequest(t, 0x642+uint16(mode), omci.GetAllAlarmsRequestType,
+			&omci.GetAllAlarmsRequest{
+				MeBasePacket:       omci.MeBasePacket{EntityClass: me.OnuDataClassID},
+				AlarmRetrievalMode: mode,
+			})
+		encoded, err := protocol.Handle(request)
+		if err != nil {
+			t.Fatalf("Handle(GetAllAlarms mode %d) error = %v", mode, err)
+		}
+		response := decodeResponse(t, encoded).Layer(omci.LayerTypeGetAllAlarmsResponse).(*omci.GetAllAlarmsResponse)
+		if response.NumberOfCommands != want {
+			t.Fatalf("GetAllAlarms mode %d count = %d, want %d", mode, response.NumberOfCommands, want)
+		}
+	}
+}
+
 func TestPerformanceThresholdFFFFDisablesTCA(t *testing.T) {
 	protocol, store, controller := newEthernetPerformanceEngine(t, false)
 	thresholdID := uint16(0x915)
@@ -705,6 +756,8 @@ func newEthernetPerformanceEngine(t *testing.T,
 			},
 			Attributes: me.AttributeValueMap{
 				me.PhysicalPathTerminationPointEthernetUni_AdministrativeState: uint8(0),
+				me.PhysicalPathTerminationPointEthernetUni_Arc:                 uint8(0),
+				me.PhysicalPathTerminationPointEthernetUni_ArcInterval:         uint8(0),
 			},
 		},
 		{
@@ -714,6 +767,8 @@ func newEthernetPerformanceEngine(t *testing.T,
 			},
 			Attributes: me.AttributeValueMap{
 				me.PhysicalPathTerminationPointEthernetUni_AdministrativeState: uint8(0),
+				me.PhysicalPathTerminationPointEthernetUni_Arc:                 uint8(0),
+				me.PhysicalPathTerminationPointEthernetUni_ArcInterval:         uint8(0),
 			},
 		},
 	}

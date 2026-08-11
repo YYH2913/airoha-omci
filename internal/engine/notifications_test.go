@@ -71,6 +71,95 @@ func TestAlarmNotificationRejectsUndefinedAlarmBit(t *testing.T) {
 	}
 }
 
+func TestONUAdministrativeLockSuppressesNotificationsButRetainsAlarmAudit(t *testing.T) {
+	protocol, store := newNotificationEngine(t)
+	if err := store.Set(mib.Key{ClassID: me.OnuGClassID, EntityID: 0}, me.AttributeValueMap{
+		me.OnuG_AdministrativeState: uint8(1),
+	}); err != nil {
+		t.Fatalf("lock ONU-G: %v", err)
+	}
+	key := mib.Key{ClassID: me.PhysicalPathTerminationPointEthernetUniClassID, EntityID: notificationUNI}
+	var raised [28]byte
+	raised[0] = 0x80
+	frame, emitted, err := protocol.NotifyAlarm(key, raised, omci.BaselineIdent)
+	if err != nil || emitted || frame != nil {
+		t.Fatalf("locked NotifyAlarm() = frame:%x emitted:%v error:%v", frame, emitted, err)
+	}
+	if protocol.alarmSequence != 0 {
+		t.Fatalf("locked alarm sequence = %d, want 0", protocol.alarmSequence)
+	}
+
+	request := encodeRequest(t, 0x46, omci.GetAllAlarmsRequestType, &omci.GetAllAlarmsRequest{
+		MeBasePacket: meBase(me.OnuDataClassID, 0),
+	})
+	response, err := protocol.Handle(request)
+	if err != nil {
+		t.Fatalf("Handle(GetAllAlarms) error = %v", err)
+	}
+	audit := decodeResponse(t, response).Layer(omci.LayerTypeGetAllAlarmsResponse).(*omci.GetAllAlarmsResponse)
+	if audit.NumberOfCommands != 1 {
+		t.Fatalf("locked alarm audit count = %d, want 1", audit.NumberOfCommands)
+	}
+
+	frames, err := protocol.NotifyAttributeChange(key, me.AttributeValueMap{
+		me.PhysicalPathTerminationPointEthernetUni_OperationalState: uint8(0),
+	}, omci.BaselineIdent)
+	if err != nil || len(frames) != 0 {
+		t.Fatalf("locked AVC frames=%d error=%v", len(frames), err)
+	}
+	instance, err := store.Get(key, 0x0400)
+	if err != nil || instance.Attributes[me.PhysicalPathTerminationPointEthernetUni_OperationalState] != uint8(0) {
+		t.Fatalf("locked AVC MIB state = %#v error=%v", instance.Attributes, err)
+	}
+
+	if err := store.Set(mib.Key{ClassID: me.OnuGClassID, EntityID: 0}, me.AttributeValueMap{
+		me.OnuG_AdministrativeState: uint8(0),
+	}); err != nil {
+		t.Fatalf("unlock ONU-G: %v", err)
+	}
+	frame, emitted, err = protocol.NotifyAlarm(key, [28]byte{}, omci.BaselineIdent)
+	if err != nil || !emitted || frame == nil {
+		t.Fatalf("unlocked NotifyAlarm(clear) = frame:%x emitted:%v error:%v", frame, emitted, err)
+	}
+	alarm := decodeResponse(t, frame).Layer(omci.LayerTypeAlarmNotification).(*omci.AlarmNotificationMsg)
+	if alarm.AlarmSequenceNumber != 1 || alarm.AlarmBitmap != ([28]byte{}) {
+		t.Fatalf("unlocked clear alarm = %#v, want sequence 1", alarm)
+	}
+}
+
+func TestEthernetParentAdministrativeLocksSuppressAlarm(t *testing.T) {
+	tests := []struct {
+		name      string
+		key       mib.Key
+		attribute string
+	}{
+		{name: "circuit pack", key: mib.Key{ClassID: me.CircuitPackClassID, EntityID: 0x0101},
+			attribute: me.CircuitPack_AdministrativeState},
+		{name: "Ethernet PPTP", key: mib.Key{
+			ClassID: me.PhysicalPathTerminationPointEthernetUniClassID, EntityID: notificationUNI,
+		}, attribute: me.PhysicalPathTerminationPointEthernetUni_AdministrativeState},
+		{name: "UNI-G", key: mib.Key{ClassID: me.UniGClassID, EntityID: notificationUNI},
+			attribute: me.UniG_AdministrativeState},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			protocol, store := newNotificationEngine(t)
+			if err := store.Set(test.key, me.AttributeValueMap{test.attribute: uint8(1)}); err != nil {
+				t.Fatalf("lock parent: %v", err)
+			}
+			var raised [28]byte
+			raised[0] = 0x80
+			frame, emitted, err := protocol.NotifyAlarm(mib.Key{
+				ClassID: me.PhysicalPathTerminationPointEthernetUniClassID, EntityID: notificationUNI,
+			}, raised, omci.BaselineIdent)
+			if err != nil || emitted || frame != nil || protocol.alarmSequence != 0 {
+				t.Fatalf("locked child alarm = frame:%x emitted:%v sequence:%d error:%v",
+					frame, emitted, protocol.alarmSequence, err)
+			}
+		})
+	}
+}
+
 func TestAlarmSequenceWrapsAt255(t *testing.T) {
 	protocol, _ := newNotificationEngine(t)
 	protocol.alarmSequence = 255
@@ -194,6 +283,28 @@ func TestRequestedTestResultKeepsTCIAndFormat(t *testing.T) {
 	}
 }
 
+func TestONUAdministrativeLockSuppressesOnlySelfInitiatedTestResult(t *testing.T) {
+	protocol, store := newNotificationEngine(t)
+	if err := store.Set(mib.Key{ClassID: me.OnuGClassID, EntityID: 0}, me.AttributeValueMap{
+		me.OnuG_AdministrativeState: uint8(1),
+	}); err != nil {
+		t.Fatalf("lock ONU-G: %v", err)
+	}
+	key := mib.Key{ClassID: me.OnuGClassID, EntityID: 0}
+	frame, err := protocol.TestResult(0, key, []byte{1}, omci.BaselineIdent)
+	if err != nil || frame != nil {
+		t.Fatalf("self-initiated locked TestResult() = %x, %v", frame, err)
+	}
+	frame, err = protocol.TestResult(0x1234, key, []byte{1}, omci.BaselineIdent)
+	if err != nil || frame == nil {
+		t.Fatalf("requested locked TestResult() = %x, %v", frame, err)
+	}
+	header := decodeResponse(t, frame).Layer(omci.LayerTypeOMCI).(*omci.OMCI)
+	if header.TransactionID != 0x1234 {
+		t.Fatalf("requested locked TestResult TCI = %#x, want 0x1234", header.TransactionID)
+	}
+}
+
 func TestExtendedAutonomousMessagesRequireCurrentSessionNegotiation(t *testing.T) {
 	protocol, _ := newNotificationEngine(t)
 	key := mib.Key{ClassID: me.PhysicalPathTerminationPointEthernetUniClassID, EntityID: notificationUNI}
@@ -255,6 +366,18 @@ func newNotificationEngine(t *testing.T) (*Engine, *mib.Store) {
 			Attributes: me.AttributeValueMap{
 				me.PhysicalPathTerminationPointEthernetUni_SensedType:       uint8(0x2f),
 				me.PhysicalPathTerminationPointEthernetUni_OperationalState: uint8(1),
+			},
+		},
+		{
+			Key: mib.Key{ClassID: me.CircuitPackClassID, EntityID: 0x0101},
+			Attributes: me.AttributeValueMap{
+				me.CircuitPack_AdministrativeState: uint8(0),
+			},
+		},
+		{
+			Key: mib.Key{ClassID: me.UniGClassID, EntityID: notificationUNI},
+			Attributes: me.AttributeValueMap{
+				me.UniG_AdministrativeState: uint8(0),
 			},
 		},
 		{

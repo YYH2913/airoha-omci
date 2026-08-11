@@ -85,6 +85,49 @@ func TestBuildServiceGraphResolvesCompleteEthernetService(t *testing.T) {
 	}
 }
 
+func TestBuildServiceGraphCombinesEthernetAdministrativeLocks(t *testing.T) {
+	tests := []struct {
+		name  string
+		class me.ClassID
+		id    uint16
+		attr  string
+	}{
+		{name: "ONU", class: me.OnuGClassID, id: 0, attr: me.OnuG_AdministrativeState},
+		{name: "circuit pack", class: me.CircuitPackClassID, id: 0x0101, attr: me.CircuitPack_AdministrativeState},
+		{name: "Ethernet PPTP", class: me.PhysicalPathTerminationPointEthernetUniClassID, id: testUNI,
+			attr: me.PhysicalPathTerminationPointEthernetUni_AdministrativeState},
+		{name: "UNI-G", class: me.UniGClassID, id: testUNI, attr: me.UniG_AdministrativeState},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			snapshot := validServiceSnapshot()
+			snapshot = append(snapshot,
+				mib.Instance{Key: mib.Key{ClassID: me.CircuitPackClassID, EntityID: 0x0101},
+					Attributes: me.AttributeValueMap{me.CircuitPack_AdministrativeState: uint8(0)}},
+				mib.Instance{Key: mib.Key{ClassID: me.UniGClassID, EntityID: testUNI},
+					Attributes: me.AttributeValueMap{me.UniG_AdministrativeState: uint8(0)}},
+			)
+			findInstance(snapshot, test.class, test.id).Attributes[test.attr] = uint8(1)
+			graph, err := BuildServiceGraph(snapshot)
+			if err != nil {
+				t.Fatalf("BuildServiceGraph(locked) error = %v", err)
+			}
+			if got := graph.UNIs[0].AdministrativeState; got != 1 {
+				t.Fatalf("effective administrative state = %d, want locked", got)
+			}
+
+			findInstance(snapshot, test.class, test.id).Attributes[test.attr] = uint8(0)
+			graph, err = BuildServiceGraph(snapshot)
+			if err != nil {
+				t.Fatalf("BuildServiceGraph(unlocked) error = %v", err)
+			}
+			if got := graph.UNIs[0].AdministrativeState; got != 0 {
+				t.Fatalf("effective administrative state = %d, want unlocked", got)
+			}
+		})
+	}
+}
+
 func TestBuildServiceGraphAllowsMultipleBridgeProfiles(t *testing.T) {
 	const (
 		secondUNI        = 0x0102

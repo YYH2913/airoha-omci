@@ -407,6 +407,40 @@ func TestMibUploadExcludesPerformanceCounters(t *testing.T) {
 	}
 }
 
+func TestMibUploadIncludesExtendedPMControlBlockOnly(t *testing.T) {
+	controlBlock := make([]byte, 16)
+	controlBlock[0] = 1
+	snapshot := []mib.Instance{{
+		Key: mib.Key{ClassID: me.EthernetFrameExtendedPmClassID, EntityID: 1},
+		Attributes: me.AttributeValueMap{
+			me.EthernetFrameExtendedPm_IntervalEndTime: uint8(7),
+			me.EthernetFrameExtendedPm_ControlBlock:    controlBlock,
+			me.EthernetFrameExtendedPm_DropEvents:      uint32(99),
+		},
+	}}
+	commands, err := buildUpload(snapshot, omci.ExtendedIdent)
+	if err != nil {
+		t.Fatalf("buildUpload() error = %v", err)
+	}
+	if len(commands) != 1 || len(commands[0]) != 1 {
+		t.Fatalf("upload commands = %#v, want one ME", commands)
+	}
+	reported := commands[0][0]
+	if got := reported.GetAttributeMask(); got != 0x4000 {
+		t.Fatalf("reported attribute mask = %#x, want control block 0x4000", got)
+	}
+	attributes := reported.GetAttributeValueMap()
+	if got, present := attributes[me.EthernetFrameExtendedPm_ControlBlock]; !present || string(got.([]byte)) != string(controlBlock) {
+		t.Fatalf("reported control block = %#v, want %#v", got, controlBlock)
+	}
+	if _, present := attributes[me.EthernetFrameExtendedPm_IntervalEndTime]; present {
+		t.Fatal("MIB upload includes transient extended PM interval end time")
+	}
+	if _, present := attributes[me.EthernetFrameExtendedPm_DropEvents]; present {
+		t.Fatal("MIB upload includes an extended PM measurement counter")
+	}
+}
+
 func TestMibUploadExcludesManagedEntitiesProhibitedByG988(t *testing.T) {
 	snapshot := []mib.Instance{
 		{
@@ -684,7 +718,7 @@ func TestExtendedSetTableCommitsRowsOnceAcrossRetransmission(t *testing.T) {
 }
 
 func TestExtendedMibUploadPacksMultipleManagedEntities(t *testing.T) {
-	snapshot := make([]mib.Instance, 12)
+	snapshot := make([]mib.Instance, 300)
 	for index := range snapshot {
 		snapshot[index] = mib.Instance{
 			Key: mib.Key{ClassID: me.OnuDataClassID, EntityID: uint16(index)},
@@ -697,8 +731,34 @@ func TestExtendedMibUploadPacksMultipleManagedEntities(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildUpload() error = %v", err)
 	}
-	if len(commands) != 1 || len(commands[0]) != len(snapshot) {
-		t.Fatalf("extended upload commands = %d MEs=%d, want 1/%d", len(commands), len(commands[0]), len(snapshot))
+	if len(commands) != 2 {
+		t.Fatalf("extended upload commands = %d, want 2", len(commands))
+	}
+	reported := 0
+	for sequence, command := range commands {
+		reported += len(command)
+		encoded, err := serialize(&omci.OMCI{
+			TransactionID:    uint16(sequence + 1),
+			MessageType:      omci.MibUploadNextRequestType,
+			DeviceIdentifier: omci.ExtendedIdent,
+		}, omci.MibUploadNextResponseType, &omci.MibUploadNextResponse{
+			MeBasePacket: omci.MeBasePacket{
+				EntityClass: me.OnuDataClassID,
+				Extended:    true,
+			},
+			ReportedME:    command[0],
+			AdditionalMEs: command[1:],
+		})
+		if err != nil {
+			t.Fatalf("serialize(command %d) error = %v", sequence, err)
+		}
+		if len(encoded) > omci.MaxExtendedLength {
+			t.Fatalf("serialized command %d length = %d, maximum %d",
+				sequence, len(encoded), omci.MaxExtendedLength)
+		}
+	}
+	if reported != len(snapshot) {
+		t.Fatalf("reported MEs = %d, want %d", reported, len(snapshot))
 	}
 }
 
@@ -720,6 +780,7 @@ func TestGetAllAlarmsUsesStableSnapshot(t *testing.T) {
 	if response.NumberOfCommands != 1 {
 		t.Fatalf("NumberOfCommands = %d, want 1", response.NumberOfCommands)
 	}
+	protocol.SetAlarm(mib.Key{ClassID: me.AniGClassID, EntityID: 0x8001}, [28]byte{})
 
 	next := encodeRequest(t, 12, omci.GetAllAlarmsNextRequestType, &omci.GetAllAlarmsNextRequest{
 		MeBasePacket:          omci.MeBasePacket{EntityClass: me.OnuDataClassID},
@@ -733,6 +794,156 @@ func TestGetAllAlarmsUsesStableSnapshot(t *testing.T) {
 	if nextResponse.AlarmEntityClass != me.AniGClassID ||
 		nextResponse.AlarmEntityInstance != 0x8001 || nextResponse.AlarmBitMap != bitmap {
 		t.Fatalf("alarm response = %#v", nextResponse)
+	}
+}
+
+func TestGetAllAlarmsRejectsReservedRetrievalMode(t *testing.T) {
+	protocol, _ := newTestEngine(t)
+	request := encodeRequest(t, 0x180, omci.GetAllAlarmsRequestType, &omci.GetAllAlarmsRequest{
+		MeBasePacket:       omci.MeBasePacket{EntityClass: me.OnuDataClassID},
+		AlarmRetrievalMode: 2,
+	})
+	if _, err := protocol.Handle(request); err == nil {
+		t.Fatal("Handle(GetAllAlarms mode 2) error = nil, want malformed request rejection")
+	}
+}
+
+func TestGetAllAlarmsSessionExpiresAndValidNextRefreshesIt(t *testing.T) {
+	newProtocol := func(t *testing.T) (*Engine, *time.Time) {
+		t.Helper()
+		protocol, _ := newTestEngine(t)
+		now := time.Date(2026, 8, 11, 0, 0, 0, 0, time.UTC)
+		protocol.now = func() time.Time { return now }
+		var bitmap [28]byte
+		bitmap[0] = 0x80
+		protocol.SetAlarm(mib.Key{ClassID: me.AniGClassID, EntityID: 0x8001}, bitmap)
+		return protocol, &now
+	}
+
+	t.Run("expires at one minute", func(t *testing.T) {
+		for name, device := range map[string]omci.DeviceIdent{
+			"baseline": omci.BaselineIdent,
+			"extended": omci.ExtendedIdent,
+		} {
+			t.Run(name, func(t *testing.T) {
+				protocol, now := newProtocol(t)
+				extended := device == omci.ExtendedIdent
+				start := encodeRequestForDevice(t, 0x181, omci.GetAllAlarmsRequestType,
+					&omci.GetAllAlarmsRequest{MeBasePacket: omci.MeBasePacket{
+						EntityClass: me.OnuDataClassID, Extended: extended,
+					}}, device)
+				if _, err := protocol.Handle(start); err != nil {
+					t.Fatalf("Handle(GetAllAlarms) error = %v", err)
+				}
+				*now = now.Add(alarmUploadTimeout)
+				next := encodeRequestForDevice(t, 0x182, omci.GetAllAlarmsNextRequestType,
+					&omci.GetAllAlarmsNextRequest{
+						MeBasePacket: omci.MeBasePacket{
+							EntityClass: me.OnuDataClassID, Extended: extended,
+						},
+					}, device)
+				encoded, err := protocol.Handle(next)
+				if err != nil {
+					t.Fatalf("Handle(expired GetAllAlarmsNext) error = %v", err)
+				}
+				if getAllAlarmsNextHasContents(encoded, device) {
+					t.Fatalf("expired GetAllAlarmsNext %#x returned contents", byte(device))
+				}
+			})
+		}
+	})
+
+	t.Run("valid request and retransmission refresh", func(t *testing.T) {
+		protocol, now := newProtocol(t)
+		start := encodeRequest(t, 0x183, omci.GetAllAlarmsRequestType,
+			&omci.GetAllAlarmsRequest{MeBasePacket: omci.MeBasePacket{EntityClass: me.OnuDataClassID}})
+		if _, err := protocol.Handle(start); err != nil {
+			t.Fatalf("Handle(GetAllAlarms) error = %v", err)
+		}
+
+		*now = now.Add(59 * time.Second)
+		next := encodeRequest(t, 0x184, omci.GetAllAlarmsNextRequestType,
+			&omci.GetAllAlarmsNextRequest{MeBasePacket: omci.MeBasePacket{EntityClass: me.OnuDataClassID}})
+		first, err := protocol.Handle(next)
+		if err != nil || !getAllAlarmsNextHasContents(first, omci.BaselineIdent) {
+			t.Fatalf("first GetAllAlarmsNext: contents=%t error=%v",
+				getAllAlarmsNextHasContents(first, omci.BaselineIdent), err)
+		}
+
+		*now = now.Add(59 * time.Second)
+		replayed, err := protocol.Handle(next)
+		if err != nil || string(replayed) != string(first) {
+			t.Fatalf("retransmitted GetAllAlarmsNext was not replayed: error=%v", err)
+		}
+
+		*now = now.Add(59 * time.Second)
+		later := encodeRequest(t, 0x185, omci.GetAllAlarmsNextRequestType,
+			&omci.GetAllAlarmsNextRequest{MeBasePacket: omci.MeBasePacket{EntityClass: me.OnuDataClassID}})
+		encoded, err := protocol.Handle(later)
+		if err != nil || !getAllAlarmsNextHasContents(encoded, omci.BaselineIdent) {
+			t.Fatalf("refreshed GetAllAlarmsNext: contents=%t error=%v",
+				getAllAlarmsNextHasContents(encoded, omci.BaselineIdent), err)
+		}
+	})
+}
+
+func TestExtendedGetAllAlarmsPacksSnapshotFromRequestedIndex(t *testing.T) {
+	protocol, _ := newTestEngine(t)
+	var bitmap [28]byte
+	bitmap[0] = 0x80
+	for entityID := uint16(1); entityID <= 100; entityID++ {
+		protocol.SetAlarm(mib.Key{ClassID: me.AniGClassID, EntityID: entityID}, bitmap)
+	}
+	start := encodeRequestForDevice(t, 0x190, omci.GetAllAlarmsRequestType,
+		&omci.GetAllAlarmsRequest{MeBasePacket: omci.MeBasePacket{
+			EntityClass: me.OnuDataClassID, Extended: true,
+		}}, omci.ExtendedIdent)
+	encoded, err := protocol.Handle(start)
+	if err != nil {
+		t.Fatalf("Handle(GetAllAlarms) error = %v", err)
+	}
+	audit := decodeResponse(t, encoded).Layer(omci.LayerTypeGetAllAlarmsResponse).(*omci.GetAllAlarmsResponse)
+	if audit.NumberOfCommands != 100 {
+		t.Fatalf("extended alarm instance count = %d, want 100", audit.NumberOfCommands)
+	}
+
+	for _, test := range []struct {
+		sequence uint16
+		want     int
+	}{
+		{sequence: 0, want: maxExtendedAlarmsPerResponse},
+		{sequence: maxExtendedAlarmsPerResponse, want: 100 - maxExtendedAlarmsPerResponse},
+	} {
+		next := encodeRequestForDevice(t, 0x191+test.sequence, omci.GetAllAlarmsNextRequestType,
+			&omci.GetAllAlarmsNextRequest{
+				MeBasePacket:          omci.MeBasePacket{EntityClass: me.OnuDataClassID, Extended: true},
+				CommandSequenceNumber: test.sequence,
+			}, omci.ExtendedIdent)
+		encoded, err = protocol.Handle(next)
+		if err != nil {
+			t.Fatalf("Handle(GetAllAlarmsNext %d) error = %v", test.sequence, err)
+		}
+		response := decodeResponse(t, encoded).Layer(omci.LayerTypeGetAllAlarmsNextResponse).(*omci.GetAllAlarmsNextResponse)
+		if got := 1 + len(response.AdditionalAlarms); got != test.want {
+			t.Fatalf("GetAllAlarmsNext %d entries = %d, want %d", test.sequence, got, test.want)
+		}
+		if response.AlarmEntityInstance != test.sequence+1 {
+			t.Fatalf("GetAllAlarmsNext %d first entity = %d, want %d",
+				test.sequence, response.AlarmEntityInstance, test.sequence+1)
+		}
+	}
+
+	outOfRange := encodeRequestForDevice(t, 0x1ff, omci.GetAllAlarmsNextRequestType,
+		&omci.GetAllAlarmsNextRequest{
+			MeBasePacket:          omci.MeBasePacket{EntityClass: me.OnuDataClassID, Extended: true},
+			CommandSequenceNumber: 100,
+		}, omci.ExtendedIdent)
+	encoded, err = protocol.Handle(outOfRange)
+	if err != nil {
+		t.Fatalf("Handle(out-of-range GetAllAlarmsNext) error = %v", err)
+	}
+	if getAllAlarmsNextHasContents(encoded, omci.ExtendedIdent) {
+		t.Fatal("out-of-range extended GetAllAlarmsNext returned contents")
 	}
 }
 

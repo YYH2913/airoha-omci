@@ -110,6 +110,13 @@ normalized logical entries. Set
 control, row-part, test and reserved bits never cross the boundary. Unknown ABI
 versions must be rejected before any platform state is changed.
 
+Each `unis[].administrative_state` is the effective hardware state, not merely
+the Ethernet PPTP attribute. It is locked when any of ONU-G, the containing
+circuit pack, the PPTP or the same-ID UNI-G is locked. The individual G.988
+attributes remain distinct in `mib_state`, so removing a parent lock restores
+the child's independently provisioned state. The helper applies this field only
+to `lan1` through `lan4`; it must not take the PON or OMCC transport down.
+
 For Create, Set, Set table, Delete, Reset and autonomous service changes, the
 OpenWrt helper applies the candidate graph and atomically replaces
 `desired.json` only after hardware programming succeeds. The `command`

@@ -74,22 +74,41 @@ func (e *Engine) notifyAlarmLocked(key mib.Key, bitmap [28]byte,
 	} else {
 		e.alarms[key] = bitmap
 	}
-	if e.arcEnabledLocked(key) {
-		if bitmap == ([28]byte{}) {
-			if _, exists := e.arcFreeSince[key]; !exists {
-				e.arcFreeSince[key] = e.now()
-			}
-		} else {
-			delete(e.arcFreeSince, key)
+	suppressed, err := e.notificationsSuppressedLocked(key)
+	if err != nil {
+		return nil, false, err
+	}
+	arcOwner, arcSupported, err := e.arcOwnerLocked(key)
+	if err != nil {
+		return nil, false, err
+	}
+	arcEnabled := false
+	if arcSupported {
+		arcEnabled, _, _, err = e.arcConfigurationLocked(arcOwner)
+		if err != nil {
+			return nil, false, err
 		}
-		frames, err := e.pollARCKeyLocked(key, device)
+	}
+	if arcEnabled {
+		if e.arcGroupHasAlarmLocked(arcOwner) {
+			delete(e.arcFreeSince, arcOwner)
+		} else if _, exists := e.arcFreeSince[arcOwner]; !exists {
+			e.arcFreeSince[arcOwner] = e.now()
+		}
+		frames, err := e.pollARCKeyLocked(arcOwner, device)
 		if err != nil {
 			return nil, false, err
 		}
 		if len(frames) == 0 {
 			return nil, false, nil
 		}
+		if suppressed {
+			return nil, false, nil
+		}
 		return frames[0], true, nil
+	}
+	if suppressed {
+		return nil, false, nil
 	}
 
 	previousSequence := e.alarmSequence
@@ -147,6 +166,13 @@ func (e *Engine) notifyAttributeChangeLocked(key mib.Key, attributes me.Attribut
 		return nil, err
 	}
 	if len(changed) == 0 {
+		return nil, nil
+	}
+	suppressed, err := e.notificationsSuppressedLocked(key)
+	if err != nil {
+		return nil, err
+	}
+	if suppressed {
 		return nil, nil
 	}
 
@@ -251,6 +277,15 @@ func (e *Engine) TestResult(transactionID uint16, key mib.Key, payload []byte,
 	if !me.SupportsMsgType(entity, me.Test) {
 		return nil, fmt.Errorf("managed entity %v/%#x does not support Test", key.ClassID, key.EntityID)
 	}
+	if transactionID == 0 {
+		suppressed, err := e.notificationsSuppressedLocked(key)
+		if err != nil {
+			return nil, err
+		}
+		if suppressed {
+			return nil, nil
+		}
+	}
 	return serializeAutonomous(device, transactionID, omci.TestResultType,
 		&omci.TestResultNotification{
 			MeBasePacket: omci.MeBasePacket{
@@ -260,6 +295,92 @@ func (e *Engine) TestResult(transactionID uint16, key mib.Key, payload []byte,
 			},
 			Payload: append([]byte(nil), payload...),
 		})
+}
+
+func (e *Engine) notificationsSuppressedLocked(key mib.Key) (bool, error) {
+	locked, err := e.administrativelyLockedLocked(
+		mib.Key{ClassID: me.OnuGClassID, EntityID: 0}, me.OnuG_AdministrativeState)
+	if err != nil || locked {
+		return locked, err
+	}
+
+	if key.ClassID == me.CircuitPackClassID {
+		return e.administrativelyLockedLocked(key, me.CircuitPack_AdministrativeState)
+	}
+
+	parent := key
+	if isEthernetPerformanceClass(key.ClassID) {
+		entityID, resolveErr := e.resolveEthernetPerformanceUNILocked(key)
+		if resolveErr != nil {
+			return false, resolveErr
+		}
+		parent = mib.Key{ClassID: me.PhysicalPathTerminationPointEthernetUniClassID, EntityID: entityID}
+	} else if key.ClassID == me.GemPortNetworkCtpPerformanceMonitoringHistoryDataClassID {
+		owner, supported, resolveErr := e.arcOwnerLocked(key)
+		if resolveErr != nil {
+			return false, resolveErr
+		}
+		if supported {
+			parent = owner
+		}
+	}
+
+	var slot uint8
+	switch parent.ClassID {
+	case me.PhysicalPathTerminationPointEthernetUniClassID, me.UniGClassID:
+		entityID := parent.EntityID
+		if locked, err = e.administrativelyLockedLocked(mib.Key{
+			ClassID: me.PhysicalPathTerminationPointEthernetUniClassID, EntityID: entityID,
+		}, me.PhysicalPathTerminationPointEthernetUni_AdministrativeState); err != nil || locked {
+			return locked, err
+		}
+		if locked, err = e.administrativelyLockedLocked(mib.Key{
+			ClassID: me.UniGClassID, EntityID: entityID,
+		}, me.UniG_AdministrativeState); err != nil || locked {
+			return locked, err
+		}
+		slot = uint8(entityID >> 8)
+	case me.AniGClassID:
+		slot = uint8(parent.EntityID >> 8)
+	default:
+		return false, nil
+	}
+
+	for _, instance := range e.mib.Snapshot() {
+		if instance.ClassID != me.CircuitPackClassID || uint8(instance.EntityID) != slot {
+			continue
+		}
+		return e.administrativelyLockedLocked(instance.Key, me.CircuitPack_AdministrativeState)
+	}
+	return false, nil
+}
+
+func (e *Engine) administrativelyLockedLocked(key mib.Key, attribute string) (bool, error) {
+	if !e.mib.Exists(key) {
+		return false, nil
+	}
+	definitions, omciErr := me.GetAttributesDefinitions(key.ClassID)
+	if omciErr.StatusCode() != me.Success {
+		return false, omciErr.GetError()
+	}
+	definition, err := me.GetAttributeDefinitionByName(definitions, attribute)
+	if err != nil {
+		return false, err
+	}
+	instance, err := e.mib.Get(key, definition.Mask)
+	if err != nil {
+		return false, err
+	}
+	value, present := instance.Attributes[attribute]
+	if !present {
+		return false, nil
+	}
+	state, valid := value.(uint8)
+	if !valid || state > 1 {
+		return false, fmt.Errorf("managed entity %v/%#x has invalid administrative state %v",
+			key.ClassID, key.EntityID, value)
+	}
+	return state == 1, nil
 }
 
 func serializeAutonomous(device omci.DeviceIdent, transactionID uint16,

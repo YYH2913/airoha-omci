@@ -555,6 +555,15 @@ func validateSemantics(instance Instance) error {
 		return &ResultError{Result: me.AttributeFailure, FailedMask: attributeMask(instance.ClassID, "Arc"),
 			Cause: fmt.Errorf("ARC value %d is not 0 or 1", arc)}
 	}
+	switch instance.ClassID {
+	case me.OnuGClassID, me.CircuitPackClassID,
+		me.PhysicalPathTerminationPointEthernetUniClassID, me.UniGClassID:
+		if state, present := byteAttribute(attributes, "AdministrativeState"); present && state > 1 {
+			return &ResultError{Result: me.AttributeFailure,
+				FailedMask: attributeMask(instance.ClassID, "AdministrativeState"),
+				Cause:      fmt.Errorf("administrative state %d is not 0 or 1", state)}
+		}
+	}
 	if instance.ClassID != me.AniGClassID {
 		return nil
 	}

@@ -29,16 +29,22 @@ const (
 	extendedPriority
 	transactionChannelCount
 
-	mibUploadTimeout = time.Minute
+	mibUploadTimeout   = time.Minute
+	alarmUploadTimeout = time.Minute
+
+	extendedMibUploadEntryOverhead = 2 + 2 + 2 + 2 // length, class, instance and mask
+	extendedAlarmEntryLength       = 2 + 2 + omci.AlarmBitmapSize/8
+	maxExtendedAlarmsPerResponse   = (omci.MaxExtendedLength - 10 - 4) / extendedAlarmEntryLength
 )
 
 type transactionChannel uint8
 
 type transactionReplay struct {
-	valid         bool
-	transactionID uint16
-	response      []byte
-	refreshUpload bool
+	valid              bool
+	transactionID      uint16
+	response           []byte
+	refreshUpload      bool
+	refreshAlarmUpload bool
 }
 
 type uploadCommand []me.ManagedEntity
@@ -46,6 +52,11 @@ type uploadCommand []me.ManagedEntity
 type uploadSession struct {
 	commands []uploadCommand
 	expires  time.Time
+}
+
+type alarmUploadSession struct {
+	alarms  []Alarm
+	expires time.Time
 }
 
 type tableKey struct {
@@ -77,7 +88,7 @@ type Engine struct {
 	upload                 map[omci.DeviceIdent]uploadSession
 	tables                 map[tableKey][]byte
 	alarms                 map[mib.Key][28]byte
-	alarmUpload            map[omci.DeviceIdent][]Alarm
+	alarmUpload            map[omci.DeviceIdent]alarmUploadSession
 	alarmSequence          uint8
 	arcFreeSince           map[mib.Key]time.Time
 	opticalSample          map[mib.Key]optical.Sample
@@ -114,7 +125,7 @@ func NewWithControllers(store *mib.Store, controller Controller, softwareControl
 		upload:           make(map[omci.DeviceIdent]uploadSession),
 		tables:           make(map[tableKey][]byte),
 		alarms:           make(map[mib.Key][28]byte),
-		alarmUpload:      make(map[omci.DeviceIdent][]Alarm),
+		alarmUpload:      make(map[omci.DeviceIdent]alarmUploadSession),
 		arcFreeSince:     make(map[mib.Key]time.Time),
 		opticalSample:    make(map[mib.Key]optical.Sample),
 		now:              time.Now,
@@ -187,7 +198,7 @@ func (e *Engine) ResetCommunicationSession() {
 	e.oneWayValid = false
 	e.upload = make(map[omci.DeviceIdent]uploadSession)
 	e.tables = make(map[tableKey][]byte)
-	e.alarmUpload = make(map[omci.DeviceIdent][]Alarm)
+	e.alarmUpload = make(map[omci.DeviceIdent]alarmUploadSession)
 	e.alarmSequence = 0
 	e.pending = nil
 	e.pendingError = nil
@@ -543,7 +554,10 @@ func (e *Engine) dispatch(packet gopacket.Packet, header *omci.OMCI) ([]byte, er
 			return alarms[i].Key.ClassID < alarms[j].Key.ClassID
 		})
 		e.alarmSequence = 0
-		e.alarmUpload[header.DeviceIdentifier] = alarms
+		e.alarmUpload[header.DeviceIdentifier] = alarmUploadSession{
+			alarms:  alarms,
+			expires: e.now().Add(alarmUploadTimeout),
+		}
 		return serialize(header, omci.GetAllAlarmsResponseType, &omci.GetAllAlarmsResponse{
 			MeBasePacket: omci.MeBasePacket{
 				EntityClass:    request.EntityClass,
@@ -565,12 +579,31 @@ func (e *Engine) dispatch(packet gopacket.Packet, header *omci.OMCI) ([]byte, er
 				Extended:       extended,
 			},
 		}
-		alarms := e.alarmUpload[header.DeviceIdentifier]
-		if int(request.CommandSequenceNumber) < len(alarms) {
-			alarm := alarms[request.CommandSequenceNumber]
-			response.AlarmEntityClass = alarm.Key.ClassID
-			response.AlarmEntityInstance = alarm.Key.EntityID
-			response.AlarmBitMap = alarm.Bitmap
+		now := e.now()
+		session, present := e.alarmUpload[header.DeviceIdentifier]
+		start := int(request.CommandSequenceNumber)
+		if !present || !now.Before(session.expires) || start >= len(session.alarms) {
+			if present && !now.Before(session.expires) {
+				delete(e.alarmUpload, header.DeviceIdentifier)
+			}
+			return serializeEmptyGetAllAlarmsNext(header, request.EntityClass, request.EntityInstance)
+		}
+		session.expires = now.Add(alarmUploadTimeout)
+		e.alarmUpload[header.DeviceIdentifier] = session
+		end := start + 1
+		if extended {
+			end = min(start+maxExtendedAlarmsPerResponse, len(session.alarms))
+		}
+		alarm := session.alarms[start]
+		response.AlarmEntityClass = alarm.Key.ClassID
+		response.AlarmEntityInstance = alarm.Key.EntityID
+		response.AlarmBitMap = alarm.Bitmap
+		for _, alarm := range session.alarms[start+1 : end] {
+			response.AdditionalAlarms = append(response.AdditionalAlarms, omci.AdditionalAlarmsData{
+				AlarmEntityClass:    alarm.Key.ClassID,
+				AlarmEntityInstance: alarm.Key.EntityID,
+				AlarmBitMap:         alarm.Bitmap,
+			})
 		}
 		return serialize(header, omci.GetAllAlarmsNextResponseType, response)
 
@@ -963,9 +996,10 @@ func buildUpload(snapshot []mib.Instance, device omci.DeviceIdent) ([]uploadComm
 			return nil, fmt.Errorf("load MIB upload definition %v: %w", instance.ClassID, omciErr.GetError())
 		}
 
-		limit := omci.MaxAttributeMibUploadNextBaselineLength
+		attributeLimit := omci.MaxAttributeMibUploadNextBaselineLength
 		if device == omci.ExtendedIdent {
-			limit = omci.MaxManagedEntityMibUploadNextExtendedLength
+			attributeLimit = omci.MaxManagedEntityMibUploadNextExtendedLength -
+				extendedMibUploadEntryOverhead
 		}
 		attributes := make(me.AttributeValueMap)
 		used := 0
@@ -983,7 +1017,8 @@ func buildUpload(snapshot []mib.Instance, device omci.DeviceIdent) ([]uploadComm
 			return nil
 		}
 
-		performanceMonitoring := isPerformanceMonitoringDefinition(definition.GetManagedEntityDefinition().GetName())
+		performanceMonitoring := isPerformanceMonitoringDefinition(
+			definition.GetManagedEntityDefinition().GetName())
 		for _, index := range me.GetAttributeDefinitionMapKeys(definition.GetAttributeDefinitions()) {
 			if index == 0 {
 				continue
@@ -992,14 +1027,14 @@ func buildUpload(snapshot []mib.Instance, device omci.DeviceIdent) ([]uploadComm
 			value, present := instance.Attributes[attribute.GetName()]
 			if !present || !me.SupportsAttributeAccess(attribute, me.Read) ||
 				attribute.IsTableAttribute() || attribute.IsCounter() ||
-				(performanceMonitoring && index != 2) {
+				(performanceMonitoring && !isPerformanceControlBlock(attribute)) {
 				continue
 			}
 			size := attribute.GetSize()
-			if size > limit {
+			if size > attributeLimit {
 				continue
 			}
-			if used > 0 && used+size > limit {
+			if used > 0 && used+size > attributeLimit {
 				if err := flush(); err != nil {
 					return nil, err
 				}
@@ -1065,6 +1100,11 @@ func excludedFromMibUpload(classID me.ClassID) bool {
 func isPerformanceMonitoringDefinition(name string) bool {
 	return strings.Contains(name, "PerformanceMonitoringHistoryData") ||
 		strings.Contains(name, "ExtendedPm")
+}
+
+func isPerformanceControlBlock(attribute me.AttributeDefinition) bool {
+	name := attribute.GetName()
+	return name == "ControlBlock" || strings.HasPrefix(name, "ThresholdData")
 }
 
 func (e *Engine) prepareTableGet(instance *mib.Instance, requestedMask uint16,
@@ -1239,6 +1279,14 @@ func serializeEmptyMibUploadNext(header *omci.OMCI, classID me.ClassID,
 	})
 }
 
+func serializeEmptyGetAllAlarmsNext(header *omci.OMCI, classID me.ClassID,
+	entityID uint16) ([]byte, error) {
+	return serialize(header, omci.GetAllAlarmsNextResponseType, &emptyMibUploadNextLayer{
+		classID: classID, entityID: entityID,
+		extended: header.DeviceIdentifier == omci.ExtendedIdent,
+	})
+}
+
 func serialize(header *omci.OMCI, responseType omci.MessageType, response gopacket.SerializableLayer) ([]byte, error) {
 	responseHeader := &omci.OMCI{
 		TransactionID:    header.TransactionID,
@@ -1295,10 +1343,26 @@ func (e *Engine) replayTransaction(header *omci.OMCI) ([]byte, bool) {
 		session.expires = now.Add(mibUploadTimeout)
 		e.upload[header.DeviceIdentifier] = session
 	}
+	if header.MessageType == omci.GetAllAlarmsNextRequestType && replay.refreshAlarmUpload {
+		now := e.now()
+		session, present := e.alarmUpload[header.DeviceIdentifier]
+		if !present || !now.Before(session.expires) {
+			delete(e.alarmUpload, header.DeviceIdentifier)
+			return nil, false
+		}
+		session.expires = now.Add(alarmUploadTimeout)
+		e.alarmUpload[header.DeviceIdentifier] = session
+	}
 	if header.MessageType == omci.MibUploadRequestType {
 		if session, present := e.upload[header.DeviceIdentifier]; present {
 			session.expires = e.now().Add(mibUploadTimeout)
 			e.upload[header.DeviceIdentifier] = session
+		}
+	}
+	if header.MessageType == omci.GetAllAlarmsRequestType {
+		if session, present := e.alarmUpload[header.DeviceIdentifier]; present {
+			session.expires = e.now().Add(alarmUploadTimeout)
+			e.alarmUpload[header.DeviceIdentifier] = session
 		}
 	}
 	return append([]byte(nil), replay.response...), true
@@ -1313,6 +1377,8 @@ func (e *Engine) rememberTransaction(header *omci.OMCI, response []byte) {
 		response: append([]byte(nil), response...),
 		refreshUpload: header.MessageType == omci.MibUploadNextRequestType &&
 			mibUploadNextHasContents(response, header.DeviceIdentifier),
+		refreshAlarmUpload: header.MessageType == omci.GetAllAlarmsNextRequestType &&
+			getAllAlarmsNextHasContents(response, header.DeviceIdentifier),
 	}
 }
 
@@ -1324,6 +1390,21 @@ func mibUploadNextHasContents(response []byte, device omci.DeviceIdent) bool {
 		return false
 	}
 	for _, value := range response[8:14] {
+		if value != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func getAllAlarmsNextHasContents(response []byte, device omci.DeviceIdent) bool {
+	if device == omci.ExtendedIdent {
+		return len(response) >= 10 && binary.BigEndian.Uint16(response[8:10]) != 0
+	}
+	if len(response) < 40 {
+		return false
+	}
+	for _, value := range response[8:40] {
 		if value != 0 {
 			return true
 		}
