@@ -14,12 +14,88 @@ import (
 )
 
 const (
-	multicastMonitorCurrentBandwidthMask = 0x4000
-	multicastMonitorJoinCounterMask      = 0x2000
-	multicastMonitorExceededCounterMask  = 0x1000
-	multicastMonitorIPv4TableMask        = 0x0800
-	multicastMonitorIPv6TableMask        = 0x0400
+	multicastSubscriberAllowedPreviewMask = 0x0200
+	multicastMonitorCurrentBandwidthMask  = 0x4000
+	multicastMonitorJoinCounterMask       = 0x2000
+	multicastMonitorExceededCounterMask   = 0x1000
+	multicastMonitorIPv4TableMask         = 0x0800
+	multicastMonitorIPv6TableMask         = 0x0400
 )
+
+// PollMulticast commits timed class-310 row expiry even when the OLT is not
+// issuing Get requests. No MIB data-sync increment or autonomous notification
+// is generated for the ONU-owned time-left transition.
+func (e *Engine) PollMulticast() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.multicastPreview == nil {
+		return nil
+	}
+	for _, instance := range e.mib.Snapshot() {
+		if instance.ClassID != me.MulticastSubscriberConfigInfoClassID {
+			continue
+		}
+		if _, err := e.refreshAllowedPreviewLocked(instance.EntityID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (e *Engine) getAllowedPreviewLocked(instance mib.Instance, mask uint16) (mib.Instance, error) {
+	if e.multicastPreview == nil || mask&multicastSubscriberAllowedPreviewMask == 0 {
+		return instance, nil
+	}
+	snapshot, err := e.refreshAllowedPreviewLocked(instance.EntityID)
+	if err != nil {
+		return mib.Instance{}, err
+	}
+	if snapshot == nil {
+		return instance, nil
+	}
+	// Expiry may have replaced the committed instance after the initial Get.
+	instance, err = e.mib.Get(instance.Key, mask)
+	if err != nil {
+		return mib.Instance{}, err
+	}
+	return mib.OverlayAllowedPreviewTimers(instance, mibAllowedPreviewTimers(snapshot.Timers))
+}
+
+func (e *Engine) refreshAllowedPreviewLocked(entityID uint16) (*multicast.AllowedPreviewSnapshot, error) {
+	if e.multicastPreview == nil {
+		return nil, nil
+	}
+	snapshot, err := e.multicastPreview.AllowedPreviewStatus(entityID)
+	if err != nil {
+		return nil, &mib.ResultError{Result: me.ProcessingError,
+			Cause: fmt.Errorf("read multicast subscriber preview status %#x: %w", entityID, err)}
+	}
+	if snapshot.MIBDataSync != e.mib.DataSync() {
+		return nil, nil
+	}
+	changed, err := e.mib.ExpireAllowedPreviewRows(mib.Key{
+		ClassID: me.MulticastSubscriberConfigInfoClassID, EntityID: entityID,
+	}, mibAllowedPreviewTimers(snapshot.Timers))
+	if err != nil {
+		return nil, &mib.ResultError{Result: me.ProcessingError,
+			Cause: fmt.Errorf("expire multicast subscriber preview rows %#x: %w", entityID, err)}
+	}
+	if changed {
+		e.tables = make(map[tableKey][]byte)
+	}
+	return &snapshot, nil
+}
+
+func mibAllowedPreviewTimers(timers []multicast.AllowedPreviewTimer) []mib.AllowedPreviewTimer {
+	result := make([]mib.AllowedPreviewTimer, 0, len(timers))
+	for _, timer := range timers {
+		result = append(result, mib.AllowedPreviewTimer{
+			RowKey: timer.RowKey, Duration: timer.Duration, TimeLeft: timer.TimeLeft,
+		})
+	}
+	return result
+}
 
 func (e *Engine) getMulticastMonitorLocked(instance mib.Instance,
 	mask uint16) (mib.Instance, error) {

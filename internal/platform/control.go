@@ -48,6 +48,37 @@ type ethernetDirectionResponse struct {
 	SizeBuckets     *[6]uint64 `json:"size_buckets"`
 }
 
+type multicastGroupResponse struct {
+	Source           *string    `json:"source"`
+	Group            *string    `json:"group"`
+	Client           *string    `json:"client"`
+	UNITagged        *bool      `json:"uni_tagged"`
+	UNIVLAN          *uint16    `json:"uni_vlan"`
+	ANIVLAN          *uint16    `json:"ani_vlan"`
+	ProfileID        *uint16    `json:"profile_id"`
+	ACLRowKey        *uint16    `json:"acl_row_key"`
+	GEMPortID        *uint16    `json:"gem_port_id"`
+	ImputedBandwidth *uint32    `json:"imputed_bandwidth"`
+	TimeSinceJoin    *uint32    `json:"time_since_join"`
+	PreviewUntil     *time.Time `json:"preview_until,omitempty"`
+}
+
+type multicastPreviewResponse struct {
+	RowKey   *uint16 `json:"row_key"`
+	Duration *uint16 `json:"duration_minutes"`
+	TimeLeft *uint16 `json:"time_left_minutes"`
+}
+
+type multicastStateResponse struct {
+	SubscriberID      *uint16                     `json:"multicast_subscriber_id"`
+	MIBDataSync       *uint8                      `json:"mib_data_sync"`
+	CurrentBandwidth  *uint32                     `json:"current_bandwidth"`
+	JoinMessages      *uint32                     `json:"join_messages"`
+	BandwidthExceeded *uint32                     `json:"bandwidth_exceeded"`
+	Groups            *[]multicastGroupResponse   `json:"groups"`
+	AllowedPreviews   *[]multicastPreviewResponse `json:"allowed_previews"`
+}
+
 func (c ExecController) GEMPortCounters(portID uint16) (performance.GEMPortCounters, error) {
 	output, err := c.execute(controlRequest{Action: "gem-port-counters", GEMPortID: &portID})
 	if err != nil {
@@ -161,42 +192,11 @@ func (c ExecController) SubscriberMonitor(entityID uint16) (multicast.Monitor, e
 	if err != nil {
 		return multicast.Monitor{}, err
 	}
-	type groupResponse struct {
-		Source           *string    `json:"source"`
-		Group            *string    `json:"group"`
-		Client           *string    `json:"client"`
-		UNITagged        *bool      `json:"uni_tagged"`
-		UNIVLAN          *uint16    `json:"uni_vlan"`
-		ANIVLAN          *uint16    `json:"ani_vlan"`
-		ProfileID        *uint16    `json:"profile_id"`
-		ACLRowKey        *uint16    `json:"acl_row_key"`
-		GEMPortID        *uint16    `json:"gem_port_id"`
-		ImputedBandwidth *uint32    `json:"imputed_bandwidth"`
-		TimeSinceJoin    *uint32    `json:"time_since_join"`
-		PreviewUntil     *time.Time `json:"preview_until,omitempty"`
-	}
-	type response struct {
-		SubscriberID      *uint16          `json:"multicast_subscriber_id"`
-		CurrentBandwidth  *uint32          `json:"current_bandwidth"`
-		JoinMessages      *uint32          `json:"join_messages"`
-		BandwidthExceeded *uint32          `json:"bandwidth_exceeded"`
-		Groups            *[]groupResponse `json:"groups"`
-	}
-	decoder := json.NewDecoder(bytes.NewReader(output))
-	decoder.DisallowUnknownFields()
-	var value response
-	if err := decoder.Decode(&value); err != nil {
+	value, err := decodeMulticastState(output, entityID)
+	if err != nil {
 		return multicast.Monitor{}, fmt.Errorf("decode multicast subscriber monitor: %w", err)
 	}
-	var trailing interface{}
-	if err := decoder.Decode(&trailing); err != io.EOF {
-		if err == nil {
-			return multicast.Monitor{}, fmt.Errorf("decode multicast subscriber monitor: trailing JSON value")
-		}
-		return multicast.Monitor{}, fmt.Errorf("decode multicast subscriber monitor: %w", err)
-	}
-	if value.SubscriberID == nil || *value.SubscriberID != entityID ||
-		value.CurrentBandwidth == nil || value.JoinMessages == nil ||
+	if value.CurrentBandwidth == nil || value.JoinMessages == nil ||
 		value.BandwidthExceeded == nil || value.Groups == nil {
 		return multicast.Monitor{}, fmt.Errorf("decode multicast subscriber monitor: required or matching field is missing")
 	}
@@ -240,6 +240,66 @@ func (c ExecController) SubscriberMonitor(entityID uint16) (multicast.Monitor, e
 		result.Groups = append(result.Groups, active)
 	}
 	return result, nil
+}
+
+func (c ExecController) AllowedPreviewStatus(entityID uint16) (multicast.AllowedPreviewSnapshot, error) {
+	output, err := c.execute(controlRequest{
+		Action: "multicast-preview-status", MulticastSubscriberID: &entityID,
+	})
+	if err != nil {
+		return multicast.AllowedPreviewSnapshot{}, err
+	}
+	value, err := decodeMulticastState(output, entityID)
+	if err != nil {
+		return multicast.AllowedPreviewSnapshot{}, fmt.Errorf("decode multicast preview status: %w", err)
+	}
+	if value.MIBDataSync == nil || value.AllowedPreviews == nil {
+		return multicast.AllowedPreviewSnapshot{}, fmt.Errorf(
+			"decode multicast preview status: required field is missing")
+	}
+	result := multicast.AllowedPreviewSnapshot{MIBDataSync: *value.MIBDataSync,
+		Timers: make([]multicast.AllowedPreviewTimer, 0, len(*value.AllowedPreviews))}
+	seen := make(map[uint16]struct{}, len(*value.AllowedPreviews))
+	for index, timer := range *value.AllowedPreviews {
+		if timer.RowKey == nil || timer.Duration == nil || timer.TimeLeft == nil {
+			return multicast.AllowedPreviewSnapshot{}, fmt.Errorf(
+				"decode multicast preview status: timer %d is incomplete", index)
+		}
+		if *timer.RowKey > 1023 || (*timer.Duration == 0 && *timer.TimeLeft != 0) ||
+			(*timer.Duration != 0 && *timer.TimeLeft > *timer.Duration) {
+			return multicast.AllowedPreviewSnapshot{}, fmt.Errorf(
+				"decode multicast preview status: timer %d is invalid", index)
+		}
+		if _, duplicate := seen[*timer.RowKey]; duplicate {
+			return multicast.AllowedPreviewSnapshot{}, fmt.Errorf(
+				"decode multicast preview status: duplicate row key %d", *timer.RowKey)
+		}
+		seen[*timer.RowKey] = struct{}{}
+		result.Timers = append(result.Timers, multicast.AllowedPreviewTimer{
+			RowKey: *timer.RowKey, Duration: *timer.Duration, TimeLeft: *timer.TimeLeft,
+		})
+	}
+	return result, nil
+}
+
+func decodeMulticastState(output []byte, entityID uint16) (multicastStateResponse, error) {
+	decoder := json.NewDecoder(bytes.NewReader(output))
+	decoder.DisallowUnknownFields()
+	var value multicastStateResponse
+	if err := decoder.Decode(&value); err != nil {
+		return multicastStateResponse{}, err
+	}
+	var trailing interface{}
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return multicastStateResponse{}, fmt.Errorf("trailing JSON value")
+		}
+		return multicastStateResponse{}, err
+	}
+	if value.SubscriberID == nil || *value.SubscriberID != entityID {
+		return multicastStateResponse{}, fmt.Errorf("required or matching subscriber ID is missing")
+	}
+	return value, nil
 }
 
 func (c ExecController) SynchronizeTime(value time.Time) error {

@@ -4,6 +4,8 @@ package multicast
 
 import (
 	"context"
+	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"math"
 	"math/bits"
@@ -22,10 +24,15 @@ const (
 	multicastDownstreamChain = 2013
 	normalDownstreamChain    = 2012
 	proxyQueryMark           = 0xa17f0001
+	gponGEMMarkKey           = 0xa1700000
 )
 
 type CommandRunner interface {
 	Run(name string, arguments ...string) error
+}
+
+type OutputCommandRunner interface {
+	Output(name string, arguments ...string) ([]byte, error)
 }
 
 type ExecCommandRunner struct {
@@ -33,6 +40,11 @@ type ExecCommandRunner struct {
 }
 
 func (r ExecCommandRunner) Run(name string, arguments ...string) error {
+	_, err := r.Output(name, arguments...)
+	return err
+}
+
+func (r ExecCommandRunner) Output(name string, arguments ...string) ([]byte, error) {
 	timeout := r.Timeout
 	if timeout <= 0 {
 		timeout = 5 * time.Second
@@ -41,31 +53,40 @@ func (r ExecCommandRunner) Run(name string, arguments ...string) error {
 	defer cancel()
 	output, err := exec.CommandContext(ctx, name, arguments...).CombinedOutput()
 	if ctx.Err() != nil {
-		return fmt.Errorf("%s timed out: %w", name, ctx.Err())
+		return nil, fmt.Errorf("%s timed out: %w", name, ctx.Err())
 	}
 	if err != nil {
-		return fmt.Errorf("%s %v: %w: %s", name, arguments, err, output)
+		return nil, fmt.Errorf("%s %v: %w: %s", name, arguments, err, output)
 	}
-	return nil
+	return output, nil
 }
 
 type LinuxBackendOptions struct {
-	TC          string
-	Runner      CommandRunner
-	Sender      func(string, []byte) error
-	QuerySender func(string, []byte) error
+	TC           string
+	Runner       CommandRunner
+	Sender       func(string, []byte) error
+	MarkedSender func(string, []byte, uint32) error
+	QuerySender  func(string, []byte) error
+	PON          string
+	Now          func() time.Time
 }
 
 type LinuxBackend struct {
 	mu sync.Mutex
 
-	tc          string
-	runner      CommandRunner
-	sender      func(string, []byte) error
-	querySender func(string, []byte) error
-	control     map[string][]downstreamRule
-	static      map[string][]downstreamRule
-	dynamic     map[dynamicRuleKey]downstreamRule
+	tc           string
+	runner       CommandRunner
+	output       OutputCommandRunner
+	sender       func(string, []byte) error
+	markedSender func(string, []byte, uint32) error
+	querySender  func(string, []byte) error
+	pon          string
+	control      map[string][]downstreamRule
+	static       map[string][]downstreamRule
+	dynamic      map[dynamicRuleKey]downstreamRule
+	filters      map[dynamicRuleKey][]tcFilterRef
+	baselines    map[dynamicRuleKey]bandwidthBaseline
+	now          func() time.Time
 }
 
 type downstreamRule struct {
@@ -78,12 +99,27 @@ type downstreamRule struct {
 	profile       Profile
 }
 
+type installedDownstreamRule struct {
+	rule       downstreamRule
+	dynamicKey *dynamicRuleKey
+}
+
 type dynamicRuleKey struct {
 	subscriberID  uint16
 	interfaceName string
 	source        netip.Addr
 	group         netip.Addr
 	uniVLAN       VLAN
+}
+
+type tcFilterRef struct {
+	interfaceName string
+	preference    int
+}
+
+type bandwidthBaseline struct {
+	bytes uint64
+	at    time.Time
 }
 
 func NewLinuxBackend(options LinuxBackendOptions) *LinuxBackend {
@@ -93,18 +129,30 @@ func NewLinuxBackend(options LinuxBackendOptions) *LinuxBackend {
 	if options.Runner == nil {
 		options.Runner = ExecCommandRunner{}
 	}
+	output, _ := options.Runner.(OutputCommandRunner)
 	if options.Sender == nil {
 		options.Sender = sendEthernetFrame
+	}
+	if options.MarkedSender == nil {
+		options.MarkedSender = sendEthernetFrameMarked
 	}
 	if options.QuerySender == nil {
 		options.QuerySender = func(interfaceName string, frame []byte) error {
 			return sendEthernetFrameMarked(interfaceName, frame, proxyQueryMark)
 		}
 	}
+	if options.Now == nil {
+		options.Now = time.Now
+	}
+	if options.PON == "" {
+		options.PON = "pon"
+	}
 	return &LinuxBackend{tc: options.TC, runner: options.Runner, sender: options.Sender,
-		querySender: options.QuerySender,
-		control:     make(map[string][]downstreamRule), static: make(map[string][]downstreamRule),
-		dynamic: make(map[dynamicRuleKey]downstreamRule)}
+		output: output, markedSender: options.MarkedSender, querySender: options.QuerySender,
+		pon: options.PON, now: options.Now,
+		control: make(map[string][]downstreamRule), static: make(map[string][]downstreamRule),
+		dynamic: make(map[dynamicRuleKey]downstreamRule),
+		filters: make(map[dynamicRuleKey][]tcFilterRef), baselines: make(map[dynamicRuleKey]bandwidthBaseline)}
 }
 
 func (b *LinuxBackend) Configure(config Config) error {
@@ -121,9 +169,19 @@ func (b *LinuxBackend) Configure(config Config) error {
 	candidateControl := make(map[string][]downstreamRule)
 	for _, subscriber := range config.Subscribers {
 		for _, attachment := range subscriber.Attachments {
-			if attachment.BridgeEntity == 0 {
+			if attachment.BridgeEntity == 0 && attachment.DirectMapper == nil {
 				return fmt.Errorf("multicast subscriber %#x attachment %s has no ANI bridge endpoint",
 					subscriber.EntityID, attachment.Interface)
+			}
+			if attachment.BridgeEntity != 0 && attachment.DirectMapper != nil {
+				return fmt.Errorf("multicast subscriber %#x attachment %s has both bridge and direct mapper paths",
+					subscriber.EntityID, attachment.Interface)
+			}
+			if attachment.DirectMapper != nil {
+				if err := validateUpstreamMapper(attachment.DirectMapper); err != nil {
+					return fmt.Errorf("multicast subscriber %#x attachment %s: %w",
+						subscriber.EntityID, attachment.Interface, err)
+				}
 			}
 			if len(subscriber.ServicePackages) == 0 {
 				profile := profiles[subscriber.Profile]
@@ -176,17 +234,27 @@ func (b *LinuxBackend) Configure(config Config) error {
 	return nil
 }
 
+func validateUpstreamMapper(mapper *UpstreamMapper) error {
+	if mapper == nil || mapper.UnmarkedFrameOption > 1 || mapper.DefaultPBit > 7 {
+		return fmt.Errorf("invalid direct mapper policy")
+	}
+	for priority, gemPortID := range mapper.GEMPortIDs {
+		if gemPortID > 4095 && gemPortID != math.MaxUint16 {
+			return fmt.Errorf("direct mapper P-bit %d has invalid GEM %d", priority, gemPortID)
+		}
+	}
+	for dscp, priority := range mapper.DSCPToPBit {
+		if priority > 7 {
+			return fmt.Errorf("direct mapper DSCP %d has invalid P-bit %d", dscp, priority)
+		}
+	}
+	return nil
+}
+
 func validateDownstreamProfile(profile Profile) error {
 	if profile.DownstreamTagControl > 7 {
 		return fmt.Errorf("multicast profile %#x has invalid downstream tag control %d",
 			profile.EntityID, profile.DownstreamTagControl)
-	}
-	// The tc vlan action cannot set DEI. Passing such a profile through would
-	// silently emit a different TCI, so reject it at the backend boundary.
-	if profile.DownstreamTagControl >= 2 && profile.DownstreamTagControl <= 5 &&
-		profile.DownstreamTCI&0x1000 != 0 {
-		return fmt.Errorf("multicast profile %#x downstream DEI requires a native VLAN action",
-			profile.EntityID)
 	}
 	return nil
 }
@@ -265,13 +333,74 @@ func (b *LinuxBackend) SendReport(report UpstreamReport) error {
 		return err
 	}
 	if report.Attachment.BridgeEntity == 0 {
-		return fmt.Errorf("multicast attachment %s has no ANI bridge endpoint", report.Attachment.Interface)
+		if report.Attachment.DirectMapper == nil {
+			return fmt.Errorf("multicast attachment %s has no ANI bridge endpoint or direct mapper",
+				report.Attachment.Interface)
+		}
+		gemPortID, err := directMapperGEM(report.Attachment.DirectMapper, frame)
+		if err != nil {
+			return fmt.Errorf("select upstream multicast report GEM on %s: %w",
+				report.Attachment.Interface, err)
+		}
+		mark := uint32(gponGEMMarkKey | uint32(gemPortID))
+		if err := b.markedSender(b.pon, frame, mark); err != nil {
+			return fmt.Errorf("send report on %s GEM %d: %w", b.pon, gemPortID, err)
+		}
+		return nil
 	}
 	ani := fmt.Sprintf("oma%04x", report.Attachment.BridgeEntity)
 	if err := b.sender(ani, frame); err != nil {
 		return fmt.Errorf("send report on %s: %w", ani, err)
 	}
 	return nil
+}
+
+func directMapperGEM(mapper *UpstreamMapper, frame []byte) (uint16, error) {
+	if mapper == nil || mapper.UnmarkedFrameOption > 1 || mapper.DefaultPBit > 7 {
+		return 0, fmt.Errorf("invalid direct mapper policy")
+	}
+	if len(frame) < 14 {
+		return 0, fmt.Errorf("short Ethernet frame")
+	}
+	etherType := binary.BigEndian.Uint16(frame[12:14])
+	offset := 14
+	var priority uint8
+	if etherType == 0x8100 || etherType == 0x88a8 || etherType == 0x9100 {
+		if len(frame) < 18 {
+			return 0, fmt.Errorf("short tagged Ethernet frame")
+		}
+		priority = uint8(binary.BigEndian.Uint16(frame[14:16]) >> 13)
+	} else if mapper.UnmarkedFrameOption == 1 {
+		priority = mapper.DefaultPBit
+	} else {
+		var dscp uint8
+		switch etherType {
+		case 0x0800:
+			if len(frame) < offset+2 {
+				return 0, fmt.Errorf("short IPv4 frame")
+			}
+			dscp = frame[offset+1] >> 2
+		case 0x86dd:
+			if len(frame) < offset+2 {
+				return 0, fmt.Errorf("short IPv6 frame")
+			}
+			trafficClass := (frame[offset]&0x0f)<<4 | frame[offset+1]>>4
+			dscp = trafficClass >> 2
+		default:
+			priority = 0
+		}
+		if etherType == 0x0800 || etherType == 0x86dd {
+			priority = mapper.DSCPToPBit[dscp]
+		}
+	}
+	if priority > 7 {
+		return 0, fmt.Errorf("mapper selected invalid P-bit %d", priority)
+	}
+	gemPortID := mapper.GEMPortIDs[priority]
+	if gemPortID > 4095 {
+		return 0, fmt.Errorf("P-bit %d has no upstream GEM", priority)
+	}
+	return gemPortID, nil
 }
 
 func (b *LinuxBackend) SendQuery(query DownstreamQuery) error {
@@ -331,23 +460,41 @@ func (b *LinuxBackend) rebuildLocked(interfaceName string) error {
 		}
 	}
 
-	rules := append([]downstreamRule(nil), b.static[interfaceName]...)
+	// Active exact-match rules precede static ranges. Besides making their byte
+	// counters observable, this prevents a broad static ACL from consuming a
+	// packet before the per-stream class-311 accounting rule sees it.
+	rules := make([]installedDownstreamRule, 0, len(b.dynamic)+len(b.static[interfaceName]))
 	for key, rule := range b.dynamic {
 		if key.interfaceName == interfaceName {
-			rules = append(rules, rule)
+			keyCopy := key
+			rules = append(rules, installedDownstreamRule{rule: rule, dynamicKey: &keyCopy})
 		}
 	}
+	for _, rule := range b.static[interfaceName] {
+		rules = append(rules, installedDownstreamRule{rule: rule})
+	}
 	sort.Slice(rules, func(i, j int) bool {
-		if comparison := rules[i].start.Compare(rules[j].start); comparison != 0 {
+		if (rules[i].dynamicKey != nil) != (rules[j].dynamicKey != nil) {
+			return rules[i].dynamicKey != nil
+		}
+		if comparison := rules[i].rule.start.Compare(rules[j].rule.start); comparison != 0 {
 			return comparison < 0
 		}
-		if comparison := rules[i].source.Compare(rules[j].source); comparison != 0 {
+		if comparison := rules[i].rule.source.Compare(rules[j].rule.source); comparison != 0 {
 			return comparison < 0
 		}
-		return rules[i].profile.EntityID < rules[j].profile.EntityID
+		if rules[i].rule.profile.EntityID != rules[j].rule.profile.EntityID {
+			return rules[i].rule.profile.EntityID < rules[j].rule.profile.EntityID
+		}
+		if rules[i].dynamicKey != nil && rules[j].dynamicKey != nil {
+			return dynamicRuleKeyLess(*rules[i].dynamicKey, *rules[j].dynamicKey)
+		}
+		return false
 	})
 	preference = 1000
-	for _, rule := range rules {
+	installedFilters := make(map[dynamicRuleKey][]tcFilterRef)
+	for _, installed := range rules {
+		rule := installed.rule
 		prefixes, err := addressRangePrefixes(rule.start, rule.stop)
 		if err != nil {
 			return err
@@ -363,6 +510,10 @@ func (b *LinuxBackend) rebuildLocked(interfaceName string) error {
 				if err := b.runner.Run(b.tc, arguments...); err != nil {
 					return err
 				}
+				if installed.dynamicKey != nil {
+					installedFilters[*installed.dynamicKey] = append(installedFilters[*installed.dynamicKey],
+						tcFilterRef{interfaceName: interfaceName, preference: preference})
+				}
 				preference++
 				if preference >= 64000 {
 					return fmt.Errorf("multicast filter count exceeds tc preference space")
@@ -370,9 +521,173 @@ func (b *LinuxBackend) rebuildLocked(interfaceName string) error {
 			}
 		}
 	}
-	return b.runner.Run(b.tc, "filter", "replace", "dev", interfaceName, "egress",
+	if err := b.runner.Run(b.tc, "filter", "replace", "dev", interfaceName, "egress",
 		"chain", strconv.Itoa(multicastDownstreamChain), "protocol", "all", "pref", "65000",
-		"flower", "skip_hw", "action", "drop")
+		"flower", "skip_hw", "action", "drop"); err != nil {
+		return err
+	}
+	for key := range b.filters {
+		if key.interfaceName == interfaceName {
+			delete(b.filters, key)
+		}
+	}
+	for key := range b.baselines {
+		if key.interfaceName == interfaceName {
+			delete(b.baselines, key)
+		}
+	}
+	for key, references := range installedFilters {
+		b.filters[key] = references
+	}
+	return nil
+}
+
+func dynamicRuleKeyLess(left, right dynamicRuleKey) bool {
+	if left.subscriberID != right.subscriberID {
+		return left.subscriberID < right.subscriberID
+	}
+	if comparison := left.group.Compare(right.group); comparison != 0 {
+		return comparison < 0
+	}
+	if comparison := left.source.Compare(right.source); comparison != 0 {
+		return comparison < 0
+	}
+	if left.uniVLAN.Tagged != right.uniVLAN.Tagged {
+		return !left.uniVLAN.Tagged
+	}
+	return left.uniVLAN.ID < right.uniVLAN.ID
+}
+
+// SampleBandwidth reads the byte counters of the exact-match rules installed
+// for active streams. Multiple VLAN protocol/tag variants are summed before a
+// byte-per-second rate is derived. The first read after every chain rebuild is
+// a baseline and intentionally produces no sample.
+func (b *LinuxBackend) SampleBandwidth() (map[BandwidthKey]uint32, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	result := make(map[BandwidthKey]uint32)
+	if b.output == nil || len(b.filters) == 0 {
+		return result, nil
+	}
+	interfaces := make(map[string]struct{})
+	for _, references := range b.filters {
+		for _, reference := range references {
+			interfaces[reference.interfaceName] = struct{}{}
+		}
+	}
+	names := make([]string, 0, len(interfaces))
+	for interfaceName := range interfaces {
+		names = append(names, interfaceName)
+	}
+	sort.Strings(names)
+	counters := make(map[string]map[int]uint64, len(names))
+	for _, interfaceName := range names {
+		output, err := b.output.Output(b.tc, "-j", "-s", "filter", "show", "dev",
+			interfaceName, "egress", "chain", strconv.Itoa(multicastDownstreamChain))
+		if err != nil {
+			return nil, fmt.Errorf("read multicast filter counters on %s: %w", interfaceName, err)
+		}
+		parsed, err := tcFilterByteCounters(output)
+		if err != nil {
+			return nil, fmt.Errorf("decode multicast filter counters on %s: %w", interfaceName, err)
+		}
+		counters[interfaceName] = parsed
+	}
+	now := b.now()
+	for key, references := range b.filters {
+		var total uint64
+		for _, reference := range references {
+			value, exists := counters[reference.interfaceName][reference.preference]
+			if !exists {
+				return nil, fmt.Errorf("multicast filter preference %d is missing on %s",
+					reference.preference, reference.interfaceName)
+			}
+			if math.MaxUint64-total < value {
+				total = math.MaxUint64
+			} else {
+				total += value
+			}
+		}
+		previous, exists := b.baselines[key]
+		if !exists || total < previous.bytes {
+			b.baselines[key] = bandwidthBaseline{bytes: total, at: now}
+			continue
+		}
+		if !now.After(previous.at) {
+			continue
+		}
+		seconds := now.Sub(previous.at).Seconds()
+		rate := float64(total-previous.bytes) / seconds
+		var value uint32
+		if rate >= float64(math.MaxUint32) {
+			value = math.MaxUint32
+		} else {
+			value = uint32(rate)
+		}
+		result[BandwidthKey{SubscriberID: key.subscriberID, Interface: key.interfaceName,
+			Source: key.source, Group: key.group, UNIVLAN: key.uniVLAN}] = value
+		b.baselines[key] = bandwidthBaseline{bytes: total, at: now}
+	}
+	return result, nil
+}
+
+func tcFilterByteCounters(document []byte) (map[int]uint64, error) {
+	type action struct {
+		Stats *struct {
+			Bytes *uint64 `json:"bytes"`
+		} `json:"stats"`
+	}
+	type filter struct {
+		Preference json.RawMessage `json:"pref"`
+		Options    struct {
+			Actions []action `json:"actions"`
+		} `json:"options"`
+	}
+	var filters []filter
+	if err := json.Unmarshal(document, &filters); err != nil {
+		return nil, err
+	}
+	result := make(map[int]uint64, len(filters))
+	for _, filter := range filters {
+		preference, err := tcPreference(filter.Preference)
+		if err != nil {
+			return nil, err
+		}
+		var bytes *uint64
+		for _, candidate := range filter.Options.Actions {
+			if candidate.Stats != nil && candidate.Stats.Bytes != nil {
+				bytes = candidate.Stats.Bytes
+				break
+			}
+		}
+		if bytes == nil {
+			// iproute2 emits a short protocol/preference header immediately
+			// before the detailed filter object. Only the latter owns stats.
+			continue
+		}
+		if math.MaxUint64-result[preference] < *bytes {
+			result[preference] = math.MaxUint64
+		} else {
+			result[preference] += *bytes
+		}
+	}
+	return result, nil
+}
+
+func tcPreference(value json.RawMessage) (int, error) {
+	var numeric uint32
+	if err := json.Unmarshal(value, &numeric); err == nil {
+		return int(numeric), nil
+	}
+	var text string
+	if err := json.Unmarshal(value, &text); err == nil {
+		parsed, parseErr := strconv.ParseUint(text, 0, 32)
+		if parseErr == nil {
+			return int(parsed), nil
+		}
+	}
+	return 0, fmt.Errorf("filter has invalid preference %s", value)
 }
 
 func downstreamControlFilterArguments(interfaceName string, preference int, rule downstreamRule,
@@ -485,10 +800,13 @@ func downstreamActions(profile Profile, uniVLAN VLAN, tagged bool) ([]string, er
 	}
 	vid := strconv.Itoa(int(tci & 0x0fff))
 	priority := strconv.Itoa(int(tci >> 13 & 7))
+	dei := strconv.Itoa(int(tci >> 12 & 1))
 	push := []string{"action", "vlan", "push", "protocol", "802.1Q", "id", vid,
-		"priority", priority, "pipe", "action", "pass"}
+		"priority", priority, "dei", dei, "pipe", "action", "pass"}
 	modify := []string{"action", "vlan", "modify", "id", vid,
-		"priority", priority, "pipe", "action", "pass"}
+		"priority", priority, "dei", dei, "pipe", "action", "pass"}
+	pushVID := []string{"action", "vlan", "push", "protocol", "802.1Q", "id", vid,
+		"pipe", "action", "pass"}
 	switch control {
 	case 0:
 		return []string{"action", "goto", "chain", strconv.Itoa(normalDownstreamChain)}, nil
@@ -508,7 +826,7 @@ func downstreamActions(profile Profile, uniVLAN VLAN, tagged bool) ([]string, er
 		if tagged {
 			return []string{"action", "vlan", "modify", "id", vid, "pipe", "action", "pass"}, nil
 		}
-		return push, nil
+		return pushVID, nil
 	default:
 		return nil, fmt.Errorf("invalid downstream multicast tag control %d", control)
 	}

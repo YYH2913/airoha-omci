@@ -50,12 +50,20 @@ type monitorGroup struct {
 	PreviewUntil     *time.Time `json:"preview_until,omitempty"`
 }
 
+type previewTimer struct {
+	RowKey   uint16 `json:"row_key"`
+	Duration uint16 `json:"duration_minutes"`
+	TimeLeft uint16 `json:"time_left_minutes"`
+}
+
 type monitorDocument struct {
 	SubscriberID      uint16         `json:"multicast_subscriber_id"`
+	MIBDataSync       uint8          `json:"mib_data_sync"`
 	CurrentBandwidth  uint32         `json:"current_bandwidth"`
 	JoinMessages      uint32         `json:"join_messages"`
 	BandwidthExceeded uint32         `json:"bandwidth_exceeded"`
 	Groups            []monitorGroup `json:"groups"`
+	AllowedPreviews   []previewTimer `json:"allowed_previews"`
 }
 
 func main() {
@@ -109,6 +117,7 @@ func run(opts options) error {
 	expiry := time.NewTicker(100 * time.Millisecond)
 	defer expiry.Stop()
 	var applied [sha256.Size]byte
+	var appliedMIBDataSync uint8
 	loaded := false
 	reload := func() {
 		document, err := os.ReadFile(opts.desired)
@@ -136,25 +145,37 @@ func run(opts options) error {
 			log.Printf("apply desired multicast policy: %v", err)
 			return
 		}
-		applied, loaded = digest, true
+		applied, appliedMIBDataSync, loaded = digest, request.MIBDataSync, true
 		log.Printf("applied multicast policy MIB data sync %d on %v",
 			request.MIBDataSync, runtime.Interfaces())
-		if err := publishMonitors(opts.stateDir, runtime); err != nil {
+		if err := publishMonitors(opts.stateDir, runtime, appliedMIBDataSync); err != nil {
 			log.Printf("publish multicast monitors: %v", err)
 		}
 	}
 	reload()
+	if err := runtime.SampleBandwidth(); err != nil {
+		log.Printf("sample multicast bandwidth: %v", err)
+	}
+	if err := publishMonitors(opts.stateDir, runtime, appliedMIBDataSync); err != nil {
+		log.Printf("publish multicast monitors: %v", err)
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
 			reload()
+			if err := runtime.SampleBandwidth(); err != nil {
+				log.Printf("sample multicast bandwidth: %v", err)
+			}
+			if err := publishMonitors(opts.stateDir, runtime, appliedMIBDataSync); err != nil {
+				log.Printf("publish multicast monitors: %v", err)
+			}
 		case <-expiry.C:
 			if err := runtime.Expire(); err != nil {
 				log.Printf("advance multicast timers: %v", err)
 			}
-			if err := publishMonitors(opts.stateDir, runtime); err != nil {
+			if err := publishMonitors(opts.stateDir, runtime, appliedMIBDataSync); err != nil {
 				log.Printf("publish multicast monitors: %v", err)
 			}
 		}
@@ -229,7 +250,7 @@ type discardRunner struct{}
 
 func (discardRunner) Run(string, ...string) error { return nil }
 
-func publishMonitors(directory string, runtime *multicast.Runtime) error {
+func publishMonitors(directory string, runtime *multicast.Runtime, mibDataSync uint8) error {
 	if err := os.MkdirAll(directory, 0o755); err != nil {
 		return err
 	}
@@ -237,10 +258,11 @@ func publishMonitors(directory string, runtime *multicast.Runtime) error {
 	for _, entityID := range runtime.SubscriberIDs() {
 		active[entityID] = struct{}{}
 		monitor := runtime.Monitor(entityID)
-		document := monitorDocument{SubscriberID: entityID,
+		document := monitorDocument{SubscriberID: entityID, MIBDataSync: mibDataSync,
 			CurrentBandwidth: monitor.CurrentBandwidth, JoinMessages: monitor.JoinMessages,
 			BandwidthExceeded: monitor.BandwidthExceeded,
-			Groups:            make([]monitorGroup, 0, len(monitor.Groups))}
+			Groups:            make([]monitorGroup, 0, len(monitor.Groups)),
+			AllowedPreviews:   make([]previewTimer, 0)}
 		for _, group := range monitor.Groups {
 			value := monitorGroup{Source: group.Source.String(), Group: group.Group.String(),
 				Client: group.Client.String(), UNITagged: group.UNIVLAN.Tagged,
@@ -252,6 +274,11 @@ func publishMonitors(directory string, runtime *multicast.Runtime) error {
 				value.PreviewUntil = &expires
 			}
 			document.Groups = append(document.Groups, value)
+		}
+		for _, timer := range runtime.AllowedPreviewTimers(entityID) {
+			document.AllowedPreviews = append(document.AllowedPreviews, previewTimer{
+				RowKey: timer.RowKey, Duration: timer.Duration, TimeLeft: timer.TimeLeft,
+			})
 		}
 		if err := writeAtomicJSON(filepath.Join(directory, strconv.Itoa(int(entityID))+".json"), document); err != nil {
 			return err

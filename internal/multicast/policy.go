@@ -76,6 +76,17 @@ type Attachment struct {
 	Interface        string
 	BridgeEntity     uint16
 	BridgePortEntity uint16
+	DirectMapper     *UpstreamMapper
+}
+
+// UpstreamMapper is the resolved, platform-neutral subset of class 130 needed
+// to inject an IGMP/MLD report directly into the PON netdev with the GEM mark
+// expected by the Airoha data path.
+type UpstreamMapper struct {
+	GEMPortIDs          [8]uint16
+	UnmarkedFrameOption uint8
+	DefaultPBit         uint8
+	DSCPToPBit          [64]uint8
 }
 
 type Subscriber struct {
@@ -153,10 +164,31 @@ type Monitor struct {
 	Groups            []ActiveGroup
 }
 
+// AllowedPreviewTimer is the ONU-owned live portion of one class-310 allowed
+// preview row. TimeLeft is rounded up to whole minutes until the deadline and
+// becomes zero only when the logical row has expired.
+type AllowedPreviewTimer struct {
+	RowKey   uint16
+	Duration uint16
+	TimeLeft uint16
+}
+
+type AllowedPreviewSnapshot struct {
+	MIBDataSync uint8
+	Timers      []AllowedPreviewTimer
+}
+
 // Controller supplies the live class-311 view maintained by the native
 // IGMP/MLD runtime.
 type Controller interface {
 	SubscriberMonitor(entityID uint16) (Monitor, error)
+}
+
+// PreviewController supplies the live ONU-owned time-left field for class 310.
+// It is separate from Controller so a platform may expose class-311 monitoring
+// before it implements allowed-preview timer synchronization.
+type PreviewController interface {
+	AllowedPreviewStatus(entityID uint16) (AllowedPreviewSnapshot, error)
 }
 
 type compiledConfig struct {
@@ -232,6 +264,37 @@ func New(config Config, now func() time.Time) (*Engine, error) {
 		now: now, config: compiled, state: make(map[uint16]*subscriberState),
 		previews: make(map[previewKey]previewState),
 	}, nil
+}
+
+// preserveAllowedPreviewExpiries carries exact deadlines across a policy
+// reload when the complete class-310 row is unchanged. Without this, an
+// unrelated MIB update would restart every preview timer from its originally
+// committed, minute-granularity time-left value.
+func (e *Engine) preserveAllowedPreviewExpiries(previous *Engine) {
+	if previous == nil {
+		return
+	}
+	previous.mu.Lock()
+	defer previous.mu.Unlock()
+	for entityID, current := range e.config.subscribers {
+		old, exists := previous.config.subscribers[entityID]
+		if !exists {
+			continue
+		}
+		oldRows := make(map[uint16]AllowedPreview, len(old.AllowedPreviews))
+		for _, preview := range old.AllowedPreviews {
+			oldRows[preview.RowKey] = preview
+		}
+		for _, preview := range current.AllowedPreviews {
+			if oldRows[preview.RowKey] != preview {
+				continue
+			}
+			if deadline, timed := old.previewExpiry[preview.RowKey]; timed {
+				current.previewExpiry[preview.RowKey] = deadline
+			}
+		}
+		e.config.subscribers[entityID] = current
+	}
 }
 
 func compile(config Config, now time.Time) (compiledConfig, error) {
@@ -798,5 +861,35 @@ func (e *Engine) Monitor(subscriberID uint16) Monitor {
 		}
 		return result.Groups[i].Client.Compare(result.Groups[j].Client) < 0
 	})
+	return result
+}
+
+// AllowedPreviewTimers returns every configured class-310 timer, including
+// expired rows with a zero value. Keeping expired row keys visible lets omcid
+// delete both row parts transactionally from its MIB and desired platform graph.
+func (e *Engine) AllowedPreviewTimers(subscriberID uint16) []AllowedPreviewTimer {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	subscriber, exists := e.config.subscribers[subscriberID]
+	if !exists {
+		return nil
+	}
+	now := e.now()
+	result := make([]AllowedPreviewTimer, 0, len(subscriber.AllowedPreviews))
+	for _, preview := range subscriber.AllowedPreviews {
+		timer := AllowedPreviewTimer{RowKey: preview.RowKey, Duration: preview.Duration}
+		if deadline, timed := subscriber.previewExpiry[preview.RowKey]; timed && deadline.After(now) {
+			remaining := deadline.Sub(now)
+			minutes := (remaining + time.Minute - 1) / time.Minute
+			if minutes > time.Duration(math.MaxUint16) {
+				timer.TimeLeft = math.MaxUint16
+			} else {
+				timer.TimeLeft = uint16(minutes)
+			}
+		}
+		result = append(result, timer)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].RowKey < result[j].RowKey })
 	return result
 }

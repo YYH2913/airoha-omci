@@ -32,6 +32,14 @@ func TestDecodeApplyRequestIsStrict(t *testing.T) {
 	}
 }
 
+func TestDecodeApplyRequestAcceptsAutonomousOperation(t *testing.T) {
+	document := `{"version":4,"operation":"autonomous","mib_data_sync":9,"service_graph":{"unis":[],"tconts":[],"traffic_descriptors":[],"gem_ports":[],"gem_interworking":[],"multicast_gem_interworking":[],"multicast_operations_profiles":[],"multicast_subscribers":[],"pbit_mappers":[],"bridges":[],"vlan_filters":[],"vlan_operations":[],"extended_vlans":[]}}`
+	request, err := DecodeApplyRequest(bytes.NewBufferString(document))
+	if err != nil || request.Operation != mib.OperationAutonomous || request.MIBDataSync != 9 {
+		t.Fatalf("DecodeApplyRequest(autonomous) = %#v, %v", request, err)
+	}
+}
+
 func TestExecApplierPassesCandidateAsJSON(t *testing.T) {
 	directory := t.TempDir()
 	output := filepath.Join(directory, "change.json")

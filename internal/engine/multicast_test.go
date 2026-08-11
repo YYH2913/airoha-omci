@@ -16,14 +16,23 @@ import (
 
 type recordingMulticastController struct {
 	*recordingController
-	entity  uint16
-	monitor multicast.Monitor
-	err     error
+	entity          uint16
+	monitor         multicast.Monitor
+	err             error
+	preview         multicast.AllowedPreviewSnapshot
+	previewErr      error
+	previewRequests int
 }
 
 func (c *recordingMulticastController) SubscriberMonitor(entityID uint16) (multicast.Monitor, error) {
 	c.entity = entityID
 	return c.monitor, c.err
+}
+
+func (c *recordingMulticastController) AllowedPreviewStatus(entityID uint16) (multicast.AllowedPreviewSnapshot, error) {
+	c.entity = entityID
+	c.previewRequests++
+	return c.preview, c.previewErr
 }
 
 func TestGetMulticastSubscriberMonitorUsesLiveBackend(t *testing.T) {
@@ -136,6 +145,139 @@ func TestGetMulticastMonitorReportsBackendFailure(t *testing.T) {
 	if response.Result != me.ProcessingError || response.AttributeMask != 0 {
 		t.Fatalf("failed multicast monitor response = %#v", response)
 	}
+}
+
+func TestAllowedPreviewGetUsesLiveTimerAndGetNextSnapshot(t *testing.T) {
+	controller := &recordingMulticastController{recordingController: &recordingController{}}
+	protocol, store, _ := newAllowedPreviewEngine(t, controller, nil)
+	controller.preview = multicast.AllowedPreviewSnapshot{
+		MIBDataSync: store.DataSync(),
+		Timers:      []multicast.AllowedPreviewTimer{{RowKey: 7, Duration: 60, TimeLeft: 23}},
+	}
+	request := encodeRequestForDevice(t, 0x720, omci.GetRequestType, &omci.GetRequest{
+		MeBasePacket: omci.MeBasePacket{
+			EntityClass: me.MulticastSubscriberConfigInfoClassID, EntityInstance: 0x500, Extended: true,
+		},
+		AttributeMask: multicastSubscriberAllowedPreviewMask,
+	}, omci.ExtendedIdent)
+	encoded, err := protocol.Handle(request)
+	if err != nil {
+		t.Fatalf("Handle(Get allowed-preview table) error = %v", err)
+	}
+	response := decodeResponse(t, encoded).Layer(omci.LayerTypeGetResponse).(*omci.GetResponse)
+	if response.Result != me.Success ||
+		response.Attributes[me.MulticastSubscriberConfigInfo_AllowedPreviewGroupsTable] != uint32(44) {
+		t.Fatalf("allowed-preview Get response = %#v", response)
+	}
+
+	controller.preview.Timers[0].TimeLeft = 22
+	next := encodeRequestForDevice(t, 0x721, omci.GetNextRequestType, &omci.GetNextRequest{
+		MeBasePacket: omci.MeBasePacket{
+			EntityClass: me.MulticastSubscriberConfigInfoClassID, EntityInstance: 0x500, Extended: true,
+		},
+		AttributeMask: multicastSubscriberAllowedPreviewMask,
+	}, omci.ExtendedIdent)
+	encoded, err = protocol.Handle(next)
+	if err != nil {
+		t.Fatalf("Handle(GetNext allowed-preview table) error = %v", err)
+	}
+	nextResponse := decodeResponse(t, encoded).Layer(omci.LayerTypeGetNextResponse).(*omci.GetNextResponse)
+	rows, ok := nextResponse.Attributes[me.MulticastSubscriberConfigInfo_AllowedPreviewGroupsTable].([]byte)
+	if !ok || len(rows) != 44 || binary.BigEndian.Uint16(rows[42:44]) != 23 {
+		t.Fatalf("allowed-preview GetNext rows = %x", rows)
+	}
+	if controller.previewRequests != 1 {
+		t.Fatalf("GetNext refreshed live timer %d times, want one Get-time snapshot", controller.previewRequests)
+	}
+	committed, err := store.Get(mib.Key{
+		ClassID: me.MulticastSubscriberConfigInfoClassID, EntityID: 0x500,
+	}, multicastSubscriberAllowedPreviewMask)
+	if err != nil {
+		t.Fatalf("Get(committed allowed-preview table) error = %v", err)
+	}
+	committedRows := committed.Attributes[me.MulticastSubscriberConfigInfo_AllowedPreviewGroupsTable].(me.TableRows)
+	if binary.BigEndian.Uint16(committedRows.Rows[42:44]) != 60 {
+		t.Fatalf("live Get changed committed time left: %x", committedRows.Rows)
+	}
+}
+
+func TestAllowedPreviewPollIgnoresStaleStateAndExpiresWithoutDataSync(t *testing.T) {
+	controller := &recordingMulticastController{recordingController: &recordingController{}}
+	var changes []mib.Change
+	protocol, store, _ := newAllowedPreviewEngine(t, controller, mib.ApplyFunc(func(change mib.Change) error {
+		changes = append(changes, change)
+		return nil
+	}))
+	sync := store.DataSync()
+	changes = nil
+	controller.preview = multicast.AllowedPreviewSnapshot{
+		MIBDataSync: sync - 1,
+		Timers:      []multicast.AllowedPreviewTimer{{RowKey: 7, Duration: 60, TimeLeft: 0}},
+	}
+	if err := protocol.PollMulticast(); err != nil {
+		t.Fatalf("PollMulticast(stale) error = %v", err)
+	}
+	if len(changes) != 0 || allowedPreviewTableRows(t, store).NumRows != 2 {
+		t.Fatal("stale multicast runtime state expired the current MIB row")
+	}
+
+	controller.preview.MIBDataSync = sync
+	if err := protocol.PollMulticast(); err != nil {
+		t.Fatalf("PollMulticast(expired) error = %v", err)
+	}
+	if store.DataSync() != sync || allowedPreviewTableRows(t, store).NumRows != 0 ||
+		len(changes) != 1 || changes[0].Operation != mib.OperationAutonomous ||
+		changes[0].MIBDataSync != sync {
+		t.Fatalf("allowed-preview expiry state: sync=%d rows=%#v changes=%+v",
+			store.DataSync(), allowedPreviewTableRows(t, store), changes)
+	}
+}
+
+func newAllowedPreviewEngine(t *testing.T, controller Controller,
+	applier mib.Applier) (*Engine, *mib.Store, mib.Key) {
+	t.Helper()
+	store, err := mib.NewWithApplier([]mib.Instance{{
+		Key:        mib.Key{ClassID: me.OnuDataClassID, EntityID: 0},
+		Attributes: me.AttributeValueMap{me.OnuData_MibDataSync: uint8(0)},
+	}}, applier)
+	if err != nil {
+		t.Fatalf("mib.NewWithApplier() error = %v", err)
+	}
+	key := mib.Key{ClassID: me.MulticastSubscriberConfigInfoClassID, EntityID: 0x500}
+	if err := store.Create(key.ClassID, key.EntityID, me.AttributeValueMap{
+		me.MulticastSubscriberConfigInfo_MeType:                            uint8(0),
+		me.MulticastSubscriberConfigInfo_MulticastOperationsProfilePointer: uint16(0x700),
+	}); err != nil {
+		t.Fatalf("Create(multicast subscriber) error = %v", err)
+	}
+	part0 := make([]byte, 22)
+	binary.BigEndian.PutUint16(part0[:2], 1<<14|7)
+	copy(part0[14:18], []byte{192, 0, 2, 1})
+	binary.BigEndian.PutUint16(part0[18:20], 100)
+	binary.BigEndian.PutUint16(part0[20:22], 200)
+	part1 := make([]byte, 22)
+	binary.BigEndian.PutUint16(part1[:2], 1<<14|1<<11|7)
+	copy(part1[14:18], []byte{239, 1, 2, 3})
+	binary.BigEndian.PutUint16(part1[18:20], 60)
+	if err := store.SetTable(key, multicastSubscriberAllowedPreviewMask, me.AttributeValueMap{
+		me.MulticastSubscriberConfigInfo_AllowedPreviewGroupsTable: me.TableRows{
+			NumRows: 2, Rows: append(part0, part1...),
+		},
+	}); err != nil {
+		t.Fatalf("SetTable(allowed preview) error = %v", err)
+	}
+	return NewWithController(store, controller), store, key
+}
+
+func allowedPreviewTableRows(t *testing.T, store *mib.Store) me.TableRows {
+	t.Helper()
+	instance, err := store.Get(mib.Key{
+		ClassID: me.MulticastSubscriberConfigInfoClassID, EntityID: 0x500,
+	}, multicastSubscriberAllowedPreviewMask)
+	if err != nil {
+		t.Fatalf("Get(allowed-preview table) error = %v", err)
+	}
+	return instance.Attributes[me.MulticastSubscriberConfigInfo_AllowedPreviewGroupsTable].(me.TableRows)
 }
 
 func newMulticastMonitorEngine(t *testing.T, controller Controller, entityID uint16) *Engine {

@@ -579,6 +579,113 @@ func TestSetTableAllowedPreviewNormalizesTimeLeftAndDeletesParts(t *testing.T) {
 	}
 }
 
+func TestAllowedPreviewRuntimeOverlayAndAutonomousExpiry(t *testing.T) {
+	var changes []Change
+	store, err := NewWithApplier([]Instance{{
+		Key:        Key{ClassID: me.OnuDataClassID, EntityID: 0},
+		Attributes: me.AttributeValueMap{me.OnuData_MibDataSync: uint8(0)},
+	}}, ApplyFunc(func(change Change) error {
+		changes = append(changes, change)
+		return nil
+	}))
+	if err != nil {
+		t.Fatalf("NewWithApplier() error = %v", err)
+	}
+	key := Key{ClassID: me.MulticastSubscriberConfigInfoClassID, EntityID: 0x500}
+	if err := store.Create(key.ClassID, key.EntityID, me.AttributeValueMap{
+		me.MulticastSubscriberConfigInfo_MeType:                            uint8(0),
+		me.MulticastSubscriberConfigInfo_MulticastOperationsProfilePointer: uint16(0x700),
+	}); err != nil {
+		t.Fatalf("Create(multicast subscriber) error = %v", err)
+	}
+	timed := append(allowedPreviewPart0(1, 7, []byte{192, 0, 2, 1}, 100, 200),
+		allowedPreviewPart1(1, 7, []byte{239, 1, 2, 3}, 60, 999)...)
+	untimed := append(allowedPreviewPart0(1, 9, nil, 101, 201),
+		allowedPreviewPart1(1, 9, []byte{239, 1, 2, 4}, 0, 999)...)
+	setTable(t, store, key, 0x0200,
+		me.MulticastSubscriberConfigInfo_AllowedPreviewGroupsTable, append(timed, untimed...))
+	sync := store.DataSync()
+
+	instance, err := store.Get(key, 0x0200)
+	if err != nil {
+		t.Fatalf("Get(allowed preview) error = %v", err)
+	}
+	overlay, err := OverlayAllowedPreviewTimers(instance, []AllowedPreviewTimer{
+		{RowKey: 7, Duration: 60, TimeLeft: 23},
+		{RowKey: 9, Duration: 0, TimeLeft: 0},
+	})
+	if err != nil {
+		t.Fatalf("OverlayAllowedPreviewTimers() error = %v", err)
+	}
+	overlayRows := overlay.Attributes[me.MulticastSubscriberConfigInfo_AllowedPreviewGroupsTable].(me.TableRows)
+	if got := binary.BigEndian.Uint16(overlayRows.Rows[multicastPreviewRowSize+20:]); got != 23 {
+		t.Fatalf("overlaid time left = %d, want 23", got)
+	}
+	committed := getTable(t, store, key, 0x0200,
+		me.MulticastSubscriberConfigInfo_AllowedPreviewGroupsTable)
+	if got := binary.BigEndian.Uint16(committed.Rows[multicastPreviewRowSize+20:]); got != 60 {
+		t.Fatalf("overlay changed committed time left to %d", got)
+	}
+
+	changes = nil
+	changed, err := store.ExpireAllowedPreviewRows(key, []AllowedPreviewTimer{
+		{RowKey: 7, Duration: 60, TimeLeft: 0},
+		{RowKey: 9, Duration: 0, TimeLeft: 0},
+	})
+	if err != nil || !changed {
+		t.Fatalf("ExpireAllowedPreviewRows() = %t, %v", changed, err)
+	}
+	if store.DataSync() != sync || len(changes) != 1 || changes[0].Operation != OperationAutonomous ||
+		changes[0].MIBDataSync != sync {
+		t.Fatalf("autonomous expiry state = sync %d changes %+v, want sync %d", store.DataSync(), changes, sync)
+	}
+	committed = getTable(t, store, key, 0x0200,
+		me.MulticastSubscriberConfigInfo_AllowedPreviewGroupsTable)
+	if committed.NumRows != 2 || binary.BigEndian.Uint16(committed.Rows[:2]) != 9 ||
+		binary.BigEndian.Uint16(committed.Rows[multicastPreviewRowSize:]) != 1<<11|9 {
+		t.Fatalf("autonomous expiry did not remove exactly row 7: %x", committed.Rows)
+	}
+}
+
+func TestAllowedPreviewAutonomousExpiryRollsBackOnPlatformFailure(t *testing.T) {
+	reject := false
+	store, err := NewWithApplier([]Instance{{
+		Key:        Key{ClassID: me.OnuDataClassID, EntityID: 0},
+		Attributes: me.AttributeValueMap{me.OnuData_MibDataSync: uint8(0)},
+	}}, ApplyFunc(func(change Change) error {
+		if reject && change.Operation == OperationAutonomous {
+			return errors.New("platform unavailable")
+		}
+		return nil
+	}))
+	if err != nil {
+		t.Fatalf("NewWithApplier() error = %v", err)
+	}
+	key := Key{ClassID: me.MulticastSubscriberConfigInfoClassID, EntityID: 0x500}
+	if err := store.Create(key.ClassID, key.EntityID, me.AttributeValueMap{
+		me.MulticastSubscriberConfigInfo_MeType:                            uint8(0),
+		me.MulticastSubscriberConfigInfo_MulticastOperationsProfilePointer: uint16(0x700),
+	}); err != nil {
+		t.Fatalf("Create(multicast subscriber) error = %v", err)
+	}
+	rows := append(allowedPreviewPart0(1, 7, nil, 100, 200),
+		allowedPreviewPart1(1, 7, []byte{239, 1, 2, 3}, 60, 0)...)
+	setTable(t, store, key, 0x0200,
+		me.MulticastSubscriberConfigInfo_AllowedPreviewGroupsTable, rows)
+	sync := store.DataSync()
+	reject = true
+	changed, err := store.ExpireAllowedPreviewRows(key,
+		[]AllowedPreviewTimer{{RowKey: 7, Duration: 60, TimeLeft: 0}})
+	if err == nil || changed {
+		t.Fatalf("rejected ExpireAllowedPreviewRows() = %t, %v", changed, err)
+	}
+	committed := getTable(t, store, key, 0x0200,
+		me.MulticastSubscriberConfigInfo_AllowedPreviewGroupsTable)
+	if store.DataSync() != sync || committed.NumRows != 2 {
+		t.Fatalf("rejected expiry changed state: sync=%d rows=%x", store.DataSync(), committed.Rows)
+	}
+}
+
 func TestSetTableMulticastSubscriberRejectsInvalidRowsAtomically(t *testing.T) {
 	serviceTests := []struct {
 		name string

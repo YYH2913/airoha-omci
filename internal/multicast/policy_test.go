@@ -252,6 +252,33 @@ func TestAllowedPreviewExpires(t *testing.T) {
 	}
 }
 
+func TestAllowedPreviewTimersRoundUpAndExposeExpiry(t *testing.T) {
+	now := time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)
+	engine := newPolicyEngine(t, &now, Config{
+		Profiles: []Profile{profile(1, acl(1, "239.1.0.1", "239.1.0.1", 100))},
+		Subscribers: []Subscriber{{EntityID: 10, Profile: 1, AllowedPreviews: []AllowedPreview{
+			{RowKey: 7, Destination: addr("239.1.0.1"), Duration: 4, TimeLeft: 2},
+			{RowKey: 9, Destination: addr("239.1.0.2"), Duration: 0, TimeLeft: 0},
+		}}},
+	})
+
+	assertTimers := func(want uint16) {
+		t.Helper()
+		timers := engine.AllowedPreviewTimers(10)
+		if len(timers) != 2 || timers[0] != (AllowedPreviewTimer{RowKey: 7, Duration: 4, TimeLeft: want}) ||
+			timers[1] != (AllowedPreviewTimer{RowKey: 9}) {
+			t.Fatalf("allowed-preview timers = %+v, want row 7 time-left %d and untimed row 9", timers, want)
+		}
+	}
+	assertTimers(2)
+	now = now.Add(time.Second)
+	assertTimers(2)
+	now = now.Add(time.Minute)
+	assertTimers(1)
+	now = now.Add(59 * time.Second)
+	assertTimers(0)
+}
+
 func TestMonitorLeaveAndPreviewExpiry(t *testing.T) {
 	now := time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)
 	regular := acl(1, "239.1.0.1", "239.1.0.1", 100)

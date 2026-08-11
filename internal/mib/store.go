@@ -37,6 +37,10 @@ const (
 	OperationSetTable Operation = "set-table"
 	OperationDelete   Operation = "delete"
 	OperationReset    Operation = "reset"
+	// OperationAutonomous applies an ONU-originated service-graph change while
+	// preserving MIB data sync. It is currently used when a timed class-310 row
+	// expires and must be removed from both the MIB and platform desired state.
+	OperationAutonomous Operation = "autonomous"
 )
 
 const defaultExtendedVLANTableSize = 64

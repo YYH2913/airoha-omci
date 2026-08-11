@@ -308,6 +308,51 @@ func TestBuildServiceGraphResolvesMulticastGEMAndSubscriber(t *testing.T) {
 	}
 }
 
+func TestMulticastPolicyResolvesDirectMapperUpstreamGEMs(t *testing.T) {
+	mapper := PBitMapper{EntityID: testMapper, TPType: 1, TPPointer: testUNI,
+		UnmarkedFrameOption: 1, DefaultPBit: 3}
+	for priority := range mapper.PBits {
+		mapper.PBits[priority] = testMapperIW
+	}
+	graph := ServiceGraph{
+		UNIs:     []EthernetUNI{{EntityID: testUNI, Interface: "lan1"}},
+		GEMPorts: []GEMPort{{EntityID: testMapperGEM, PortID: 200, Direction: 3}},
+		Interworking: []GEMInterworking{{EntityID: testMapperIW, GEMPort: testMapperGEM,
+			Option: 5, ServiceProfile: testMapper}},
+		Mappers:           []PBitMapper{mapper},
+		MulticastProfiles: []MulticastOperationsProfile{{EntityID: 0x700, IGMPVersion: 2}},
+		MulticastSubscribers: []MulticastSubscriberConfigInfo{{
+			EntityID: testMapper, METype: 1, Profile: 0x700,
+		}},
+	}
+	policy, err := graph.MulticastPolicy()
+	if err != nil {
+		t.Fatalf("MulticastPolicy() error = %v", err)
+	}
+	if len(policy.Subscribers) != 1 || len(policy.Subscribers[0].Attachments) != 1 {
+		t.Fatalf("direct mapper policy = %#v", policy)
+	}
+	attachment := policy.Subscribers[0].Attachments[0]
+	if attachment.Interface != "lan1" || attachment.BridgeEntity != 0 ||
+		attachment.DirectMapper == nil || attachment.DirectMapper.GEMPortIDs[0] != 200 ||
+		attachment.DirectMapper.GEMPortIDs[7] != 200 || attachment.DirectMapper.DefaultPBit != 3 {
+		t.Fatalf("direct mapper attachment = %#v", attachment)
+	}
+	backend := multicast.NewLinuxBackend(multicast.LinuxBackendOptions{Runner: &discardPlatformRunner{}})
+	if _, err := multicast.NewRuntime(policy, backend, nil); err != nil {
+		t.Fatalf("NewRuntime(direct mapper) error = %v", err)
+	}
+
+	graph.GEMPorts[0].Direction = 1
+	if _, err := graph.MulticastPolicy(); err == nil || !strings.Contains(err.Error(), "upstream direction") {
+		t.Fatalf("MulticastPolicy(downstream-only mapper GEM) error = %v", err)
+	}
+}
+
+type discardPlatformRunner struct{}
+
+func (*discardPlatformRunner) Run(string, ...string) error { return nil }
+
 func TestBuildServiceGraphRejectsUnrepresentableMulticastReferences(t *testing.T) {
 	const multicastIW = 0x0302
 	base := func() []mib.Instance {

@@ -193,3 +193,50 @@ func TestExecControllerRejectsIncompleteMulticastSubscriberMonitor(t *testing.T)
 		t.Fatalf("SubscriberMonitor() error = %v", err)
 	}
 }
+
+func TestExecControllerReadsAllowedPreviewStatus(t *testing.T) {
+	directory := t.TempDir()
+	requestPath := filepath.Join(directory, "request.json")
+	helper := filepath.Join(directory, "control")
+	response := `{"multicast_subscriber_id":1280,"mib_data_sync":17,"current_bandwidth":0,"join_messages":0,"bandwidth_exceeded":0,"groups":[],"allowed_previews":[{"row_key":7,"duration_minutes":60,"time_left_minutes":23}]}`
+	script := "#!/bin/sh\ncat > " + requestPath + "\n" +
+		"printf '%s\\n' '" + response + "'\n"
+	if err := os.WriteFile(helper, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile(helper) error = %v", err)
+	}
+	snapshot, err := (ExecController{Path: helper}).AllowedPreviewStatus(1280)
+	if err != nil {
+		t.Fatalf("AllowedPreviewStatus() error = %v", err)
+	}
+	if snapshot.MIBDataSync != 17 || len(snapshot.Timers) != 1 ||
+		snapshot.Timers[0].RowKey != 7 || snapshot.Timers[0].Duration != 60 ||
+		snapshot.Timers[0].TimeLeft != 23 {
+		t.Fatalf("allowed-preview snapshot = %+v", snapshot)
+	}
+	payload, err := os.ReadFile(requestPath)
+	if err != nil {
+		t.Fatalf("ReadFile(request) error = %v", err)
+	}
+	if !strings.Contains(string(payload), `"action":"multicast-preview-status"`) ||
+		!strings.Contains(string(payload), `"multicast_subscriber_id":1280`) {
+		t.Fatalf("request = %s", payload)
+	}
+}
+
+func TestExecControllerRejectsInvalidAllowedPreviewStatus(t *testing.T) {
+	for name, response := range map[string]string{
+		"missing timer field":   `{"multicast_subscriber_id":1280,"mib_data_sync":1,"allowed_previews":[{"row_key":7,"duration_minutes":60}]}`,
+		"time exceeds duration": `{"multicast_subscriber_id":1280,"mib_data_sync":1,"allowed_previews":[{"row_key":7,"duration_minutes":60,"time_left_minutes":61}]}`,
+		"duplicate key":         `{"multicast_subscriber_id":1280,"mib_data_sync":1,"allowed_previews":[{"row_key":7,"duration_minutes":60,"time_left_minutes":1},{"row_key":7,"duration_minutes":60,"time_left_minutes":1}]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			helper := filepath.Join(t.TempDir(), "control")
+			if err := os.WriteFile(helper, []byte("#!/bin/sh\nprintf '%s\\n' '"+response+"'\n"), 0o755); err != nil {
+				t.Fatalf("WriteFile(helper) error = %v", err)
+			}
+			if _, err := (ExecController{Path: helper}).AllowedPreviewStatus(1280); err == nil {
+				t.Fatal("AllowedPreviewStatus() unexpectedly accepted invalid state")
+			}
+		})
+	}
+}

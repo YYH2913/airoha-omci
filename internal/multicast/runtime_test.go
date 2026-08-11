@@ -14,6 +14,12 @@ type recordingRuntimeBackend struct {
 	changes        []ReplicationChange
 	reports        []UpstreamReport
 	queries        []DownstreamQuery
+	samples        map[BandwidthKey]uint32
+	sampleError    error
+}
+
+func (b *recordingRuntimeBackend) SampleBandwidth() (map[BandwidthKey]uint32, error) {
+	return b.samples, b.sampleError
 }
 
 func (b *recordingRuntimeBackend) Configure(Config) error {
@@ -82,6 +88,40 @@ func TestRuntimeSPRTracksClientsAndAggregatesReports(t *testing.T) {
 	if len(backend.changes) != 2 || backend.changes[1].Enable ||
 		len(backend.reports) != 2 || backend.reports[1].Join {
 		t.Fatalf("final leave backend changes = %+v, reports = %+v", backend.changes, backend.reports)
+	}
+}
+
+func TestRuntimeMonitorUsesActualBandwidthAndFallsBackToImputed(t *testing.T) {
+	backend := &recordingRuntimeBackend{}
+	configured := profile(1, acl(1, "239.1.0.1", "239.1.0.1", 100))
+	configured.DynamicACL[0].ImputedBandwidth = 1000
+	runtime, err := NewRuntime(Config{Profiles: []Profile{configured}, Subscribers: []Subscriber{{
+		EntityID: 10, Profile: 1, Attachments: []Attachment{{Interface: "lan1", BridgeEntity: 0x100}},
+	}}}, backend, nil)
+	if err != nil {
+		t.Fatalf("NewRuntime() error = %v", err)
+	}
+	message := membershipMessage("192.0.2.10", [6]byte{2, 0, 0, 0, 0, 10}, ModeIsExclude)
+	if err := runtime.Handle("lan1", message); err != nil {
+		t.Fatalf("Handle(join) error = %v", err)
+	}
+	if monitor := runtime.Monitor(10); monitor.CurrentBandwidth != 1000 {
+		t.Fatalf("monitor fallback bandwidth = %d, want 1000", monitor.CurrentBandwidth)
+	}
+	key := BandwidthKey{SubscriberID: 10, Interface: "lan1", Source: netip.IPv4Unspecified(),
+		Group: addr("239.1.0.1")}
+	backend.samples = map[BandwidthKey]uint32{key: 321}
+	if err := runtime.SampleBandwidth(); err != nil {
+		t.Fatalf("SampleBandwidth() error = %v", err)
+	}
+	monitor := runtime.Monitor(10)
+	if monitor.CurrentBandwidth != 321 || len(monitor.Groups) != 1 ||
+		monitor.Groups[0].ImputedBandwidth != 1000 {
+		t.Fatalf("monitor actual/imputed bandwidth = %+v", monitor)
+	}
+	backend.sampleError = errors.New("statistics unavailable")
+	if err := runtime.SampleBandwidth(); err == nil || runtime.Monitor(10).CurrentBandwidth != 1000 {
+		t.Fatalf("failed sample did not restore imputed fallback: %v/%+v", err, runtime.Monitor(10))
 	}
 }
 
@@ -188,6 +228,45 @@ func TestRuntimeEquivalentConfigurePreservesMembership(t *testing.T) {
 	}
 	if monitor := runtime.Monitor(10); len(monitor.Groups) != 1 || monitor.JoinMessages != 1 {
 		t.Fatalf("equivalent configure reset state: %+v", monitor)
+	}
+}
+
+func TestRuntimePolicyReloadPreservesUnchangedPreviewDeadline(t *testing.T) {
+	now := time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)
+	backend := &recordingRuntimeBackend{}
+	config := Config{
+		Profiles: []Profile{profile(1, acl(1, "239.1.0.1", "239.1.0.1", 100))},
+		Subscribers: []Subscriber{{EntityID: 10, Profile: 1,
+			Attachments: []Attachment{{Interface: "lan1"}},
+			AllowedPreviews: []AllowedPreview{{RowKey: 7, Destination: addr("239.1.0.1"),
+				Duration: 4, TimeLeft: 2}}}},
+	}
+	runtime, err := NewRuntime(config, backend, func() time.Time { return now })
+	if err != nil {
+		t.Fatalf("NewRuntime() error = %v", err)
+	}
+	now = now.Add(70 * time.Second)
+	next := config
+	next.Subscribers = append([]Subscriber(nil), config.Subscribers...)
+	next.Subscribers[0].MaxSimultaneousGroups = 8
+	if err := runtime.Configure(next); err != nil {
+		t.Fatalf("Configure(unrelated change) error = %v", err)
+	}
+	now = now.Add(51 * time.Second)
+	if timers := runtime.AllowedPreviewTimers(10); len(timers) != 1 || timers[0].TimeLeft != 0 {
+		t.Fatalf("unchanged preview deadline restarted after reload: %+v", timers)
+	}
+
+	rewritten := next
+	rewritten.Subscribers = append([]Subscriber(nil), next.Subscribers...)
+	rewritten.Subscribers[0].AllowedPreviews = append([]AllowedPreview(nil),
+		next.Subscribers[0].AllowedPreviews...)
+	rewritten.Subscribers[0].AllowedPreviews[0].TimeLeft = 3
+	if err := runtime.Configure(rewritten); err != nil {
+		t.Fatalf("Configure(preview rewrite) error = %v", err)
+	}
+	if timers := runtime.AllowedPreviewTimers(10); len(timers) != 1 || timers[0].TimeLeft != 3 {
+		t.Fatalf("rewritten preview did not receive a new deadline: %+v", timers)
 	}
 }
 

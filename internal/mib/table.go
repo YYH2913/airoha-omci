@@ -29,6 +29,14 @@ const (
 	tableRowKeyMask     = uint16(0x03ff)
 )
 
+// AllowedPreviewTimer identifies the live ONU-owned timer for one logical
+// class-310 allowed-preview row.
+type AllowedPreviewTimer struct {
+	RowKey   uint16
+	Duration uint16
+	TimeLeft uint16
+}
+
 var extendedVLANDefaultRows = []byte{
 	0xf8, 0x00, 0x00, 0x00, 0xf8, 0x00, 0x00, 0x00, 0x00, 0x0f, 0x00, 0x00, 0x00, 0x0f, 0x00, 0x00,
 	0xf8, 0x00, 0x00, 0x00, 0xe8, 0x00, 0x00, 0x00, 0x00, 0x0f, 0x00, 0x00, 0x00, 0x0f, 0x00, 0x00,
@@ -600,6 +608,124 @@ func applyAllowedPreviewRows(existing, updates []byte) (me.TableRows, error) {
 		result = append(result, rows[key]...)
 	}
 	return me.TableRows{NumRows: len(rows), Rows: result}, nil
+}
+
+// OverlayAllowedPreviewTimers returns a response snapshot with current
+// time-left fields. It never changes the committed MIB; GetNext therefore sees
+// a stable copy captured by the initiating Get request.
+func OverlayAllowedPreviewTimers(instance Instance, timers []AllowedPreviewTimer) (Instance, error) {
+	if instance.ClassID != me.MulticastSubscriberConfigInfoClassID {
+		return Instance{}, fmt.Errorf("allowed-preview timers require class %d, got %d",
+			me.MulticastSubscriberConfigInfoClassID, instance.ClassID)
+	}
+	value, exists := instance.Attributes[me.MulticastSubscriberConfigInfo_AllowedPreviewGroupsTable]
+	if !exists {
+		return instance, nil
+	}
+	rows, err := tableRows(value, multicastPreviewRowSize)
+	if err != nil {
+		return Instance{}, err
+	}
+	indexed, err := indexAllowedPreviewTimers(timers)
+	if err != nil {
+		return Instance{}, err
+	}
+	for offset := 0; offset < len(rows.Rows); offset += multicastPreviewRowSize {
+		row := rows.Rows[offset : offset+multicastPreviewRowSize]
+		control := binary.BigEndian.Uint16(row[:2])
+		if control&tableRowPartMask != 1<<11 {
+			continue
+		}
+		timer, found := indexed[control&tableRowKeyMask]
+		if !found || timer.Duration != binary.BigEndian.Uint16(row[18:20]) {
+			continue
+		}
+		binary.BigEndian.PutUint16(row[20:22], timer.TimeLeft)
+	}
+	instance.Attributes[me.MulticastSubscriberConfigInfo_AllowedPreviewGroupsTable] = rows
+	return instance, nil
+}
+
+// ExpireAllowedPreviewRows removes every matching timed logical row, including
+// all of its row parts. The platform receives the new desired graph before the
+// MIB commits, but the MIB data-sync counter is intentionally unchanged because
+// expiry is an ONU-originated transition defined by G.988.
+func (s *Store) ExpireAllowedPreviewRows(key Key, timers []AllowedPreviewTimer) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if key.ClassID != me.MulticastSubscriberConfigInfoClassID {
+		return false, fmt.Errorf("allowed-preview expiry requires class %d, got %d",
+			me.MulticastSubscriberConfigInfoClassID, key.ClassID)
+	}
+	current, exists := s.current[key]
+	if !exists {
+		return false, unknownKeyError(key)
+	}
+	indexed, err := indexAllowedPreviewTimers(timers)
+	if err != nil {
+		return false, err
+	}
+	value := current.Attributes[me.MulticastSubscriberConfigInfo_AllowedPreviewGroupsTable]
+	rows, err := tableRows(value, multicastPreviewRowSize)
+	if err != nil {
+		return false, err
+	}
+	expired := make(map[uint16]struct{})
+	for offset := 0; offset < len(rows.Rows); offset += multicastPreviewRowSize {
+		row := rows.Rows[offset : offset+multicastPreviewRowSize]
+		control := binary.BigEndian.Uint16(row[:2])
+		if control&tableRowPartMask != 1<<11 {
+			continue
+		}
+		key := control & tableRowKeyMask
+		timer, found := indexed[key]
+		duration := binary.BigEndian.Uint16(row[18:20])
+		if found && duration != 0 && timer.Duration == duration && timer.TimeLeft == 0 {
+			expired[key] = struct{}{}
+		}
+	}
+	if len(expired) == 0 {
+		return false, nil
+	}
+	kept := make([]byte, 0, len(rows.Rows))
+	for offset := 0; offset < len(rows.Rows); offset += multicastPreviewRowSize {
+		row := rows.Rows[offset : offset+multicastPreviewRowSize]
+		if _, remove := expired[binary.BigEndian.Uint16(row[:2])&tableRowKeyMask]; !remove {
+			kept = append(kept, row...)
+		}
+	}
+	next := cloneInstance(current)
+	next.Attributes[me.MulticastSubscriberConfigInfo_AllowedPreviewGroupsTable] = me.TableRows{
+		NumRows: len(kept) / multicastPreviewRowSize, Rows: kept,
+	}
+	normalized, err := normalize(next)
+	if err != nil {
+		return false, err
+	}
+	proposed := cloneInstances(s.current)
+	proposed[key] = normalized
+	if err := s.commitLocked(OperationAutonomous, &current, &normalized, proposed, s.dataSync); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func indexAllowedPreviewTimers(timers []AllowedPreviewTimer) (map[uint16]AllowedPreviewTimer, error) {
+	result := make(map[uint16]AllowedPreviewTimer, len(timers))
+	for _, timer := range timers {
+		if timer.RowKey > tableRowKeyMask ||
+			(timer.Duration == 0 && timer.TimeLeft != 0) ||
+			(timer.Duration != 0 && timer.TimeLeft > timer.Duration) {
+			return nil, fmt.Errorf("invalid allowed-preview timer row %d duration/time-left %d/%d",
+				timer.RowKey, timer.Duration, timer.TimeLeft)
+		}
+		if _, duplicate := result[timer.RowKey]; duplicate {
+			return nil, fmt.Errorf("duplicate allowed-preview timer row %d", timer.RowKey)
+		}
+		result[timer.RowKey] = timer
+	}
+	return result, nil
 }
 
 func validateAllowedPreviewPart0(key uint16, row []byte) error {

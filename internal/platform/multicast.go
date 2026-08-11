@@ -4,6 +4,7 @@ package platform
 
 import (
 	"fmt"
+	"math"
 	"net/netip"
 	"sort"
 
@@ -183,7 +184,13 @@ func (g ServiceGraph) multicastAttachments(source MulticastSubscriberConfigInfo)
 				return nil, fmt.Errorf("multicast subscriber %#x mapper references missing UNI %#x",
 					source.EntityID, mapper.TPPointer)
 			}
-			attachments = append(attachments, multicast.Attachment{Interface: ifname})
+			upstream, err := g.directMulticastMapper(*mapper)
+			if err != nil {
+				return nil, fmt.Errorf("multicast subscriber %#x direct mapper: %w", source.EntityID, err)
+			}
+			attachments = append(attachments, multicast.Attachment{
+				Interface: ifname, DirectMapper: upstream,
+			})
 		}
 	default:
 		return nil, fmt.Errorf("multicast subscriber %#x has invalid ME type %d", source.EntityID, source.METype)
@@ -201,4 +208,43 @@ func (g ServiceGraph) multicastAttachments(source MulticastSubscriberConfigInfo)
 		return attachments[i].Interface < attachments[j].Interface
 	})
 	return attachments, nil
+}
+
+func (g ServiceGraph) directMulticastMapper(mapper PBitMapper) (*multicast.UpstreamMapper, error) {
+	result := &multicast.UpstreamMapper{UnmarkedFrameOption: mapper.UnmarkedFrameOption,
+		DefaultPBit: mapper.DefaultPBit, DSCPToPBit: mapper.DSCPToPBit}
+	for priority := range result.GEMPortIDs {
+		result.GEMPortIDs[priority] = math.MaxUint16
+		pointer := mapper.PBits[priority]
+		if pointer == math.MaxUint16 {
+			continue
+		}
+		var interworking *GEMInterworking
+		for index := range g.Interworking {
+			if g.Interworking[index].EntityID == pointer {
+				interworking = &g.Interworking[index]
+				break
+			}
+		}
+		if interworking == nil || interworking.Option != 5 ||
+			interworking.ServiceProfile != mapper.EntityID {
+			return nil, fmt.Errorf("P-bit %d references invalid GEM IW TP %#x", priority, pointer)
+		}
+		var gem *GEMPort
+		for index := range g.GEMPorts {
+			if g.GEMPorts[index].EntityID == interworking.GEMPort {
+				gem = &g.GEMPorts[index]
+				break
+			}
+		}
+		if gem == nil {
+			return nil, fmt.Errorf("P-bit %d GEM IW TP %#x references missing GEM CTP %#x",
+				priority, pointer, interworking.GEMPort)
+		}
+		if gem.Direction&2 == 0 {
+			return nil, fmt.Errorf("P-bit %d GEM %d has no upstream direction", priority, gem.PortID)
+		}
+		result.GEMPortIDs[priority] = gem.PortID
+	}
+	return result, nil
 }

@@ -4,6 +4,7 @@ package multicast
 
 import (
 	"fmt"
+	"math"
 	"net/netip"
 	"reflect"
 	"sort"
@@ -39,6 +40,21 @@ type RuntimeBackend interface {
 	SetReplication(ReplicationChange) error
 	SendReport(UpstreamReport) error
 	SendQuery(DownstreamQuery) error
+}
+
+// BandwidthKey identifies one replicated downstream stream. A backend reports
+// byte-rate samples per key so class 311 can use live traffic while the policy
+// engine continues to use imputed bandwidth for admission control.
+type BandwidthKey struct {
+	SubscriberID uint16
+	Interface    string
+	Source       netip.Addr
+	Group        netip.Addr
+	UNIVLAN      VLAN
+}
+
+type RuntimeBandwidthSampler interface {
+	SampleBandwidth() (map[BandwidthKey]uint32, error)
 }
 
 type noopRuntimeBackend struct{}
@@ -140,6 +156,7 @@ type Runtime struct {
 	queries     []generalQuery
 	rates       map[rateKey]rateWindow
 	robustness  map[robustnessKey]uint8
+	bandwidth   map[BandwidthKey]uint32
 }
 
 func NewRuntime(config Config, backend RuntimeBackend, now func() time.Time) (*Runtime, error) {
@@ -210,6 +227,7 @@ func (r *Runtime) configureLocked(config Config) error {
 	if err != nil {
 		return err
 	}
+	engine.preserveAllowedPreviewExpiries(r.engine)
 	if err := r.backend.Configure(config); err != nil {
 		return fmt.Errorf("configure multicast backend: %w", err)
 	}
@@ -223,6 +241,7 @@ func (r *Runtime) configureLocked(config Config) error {
 	r.queries = queries
 	r.rates = make(map[rateKey]rateWindow)
 	r.robustness = make(map[robustnessKey]uint8)
+	r.bandwidth = nil
 	return nil
 }
 
@@ -686,7 +705,60 @@ func (r *Runtime) expireProxyMembershipsLocked(now time.Time) error {
 func (r *Runtime) Monitor(subscriberID uint16) Monitor {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.engine.Monitor(subscriberID)
+	result := r.engine.Monitor(subscriberID)
+	if _, available := r.backend.(RuntimeBandwidthSampler); !available {
+		return result
+	}
+	seen := make(map[BandwidthKey]struct{}, len(result.Groups))
+	var bandwidth uint64
+	for _, group := range result.Groups {
+		key := BandwidthKey{SubscriberID: subscriberID, Interface: group.Interface,
+			Source: group.Source, Group: group.Group, UNIVLAN: group.UNIVLAN}
+		if _, duplicate := seen[key]; duplicate {
+			continue
+		}
+		seen[key] = struct{}{}
+		value, sampled := r.bandwidth[key]
+		if !sampled {
+			value = group.ImputedBandwidth
+		}
+		bandwidth += uint64(value)
+	}
+	if bandwidth > math.MaxUint32 {
+		result.CurrentBandwidth = math.MaxUint32
+	} else {
+		result.CurrentBandwidth = uint32(bandwidth)
+	}
+	return result
+}
+
+// SampleBandwidth refreshes the live class-311 rates. A failed or incomplete
+// sample is discarded so Monitor falls back to the configured imputed value
+// instead of publishing stale traffic indefinitely.
+func (r *Runtime) SampleBandwidth() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	sampler, available := r.backend.(RuntimeBandwidthSampler)
+	if !available {
+		r.bandwidth = nil
+		return nil
+	}
+	values, err := sampler.SampleBandwidth()
+	if err != nil {
+		r.bandwidth = nil
+		return err
+	}
+	r.bandwidth = make(map[BandwidthKey]uint32, len(values))
+	for key, value := range values {
+		r.bandwidth[key] = value
+	}
+	return nil
+}
+
+func (r *Runtime) AllowedPreviewTimers(subscriberID uint16) []AllowedPreviewTimer {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.engine.AllowedPreviewTimers(subscriberID)
 }
 
 func (r *Runtime) SubscriberIDs() []uint16 {

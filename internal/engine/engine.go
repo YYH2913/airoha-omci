@@ -97,6 +97,7 @@ type Engine struct {
 	performanceNext        time.Time
 	performanceIntervalEnd uint8
 	multicast              multicast.Controller
+	multicastPreview       multicast.PreviewController
 }
 
 func New(store *mib.Store) *Engine {
@@ -132,6 +133,9 @@ func NewWithControllers(store *mib.Store, controller Controller, softwareControl
 	}
 	if multicastController, ok := controller.(multicast.Controller); ok {
 		result.multicast = multicastController
+	}
+	if previewController, ok := controller.(multicast.PreviewController); ok {
+		result.multicastPreview = previewController
 	}
 	return result
 }
@@ -406,6 +410,14 @@ func (e *Engine) dispatch(packet gopacket.Packet, header *omci.OMCI) ([]byte, er
 			EntityID: request.EntityInstance,
 		}
 		instance, operationError := e.mib.Get(key, request.AttributeMask)
+		if instance.Attributes != nil && request.EntityClass == me.MulticastSubscriberConfigInfoClassID &&
+			request.AttributeMask&multicastSubscriberAllowedPreviewMask != 0 {
+			var previewError error
+			instance, previewError = e.getAllowedPreviewLocked(instance, request.AttributeMask)
+			if previewError != nil {
+				operationError = previewError
+			}
+		}
 		if instance.Attributes != nil && request.EntityClass == me.MulticastSubscriberMonitorClassID &&
 			request.AttributeMask&0x7c00 != 0 {
 			var monitorError error

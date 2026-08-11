@@ -15,7 +15,7 @@ and extended messages.  A successful build or reaching GPON O5 is not enough.
 | Traffic | 8 advertised T-CONTs, scheduler/queue graph, GEM CTP/IW validation and hardware apply | upstream SP/WRR/TRTCM implemented; physical verification pending |
 | Performance | common 15-minute engine, GEM CTP and Ethernet UNI/frame PM | class 341, 24, 296, 321 and 322 counters, threshold data 1/2 and TCA implemented; physical verification pending |
 | Ethernet service | resolved bridge, mapper, VLAN and extended VLAN graph | UNI, bridge-port, mapper and GEM-IW associations implemented; advanced treatment pending |
-| Multicast | multicast GEM-IW, IGMP/MLD policy, subscriber limits and live groups | class 281 and class 309/310 tables, ACL/preview enforcement, native report/query interception, proxy querier and class 311 monitoring implemented; sampled bandwidth and physical OLT verification pending |
+| Multicast | multicast GEM-IW, IGMP/MLD policy, subscriber limits and live groups | class 281 and class 309/310 tables, ACL/preview enforcement, native report/query interception, proxy querier and sampled class 311 monitoring implemented; physical OLT verification pending |
 | Lifecycle | reboot, time sync, software download/activate/commit | implemented; OLT verification pending |
 | Platform | multi-T-CONT/GEM Airoha ABI and transactional Linux backend | GEM and 16-channel GPON QDMA QoS, UNI VLAN, bridge FDB limit and multi-profile MAC bridge implemented; Ethernet offload pending |
 | OpenWrt | package, procd, UCI, rpcd/ubus and LuCI | optical configuration, live service status and automatic/manual service handover implemented |
@@ -154,8 +154,8 @@ accepted dynamic streams are compiled into a default-deny tc egress chain;
 source-specific entries remain source-specific. Upstream tag-control modes
 0-3 preserve up to two subscriber VLAN tags and upstream rate limits are
 applied before reports are reinjected through the profile ANI. Downstream
-tag-control modes 0-7 use tc VLAN actions, with an explicit rejection when a
-TCI DEI rewrite cannot be represented.
+tag-control modes 0-7 use tc VLAN actions; the Airoha kernel/iproute2 ABI
+extends those actions with explicit DEI push/modify handling.
 
 The runtime aggregates first-join/final-leave reports for SPR/proxy profiles,
 tracks each client independently, expires preview delivery, and atomically
@@ -169,10 +169,12 @@ are admitted by the default-deny tc chain and receive class-309 downstream tag
 control; locally generated queries use a reserved skb mark to avoid applying
 the transformation twice.
 
-Current multicast bandwidth remains the G.988 imputed-bandwidth estimate rather
-than a sampled data-plane rate. Class-310 allowed-preview `time-left` write-back,
-direct mapper attachments without a profile ANI, and downstream DEI rewrite
-still require implementation.
+Class-311 current bandwidth uses sampled tc action byte counters when available,
+and falls back immediately to the configured imputed bandwidth when a counter
+read is unavailable or a rule is rebuilt. Class-310 allowed-preview `time-left`
+is written back from the real deadline and expires autonomously; direct mapper
+attachments select a validated upstream GEM and send reports through the marked
+PON path. Physical OLT and sustained multicast traffic verification remain.
 Real baseline and extended OLT traces and sustained multicast traffic tests
 remain deployment gates.
 
@@ -204,8 +206,9 @@ backend and are rejected. Colour-aware marking/remarking and RFC 4115 meter
 coupling are also rejected rather than silently approximated. These limits and
 real OLT/optical-module testing remain explicit deployment blockers.
 
-The remaining Ethernet blockers are extended-VLAN DEI treatment, copy and
-some inverse behavior, per-port learning-depth, and native Airoha offload. DEI
-matching is implemented through a classic-BPF gate before the existing VLAN
-action chain. Transactional crash recovery and physical baseline/extended OLT
-interoperability also remain completion gates.
+The remaining Ethernet blockers are generic extended-VLAN copy and some inverse
+behavior, per-port learning-depth, and native Airoha offload. DEI matching is
+implemented through a classic-BPF gate before the existing VLAN action chain;
+multicast downstream DEI treatment is handled by the native VLAN action
+extension above. Transactional crash recovery and physical baseline/extended
+OLT interoperability also remain completion gates.

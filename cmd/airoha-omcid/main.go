@@ -176,6 +176,8 @@ func run(opts options) error {
 	defer arcTicker.Stop()
 	performanceTicker := time.NewTicker(time.Second)
 	defer performanceTicker.Stop()
+	multicastTicker := time.NewTicker(time.Second)
+	defer multicastTicker.Stop()
 
 	for {
 		select {
@@ -261,6 +263,15 @@ func run(opts options) error {
 				if err := statusWriter.Write(state); err != nil {
 					log.Printf("publish status: %v", err)
 				}
+			}
+
+		case <-multicastTicker.C:
+			if err := protocol.PollMulticast(); err != nil {
+				state.EventErrors++
+				state.LastError = err.Error()
+				_ = statusWriter.Write(state)
+				log.Printf("OMCI multicast timer synchronization failed: %v", err)
+				continue
 			}
 
 		case result := <-received:

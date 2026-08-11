@@ -52,7 +52,7 @@ func DecodeApplyRequest(reader io.Reader) (ApplyRequest, error) {
 	}
 	switch request.Operation {
 	case mib.OperationCreate, mib.OperationSet, mib.OperationSetTable,
-		mib.OperationDelete, mib.OperationReset:
+		mib.OperationDelete, mib.OperationReset, mib.OperationAutonomous:
 	default:
 		return ApplyRequest{}, fmt.Errorf("invalid platform operation %q", request.Operation)
 	}
