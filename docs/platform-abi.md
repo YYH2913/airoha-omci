@@ -51,7 +51,25 @@ shape:
   "mib_data_sync": 17,
   "service_graph": {
     "unis": [],
-    "tconts": [],
+    "tconts": [{
+      "entity_id": 32768,
+      "alloc_id": 1024,
+      "scheduler_policy": 2,
+      "scheduler_weight": 0,
+      "queue_entities": [32768,32769,32770,32771,32772,32773,32774,32775],
+      "queue_weights": [1,1,2,2,4,4,8,8]
+    }],
+    "traffic_descriptors": [{
+      "entity_id": 34816,
+      "cir": 125000000,
+      "pir": 312500000,
+      "cbs": 65536,
+      "pbs": 131072,
+      "colour_mode": 0,
+      "ingress_colour_marking": 0,
+      "egress_colour_marking": 0,
+      "meter_type": 0
+    }],
     "gem_ports": [],
     "gem_interworking": [],
     "pbit_mappers": [],
@@ -68,6 +86,42 @@ the daemon's responsibility. Extended VLAN tables are emitted as named filter
 and treatment fields, including enhanced row keys and directions; no encoded
 table rows cross this boundary. Unknown ABI versions must be rejected before
 any platform state is changed.
+
+OMCI traffic management is part of the same transaction. The XG2010G OpenWrt
+backend applies the following native mapping atomically before acknowledging
+the OMCI mutation:
+
+| G.988 object | EN7581/QDMA object | Required operation |
+| --- | --- | --- |
+| T-CONT (class 262) | GPON Alloc-ID and WAN channel | allocate or release the T-CONT slot |
+| GEM CTP (class 268) | GPON GEM table and channel direction | enable GEM, encryption and GEM/mark mapping |
+| Priority queue (class 277) | QDMA WAN channel queue 0-7 | set SP/WRR mode and weight |
+| Traffic descriptor (class 280) | QDMA TRTCM meter | set CIR/PIR/CBS/PBS and enable/disable |
+
+The SDK names these capabilities `qdmamgr_lib_set_channel_qos`,
+`qdmamgr_lib_set_ratectl_trtcm_mode_*` and `gpon_flow_public` flow records.
+Those proprietary headers are reference material only; they are not copied
+into this Apache-2.0 repository. The OpenWrt adapter exposes an equivalent
+complete-table ABI with prepare/apply/rollback behavior. It supports 16 GPON
+QDMA channels; the current factory MIB advertises eight T-CONTs. Channels 0
+through 3 share allocation state with regular Linux qdiscs, while GPON-only
+channels 4 through 15 do not consume one of the four ordinary netdev QoS
+slots.
+
+Scheduler policy 0 (null) and 1 (strict priority) map to EN7581 SP; policy 2
+maps to WRR8 and requires at least one non-zero queue weight. Class-280 CIR and
+PIR values are G.988 bytes/s and are converted by the driver to kbit/s with
+`bytes/s * 8 / 1000`; CBS and PBS remain bytes. One egress TRTCM meter exists
+per T-CONT channel, so all GEMs sharing a T-CONT must use the same upstream
+traffic descriptor. Downstream per-GEM metering, colour-aware marking or
+remarking, and RFC 4115 coupling are rejected explicitly because the current
+hardware adapter cannot represent them faithfully.
+
+The standalone OMCI daemon still owns the corresponding G.988 entities,
+attribute validation, MIB data-sync and response status. Therefore migrating
+the SDK monitor or flow parser alone is insufficient: the OMCI protocol model
+and the hardware adapter must be migrated together, while keeping the
+proprietary implementation behind this boundary.
 
 VLAN tagging filter data is similarly normalized. `forward_operation` is kept
 for diagnostics, while `tagged_action` contains the G.988 action letter

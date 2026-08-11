@@ -56,6 +56,10 @@ func TestBuildServiceGraphResolvesCompleteEthernetService(t *testing.T) {
 	if graph.GEMPorts[0].AllocID != 100 || graph.GEMPorts[1].AllocID != 100 {
 		t.Fatalf("GEM Alloc-IDs = %d/%d, want 100", graph.GEMPorts[0].AllocID, graph.GEMPorts[1].AllocID)
 	}
+	if graph.TCONTs[0].SchedulerPolicy != 0 || graph.TCONTs[0].QueueWeights[0] != 1 ||
+		graph.TCONTs[0].QueueEntities[0] != 0x8000 {
+		t.Fatalf("T-CONT QoS = %#v", graph.TCONTs[0])
+	}
 	bridge := graph.Bridges[0]
 	if bridge.SpanningTree != 1 || bridge.Learning != 1 || bridge.PortBridging != 1 ||
 		bridge.Priority != 0x9000 || bridge.MaxAge != 20*256 || bridge.HelloTime != 2*256 ||
@@ -219,6 +223,63 @@ func TestValidateServiceGraphRejectsBrokenReferencesAndConstraints(t *testing.T)
 			want: "missing T-CONT",
 		},
 		{
+			name: "dangling upstream traffic descriptor",
+			edit: func(snapshot []mib.Instance) []mib.Instance {
+				findInstance(snapshot, me.GemPortNetworkCtpClassID, testMapperGEM).Attributes[me.GemPortNetworkCtp_TrafficDescriptorProfilePointerForUpstream] = uint16(0x7777)
+				return snapshot
+			},
+			want: "missing upstream traffic descriptor",
+		},
+		{
+			name: "multiple schedulers serve one T-CONT",
+			edit: func(snapshot []mib.Instance) []mib.Instance {
+				for _, entityID := range []uint16{0x9000, 0x9001} {
+					snapshot = append(snapshot, mib.Instance{
+						Key: mib.Key{ClassID: me.TrafficSchedulerClassID, EntityID: entityID},
+						Attributes: me.AttributeValueMap{
+							me.TrafficScheduler_TContPointer: uint16(testTCONT),
+						},
+					})
+				}
+				return snapshot
+			},
+			want: "is served by traffic schedulers",
+		},
+		{
+			name: "duplicate T-CONT queue priority",
+			edit: func(snapshot []mib.Instance) []mib.Instance {
+				return append(snapshot, mib.Instance{
+					Key: mib.Key{ClassID: me.PriorityQueueClassID, EntityID: 0x8001},
+					Attributes: me.AttributeValueMap{
+						me.PriorityQueue_RelatedPort: uint32(testTCONT) << 16,
+					},
+				})
+			},
+			want: "more than one priority queue",
+		},
+		{
+			name: "queue scheduler serves another T-CONT",
+			edit: func(snapshot []mib.Instance) []mib.Instance {
+				findInstance(snapshot, me.PriorityQueueClassID, 0x8000).Attributes[me.PriorityQueue_TrafficSchedulerPointer] = uint16(0x9000)
+				return append(snapshot, mib.Instance{
+					Key: mib.Key{ClassID: me.TrafficSchedulerClassID, EntityID: 0x9000},
+					Attributes: me.AttributeValueMap{
+						me.TrafficScheduler_TContPointer: uint16(testTCONT + 1),
+					},
+				})
+			},
+			want: "serves T-CONT",
+		},
+		{
+			name: "WRR without queue weight",
+			edit: func(snapshot []mib.Instance) []mib.Instance {
+				findInstance(snapshot, me.TContClassID, testTCONT).Attributes[me.TCont_Policy] = uint8(2)
+				findInstance(snapshot, me.PriorityQueueClassID, 0x8000).Attributes[me.PriorityQueue_Weight] = uint8(0)
+				return snapshot
+			},
+			want: "WRR scheduler has no non-zero queue weight",
+		},
+		{
 			name: "upstream queue belongs to UNI",
 			edit: func(snapshot []mib.Instance) []mib.Instance {
 				findInstance(snapshot, me.PriorityQueueClassID, 0x8000).Attributes[me.PriorityQueue_RelatedPort] = uint32(testUNI) << 16
@@ -235,6 +296,34 @@ func TestValidateServiceGraphRejectsBrokenReferencesAndConstraints(t *testing.T)
 				})
 			},
 			want: "Alloc-ID 100 is shared",
+		},
+		{
+			name: "traffic descriptor CIR above PIR",
+			edit: func(snapshot []mib.Instance) []mib.Instance {
+				return append(snapshot, trafficDescriptorInstance(0x8800, me.AttributeValueMap{
+					me.TrafficDescriptor_Cir: uint32(2000),
+					me.TrafficDescriptor_Pir: uint32(1000),
+				}))
+			},
+			want: "above PIR",
+		},
+		{
+			name: "reserved ingress colour marking",
+			edit: func(snapshot []mib.Instance) []mib.Instance {
+				return append(snapshot, trafficDescriptorInstance(0x8800, me.AttributeValueMap{
+					me.TrafficDescriptor_IngressColourMarking: uint8(1),
+				}))
+			},
+			want: "invalid ingress colour marking",
+		},
+		{
+			name: "invalid traffic descriptor meter type",
+			edit: func(snapshot []mib.Instance) []mib.Instance {
+				return append(snapshot, trafficDescriptorInstance(0x8800, me.AttributeValueMap{
+					me.TrafficDescriptor_MeterType: uint8(3),
+				}))
+			},
+			want: "invalid meter type",
 		},
 		{
 			name: "dangling mapper branch",
@@ -329,6 +418,50 @@ func TestValidateServiceGraphRejectsBrokenReferencesAndConstraints(t *testing.T)
 				t.Fatalf("ValidateServiceGraph() error = %v, want %q", err, test.want)
 			}
 		})
+	}
+}
+
+func TestBuildServiceGraphExportsWRRScheduler(t *testing.T) {
+	snapshot := validServiceSnapshot()
+	findInstance(snapshot, me.PriorityQueueClassID, 0x8000).Attributes[me.PriorityQueue_TrafficSchedulerPointer] = uint16(0x9000)
+	findInstance(snapshot, me.PriorityQueueClassID, 0x8000).Attributes[me.PriorityQueue_Weight] = uint8(5)
+	snapshot = append(snapshot, mib.Instance{
+		Key: mib.Key{ClassID: me.TrafficSchedulerClassID, EntityID: 0x9000},
+		Attributes: me.AttributeValueMap{
+			me.TrafficScheduler_TContPointer:   uint16(testTCONT),
+			me.TrafficScheduler_Policy:         uint8(2),
+			me.TrafficScheduler_PriorityWeight: uint8(9),
+		},
+	})
+	graph, err := BuildServiceGraph(snapshot)
+	if err != nil {
+		t.Fatalf("BuildServiceGraph() error = %v", err)
+	}
+	if len(graph.TCONTs) != 1 || graph.TCONTs[0].SchedulerPolicy != 2 ||
+		graph.TCONTs[0].SchedulerWeight != 9 || graph.TCONTs[0].QueueWeights[0] != 5 {
+		t.Fatalf("T-CONT scheduler graph = %#v", graph.TCONTs)
+	}
+}
+
+func TestBuildServiceGraphExportsTrafficDescriptor(t *testing.T) {
+	snapshot := validServiceSnapshot()
+	findInstance(snapshot, me.GemPortNetworkCtpClassID, testMapperGEM).Attributes[me.GemPortNetworkCtp_TrafficDescriptorProfilePointerForUpstream] = uint16(0x8800)
+	snapshot = append(snapshot, mib.Instance{
+		Key: mib.Key{ClassID: me.TrafficDescriptorClassID, EntityID: 0x8800},
+		Attributes: me.AttributeValueMap{
+			me.TrafficDescriptor_Cir: uint32(1000),
+			me.TrafficDescriptor_Pir: uint32(2000),
+			me.TrafficDescriptor_Cbs: uint32(64),
+			me.TrafficDescriptor_Pbs: uint32(128),
+		},
+	})
+	graph, err := BuildServiceGraph(snapshot)
+	if err != nil {
+		t.Fatalf("BuildServiceGraph() error = %v", err)
+	}
+	if len(graph.TrafficDescs) != 1 || graph.TrafficDescs[0].EntityID != 0x8800 ||
+		graph.TrafficDescs[0].CIR != 1000 || graph.GEMPorts[0].UpstreamTD != 0x8800 {
+		t.Fatalf("traffic descriptor graph = %#v", graph)
 	}
 }
 
@@ -595,6 +728,13 @@ func gemPortInstance(entityID, portID uint16) mib.Instance {
 			me.GemPortNetworkCtp_PriorityQueuePointerForDownStream:   uint16(0),
 			me.GemPortNetworkCtp_EncryptionKeyRing:                   uint8(0),
 		},
+	}
+}
+
+func trafficDescriptorInstance(entityID uint16, attributes me.AttributeValueMap) mib.Instance {
+	return mib.Instance{
+		Key:        mib.Key{ClassID: me.TrafficDescriptorClassID, EntityID: entityID},
+		Attributes: attributes,
 	}
 }
 

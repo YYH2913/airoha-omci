@@ -25,15 +25,16 @@ var mapperPBitAttributes = [...]string{
 }
 
 type ServiceGraph struct {
-	UNIs           []EthernetUNI     `json:"unis"`
-	TCONTs         []TCONT           `json:"tconts"`
-	GEMPorts       []GEMPort         `json:"gem_ports"`
-	Interworking   []GEMInterworking `json:"gem_interworking"`
-	Mappers        []PBitMapper      `json:"pbit_mappers"`
-	Bridges        []MACBridge       `json:"bridges"`
-	VLANFilters    []VLANFilter      `json:"vlan_filters"`
-	VLANOperations []VLANOperation   `json:"vlan_operations"`
-	ExtendedVLANs  []ExtendedVLAN    `json:"extended_vlans"`
+	UNIs           []EthernetUNI       `json:"unis"`
+	TCONTs         []TCONT             `json:"tconts"`
+	TrafficDescs   []TrafficDescriptor `json:"traffic_descriptors"`
+	GEMPorts       []GEMPort           `json:"gem_ports"`
+	Interworking   []GEMInterworking   `json:"gem_interworking"`
+	Mappers        []PBitMapper        `json:"pbit_mappers"`
+	Bridges        []MACBridge         `json:"bridges"`
+	VLANFilters    []VLANFilter        `json:"vlan_filters"`
+	VLANOperations []VLANOperation     `json:"vlan_operations"`
+	ExtendedVLANs  []ExtendedVLAN      `json:"extended_vlans"`
 }
 
 type EthernetUNI struct {
@@ -45,8 +46,12 @@ type EthernetUNI struct {
 }
 
 type TCONT struct {
-	EntityID uint16 `json:"entity_id"`
-	AllocID  uint16 `json:"alloc_id"`
+	EntityID        uint16    `json:"entity_id"`
+	AllocID         uint16    `json:"alloc_id"`
+	SchedulerPolicy uint8     `json:"scheduler_policy"`
+	SchedulerWeight uint8     `json:"scheduler_weight"`
+	QueueEntities   [8]uint16 `json:"queue_entities"`
+	QueueWeights    [8]uint8  `json:"queue_weights"`
 }
 
 type GEMPort struct {
@@ -57,7 +62,24 @@ type GEMPort struct {
 	Direction       uint8  `json:"direction"`
 	UpstreamQueue   uint16 `json:"upstream_queue"`
 	DownstreamQueue uint16 `json:"downstream_queue"`
+	UpstreamTD      uint16 `json:"upstream_traffic_descriptor"`
+	DownstreamTD    uint16 `json:"downstream_traffic_descriptor"`
 	EncryptionRing  uint8  `json:"encryption_ring"`
+}
+
+// TrafficDescriptor is the normalized class-280 ME consumed by a native
+// GPON/QDMA backend. Rates and burst sizes retain the G.988 wire values; the
+// backend is responsible for converting them to the hardware tick units.
+type TrafficDescriptor struct {
+	EntityID             uint16 `json:"entity_id"`
+	CIR                  uint32 `json:"cir"`
+	PIR                  uint32 `json:"pir"`
+	CBS                  uint32 `json:"cbs"`
+	PBS                  uint32 `json:"pbs"`
+	ColourMode           uint8  `json:"colour_mode"`
+	IngressColourMarking uint8  `json:"ingress_colour_marking"`
+	EgressColourMarking  uint8  `json:"egress_colour_marking"`
+	MeterType            uint8  `json:"meter_type"`
 }
 
 type GEMInterworking struct {
@@ -186,6 +208,7 @@ func BuildServiceGraph(snapshot []mib.Instance) (ServiceGraph, error) {
 	mappers := make(map[uint16]PBitMapper)
 	gemPorts := make(map[uint16]GEMPort)
 	gemInterworking := make(map[uint16]GEMInterworking)
+	tcontIndexes := make(map[uint16]int)
 
 	trafficManagementOption := uint8(0)
 	if onu, found := instances[mib.Key{ClassID: me.OnuGClassID, EntityID: 0}]; found {
@@ -241,8 +264,18 @@ func BuildServiceGraph(snapshot []mib.Instance) (ServiceGraph, error) {
 			if allocID != nullPointer {
 				activeAllocIDs[allocID] = instance.EntityID
 			}
-			tcont := TCONT{EntityID: instance.EntityID, AllocID: allocID}
+			policy, err := uint8AttributeDefault(instance, me.TCont_Policy, 0)
+			if err != nil {
+				return ServiceGraph{}, err
+			}
+			if policy > 2 {
+				return ServiceGraph{}, fmt.Errorf("T-CONT %#x uses unsupported scheduler policy %d",
+					instance.EntityID, policy)
+			}
+			tcont := TCONT{EntityID: instance.EntityID, AllocID: allocID,
+				SchedulerPolicy: policy}
 			tconts[instance.EntityID] = tcont
+			tcontIndexes[instance.EntityID] = len(graph.TCONTs)
 			graph.TCONTs = append(graph.TCONTs, tcont)
 
 		case me.MacBridgeServiceProfileClassID:
@@ -260,6 +293,125 @@ func BuildServiceGraph(snapshot []mib.Instance) (ServiceGraph, error) {
 			mappers[instance.EntityID] = mapper
 			graph.Mappers = append(graph.Mappers, mapper)
 		}
+	}
+
+	// Resolve the T-CONT scheduler and its eight hardware-facing queues after
+	// all factory and OLT-created MEs are visible. Ethernet UNI queues are
+	// intentionally excluded: their QDMA block is independent from GPON WAN.
+	for tcontID, tcont := range tconts {
+		var schedulerID uint16
+		schedulerFound := false
+		for _, instance := range snapshot {
+			if instance.ClassID != me.TrafficSchedulerClassID {
+				continue
+			}
+			pointer, err := uint16AttributeDefault(instance,
+				me.TrafficScheduler_TContPointer, nullPointer)
+			if err != nil {
+				return ServiceGraph{}, err
+			}
+			if pointer != tcontID {
+				continue
+			}
+			if schedulerFound {
+				return ServiceGraph{}, fmt.Errorf("T-CONT %#x is served by traffic schedulers %#x and %#x",
+					tcontID, schedulerID, instance.EntityID)
+			}
+			policy, err := uint8AttributeDefault(instance,
+				me.TrafficScheduler_Policy, tcont.SchedulerPolicy)
+			if err != nil {
+				return ServiceGraph{}, err
+			}
+			weight, err := uint8AttributeDefault(instance,
+				me.TrafficScheduler_PriorityWeight, 0)
+			if err != nil {
+				return ServiceGraph{}, err
+			}
+			if policy > 2 {
+				return ServiceGraph{}, fmt.Errorf("T-CONT %#x uses unsupported scheduler policy %d",
+					tcontID, policy)
+			}
+			tcont.SchedulerPolicy = policy
+			tcont.SchedulerWeight = weight
+			schedulerID = instance.EntityID
+			schedulerFound = true
+		}
+		var queueSlots [8]bool
+		for _, instance := range snapshot {
+			if instance.ClassID != me.PriorityQueueClassID {
+				continue
+			}
+			related, err := uint32AttributeDefault(instance,
+				me.PriorityQueue_RelatedPort, 0xffffffff)
+			if err != nil {
+				return ServiceGraph{}, err
+			}
+			if uint16(related>>16) != tcontID {
+				continue
+			}
+			priority := uint8(related & 0xff)
+			if priority >= 8 {
+				return ServiceGraph{}, fmt.Errorf("T-CONT %#x priority queue %#x has invalid priority %d",
+					tcontID, instance.EntityID, priority)
+			}
+			if queueSlots[priority] {
+				return ServiceGraph{}, fmt.Errorf("T-CONT %#x has more than one priority queue at priority %d",
+					tcontID, priority)
+			}
+			queueScheduler, err := uint16AttributeDefault(instance,
+				me.PriorityQueue_TrafficSchedulerPointer, 0)
+			if err != nil {
+				return ServiceGraph{}, err
+			}
+			if queueScheduler != 0 {
+				scheduler, exists := instances[mib.Key{ClassID: me.TrafficSchedulerClassID,
+					EntityID: queueScheduler}]
+				if !exists {
+					return ServiceGraph{}, fmt.Errorf("priority queue %#x references missing traffic scheduler %#x",
+						instance.EntityID, queueScheduler)
+				}
+				schedulerTCONT, err := uint16AttributeDefault(scheduler,
+					me.TrafficScheduler_TContPointer, nullPointer)
+				if err != nil {
+					return ServiceGraph{}, err
+				}
+				if schedulerTCONT != tcontID {
+					return ServiceGraph{}, fmt.Errorf("priority queue %#x scheduler %#x serves T-CONT %#x, not %#x",
+						instance.EntityID, queueScheduler, schedulerTCONT, tcontID)
+				}
+			}
+			queueWeight, err := uint8AttributeDefault(instance,
+				me.PriorityQueue_Weight, 1)
+			if err != nil {
+				return ServiceGraph{}, err
+			}
+			tcont.QueueEntities[priority] = instance.EntityID
+			tcont.QueueWeights[priority] = queueWeight
+			queueSlots[priority] = true
+		}
+		if tcont.SchedulerPolicy == 2 {
+			haveWeight := false
+			for priority := range tcont.QueueWeights {
+				haveWeight = haveWeight || tcont.QueueWeights[priority] != 0
+			}
+			if !haveWeight {
+				return ServiceGraph{}, fmt.Errorf("T-CONT %#x WRR scheduler has no non-zero queue weight", tcontID)
+			}
+		}
+		if index, ok := tcontIndexes[tcontID]; ok {
+			graph.TCONTs[index] = tcont
+		}
+	}
+
+	for _, instance := range snapshot {
+		if instance.ClassID != me.TrafficDescriptorClassID {
+			continue
+		}
+		descriptor, err := buildTrafficDescriptor(instance)
+		if err != nil {
+			return ServiceGraph{}, err
+		}
+		graph.TrafficDescs = append(graph.TrafficDescs, descriptor)
 	}
 
 	gemPortIDs := make(map[uint16]uint16)
@@ -309,6 +461,24 @@ func BuildServiceGraph(snapshot []mib.Instance) (ServiceGraph, error) {
 		if downstreamQueue != nullPointer && !hasInstance(instances, me.PriorityQueueClassID, downstreamQueue) {
 			return ServiceGraph{}, fmt.Errorf("GEM CTP %#x references missing downstream priority queue %#x", instance.EntityID, downstreamQueue)
 		}
+		upstreamTD, err := uint16AttributeDefault(instance,
+			me.GemPortNetworkCtp_TrafficDescriptorProfilePointerForUpstream, nullPointer)
+		if err != nil {
+			return ServiceGraph{}, err
+		}
+		downstreamTD, err := uint16AttributeDefault(instance,
+			me.GemPortNetworkCtp_TrafficDescriptorProfilePointerForDownstream, nullPointer)
+		if err != nil {
+			return ServiceGraph{}, err
+		}
+		if err := validateTrafficDescriptorPointer(instances, instance.EntityID,
+			"upstream", upstreamTD); err != nil {
+			return ServiceGraph{}, err
+		}
+		if err := validateTrafficDescriptorPointer(instances, instance.EntityID,
+			"downstream", downstreamTD); err != nil {
+			return ServiceGraph{}, err
+		}
 		encryptionRing, err := uint8AttributeDefault(instance, me.GemPortNetworkCtp_EncryptionKeyRing, 0)
 		if err != nil {
 			return ServiceGraph{}, err
@@ -318,7 +488,8 @@ func BuildServiceGraph(snapshot []mib.Instance) (ServiceGraph, error) {
 		}
 		gemPort := GEMPort{EntityID: instance.EntityID, PortID: portID, TCONT: tcontID,
 			AllocID: tcont.AllocID, Direction: direction, UpstreamQueue: upstreamQueue,
-			DownstreamQueue: downstreamQueue, EncryptionRing: encryptionRing}
+			DownstreamQueue: downstreamQueue, UpstreamTD: upstreamTD,
+			DownstreamTD: downstreamTD, EncryptionRing: encryptionRing}
 		gemPorts[instance.EntityID] = gemPort
 		graph.GEMPorts = append(graph.GEMPorts, gemPort)
 	}
@@ -999,9 +1170,74 @@ func validateUpstreamTrafficPointer(instances map[mib.Key]mib.Instance, gem, tco
 	return nil
 }
 
+func validateTrafficDescriptorPointer(instances map[mib.Key]mib.Instance, gem uint16,
+	direction string, pointer uint16) error {
+	if pointer == nullPointer {
+		return nil
+	}
+	if !hasInstance(instances, me.TrafficDescriptorClassID, pointer) {
+		return fmt.Errorf("GEM CTP %#x references missing %s traffic descriptor %#x",
+			gem, direction, pointer)
+	}
+	return nil
+}
+
+func buildTrafficDescriptor(instance mib.Instance) (TrafficDescriptor, error) {
+	descriptor := TrafficDescriptor{EntityID: instance.EntityID}
+	var err error
+	if descriptor.CIR, err = uint32AttributeDefault(instance, me.TrafficDescriptor_Cir, 0); err != nil {
+		return TrafficDescriptor{}, err
+	}
+	if descriptor.PIR, err = uint32AttributeDefault(instance, me.TrafficDescriptor_Pir, 0); err != nil {
+		return TrafficDescriptor{}, err
+	}
+	if descriptor.CBS, err = uint32AttributeDefault(instance, me.TrafficDescriptor_Cbs, 0); err != nil {
+		return TrafficDescriptor{}, err
+	}
+	if descriptor.PBS, err = uint32AttributeDefault(instance, me.TrafficDescriptor_Pbs, 0); err != nil {
+		return TrafficDescriptor{}, err
+	}
+	if descriptor.ColourMode, err = uint8AttributeDefault(instance, me.TrafficDescriptor_ColourMode, 0); err != nil {
+		return TrafficDescriptor{}, err
+	}
+	if descriptor.IngressColourMarking, err = uint8AttributeDefault(instance,
+		me.TrafficDescriptor_IngressColourMarking, 0); err != nil {
+		return TrafficDescriptor{}, err
+	}
+	if descriptor.EgressColourMarking, err = uint8AttributeDefault(instance,
+		me.TrafficDescriptor_EgressColourMarking, 0); err != nil {
+		return TrafficDescriptor{}, err
+	}
+	if descriptor.MeterType, err = uint8AttributeDefault(instance, me.TrafficDescriptor_MeterType, 0); err != nil {
+		return TrafficDescriptor{}, err
+	}
+	if descriptor.PIR != 0 && descriptor.CIR > descriptor.PIR {
+		return TrafficDescriptor{}, fmt.Errorf("traffic descriptor %#x has CIR %d above PIR %d",
+			descriptor.EntityID, descriptor.CIR, descriptor.PIR)
+	}
+	if descriptor.ColourMode > 1 {
+		return TrafficDescriptor{}, fmt.Errorf("traffic descriptor %#x has invalid colour mode %d",
+			descriptor.EntityID, descriptor.ColourMode)
+	}
+	if descriptor.IngressColourMarking == 1 || descriptor.IngressColourMarking > 7 {
+		return TrafficDescriptor{}, fmt.Errorf("traffic descriptor %#x has invalid ingress colour marking %d",
+			descriptor.EntityID, descriptor.IngressColourMarking)
+	}
+	if descriptor.EgressColourMarking > 7 {
+		return TrafficDescriptor{}, fmt.Errorf("traffic descriptor %#x has invalid egress colour marking %d",
+			descriptor.EntityID, descriptor.EgressColourMarking)
+	}
+	if descriptor.MeterType > 2 {
+		return TrafficDescriptor{}, fmt.Errorf("traffic descriptor %#x has invalid meter type %d",
+			descriptor.EntityID, descriptor.MeterType)
+	}
+	return descriptor, nil
+}
+
 func sortServiceGraph(graph *ServiceGraph) {
 	sort.Slice(graph.UNIs, func(i, j int) bool { return graph.UNIs[i].EntityID < graph.UNIs[j].EntityID })
 	sort.Slice(graph.TCONTs, func(i, j int) bool { return graph.TCONTs[i].EntityID < graph.TCONTs[j].EntityID })
+	sort.Slice(graph.TrafficDescs, func(i, j int) bool { return graph.TrafficDescs[i].EntityID < graph.TrafficDescs[j].EntityID })
 	sort.Slice(graph.GEMPorts, func(i, j int) bool { return graph.GEMPorts[i].EntityID < graph.GEMPorts[j].EntityID })
 	sort.Slice(graph.Interworking, func(i, j int) bool { return graph.Interworking[i].EntityID < graph.Interworking[j].EntityID })
 	sort.Slice(graph.Mappers, func(i, j int) bool { return graph.Mappers[i].EntityID < graph.Mappers[j].EntityID })

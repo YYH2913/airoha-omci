@@ -12,12 +12,12 @@ and extended messages.  A successful build or reaching GPON O5 is not enough.
 | Tables | stable Get/Get Next cache and baseline/enhanced extended Set Table | implemented; OLT verification pending |
 | Notifications | alarm audit/sequence, event-driven Alarm/AVC, requested optical tests and ARC | in progress |
 | Equipment | ONU-G, ONU2-G, ANI-G, four speed-specific Ethernet UNIs, software images | in progress |
-| Traffic | 8 T-CONTs/schedulers, 96 queues, GEM CTP/IW validation and hardware apply | in progress |
+| Traffic | 8 advertised T-CONTs, scheduler/queue graph, GEM CTP/IW validation and hardware apply | upstream SP/WRR/TRTCM implemented; physical verification pending |
 | Performance | common 15-minute engine, GEM CTP and Ethernet UNI/frame PM | class 341, 24, 296, 321 and 322 counters, threshold data 1/2 and TCA implemented; physical verification pending |
 | Ethernet service | resolved bridge, mapper, VLAN and extended VLAN graph | UNI, bridge-port, mapper and GEM-IW associations implemented; advanced treatment pending |
 | Lifecycle | reboot, time sync, software download/activate/commit | implemented; OLT verification pending |
-| Platform | multi-T-CONT/GEM Airoha ABI and transactional Linux backend | GEM, UNI VLAN and multi-profile MAC bridge implemented; hardware offload pending |
-| OpenWrt | package, procd, UCI, rpcd/ubus and LuCI | optical configuration and live service status implemented; mode integration pending |
+| Platform | multi-T-CONT/GEM Airoha ABI and transactional Linux backend | GEM and 16-channel GPON QDMA QoS, UNI VLAN, bridge FDB limit and multi-profile MAC bridge implemented; Ethernet offload pending |
+| OpenWrt | package, procd, UCI, rpcd/ubus and LuCI | optical configuration, live service status and automatic/manual service handover implemented |
 | Verification | unit/fuzz/race/cross-build plus physical OLT traces | pending |
 
 ## Current interoperability limits
@@ -143,7 +143,30 @@ selected LAN ports to be explicitly released from their existing network
 bridge. The platform helper reports `bridge-conflict` and leaves that network
 untouched if any requested LAN or PON port has a non-OMCI master.
 
-The remaining Ethernet blockers are full extended-VLAN DEI/copy/inverse
-behavior, learning-depth and traffic-descriptor enforcement, and native Airoha
-offload. Transactional crash recovery and physical baseline/extended OLT
+The GPON configuration service records the exact legacy `data_gem` setting it
+installs in manual mode. Switching back to automatic OMCI provisioning removes
+only that owned setting. If the OMCI backend has already replaced it with a
+multi-GEM configuration during the transition, the configuration service leaves
+the new state intact. This prevents a stale manual channel from competing with
+the OLT while avoiding an implicit teardown of a newly provisioned service.
+
+GEM CTP upstream and downstream traffic-descriptor pointers are checked as part
+of every graph commit. A non-null pointer must resolve to class 280. The
+XG2010G backend maps one active T-CONT to one of 16 GPON QDMA channels and
+programs its eight queues and egress TRTCM meter atomically with the GEM table.
+The factory MIB currently advertises eight T-CONTs. G.988 scheduler policies 0
+and 1 use strict priority and policy 2 uses WRR8. CIR/PIR retain their G.988
+bytes-per-second units until the driver converts them to kbit/s; CBS/PBS are
+bytes. Multiple GEMs sharing a T-CONT must select the same upstream traffic
+descriptor because EN7581 exposes one egress meter per channel.
+
+Downstream per-GEM traffic descriptors still require an ingress hardware
+backend and are rejected. Colour-aware marking/remarking and RFC 4115 meter
+coupling are also rejected rather than silently approximated. These limits and
+real OLT/optical-module testing remain explicit deployment blockers.
+
+The remaining Ethernet blockers are extended-VLAN DEI treatment, copy and
+some inverse behavior, per-port learning-depth, and native Airoha offload. DEI
+matching is implemented through a classic-BPF gate before the existing VLAN
+action chain. Transactional crash recovery and physical baseline/extended OLT
 interoperability also remain completion gates.
