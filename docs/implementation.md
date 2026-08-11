@@ -14,7 +14,7 @@ and extended messages.  A successful build or reaching GPON O5 is not enough.
 | Equipment | ONU-G, ONU2-G, ANI-G, four speed-specific Ethernet UNIs, software images | implemented; physical OLT verification pending |
 | Traffic | 8 advertised T-CONTs, scheduler/queue graph, GEM CTP/IW validation and hardware apply | upstream SP/WRR/TRTCM implemented; physical verification pending |
 | Performance | common 15-minute engine, GEM CTP and Ethernet UNI/frame PM | class 341, 24, 296, 321 and 322 counters, threshold data 1/2 and TCA implemented; physical verification pending |
-| Ethernet service | resolved bridge, mapper, VLAN and extended VLAN graph | UNI, bridge-port, mapper, GEM-IW and static/copy tag treatment implemented; packet-dependent treatment pending |
+| Ethernet service | resolved bridge, mapper, VLAN and extended VLAN graph | UNI, bridge-port, mapper, GEM-IW, static/copy tag treatment and DSCP-derived PCP implemented; other packet-dependent copies pending |
 | Multicast | multicast GEM-IW, IGMP/MLD policy, subscriber limits and live groups | class 281 and class 309/310 tables, ACL/preview enforcement, native report/query interception, proxy querier and sampled class 311 monitoring implemented; physical OLT verification pending |
 | Lifecycle | reboot, time sync, software download/activate/commit | implemented; OLT verification pending |
 | Platform | multi-T-CONT/GEM Airoha ABI and transactional Linux backend | GEM and 16-channel GPON QDMA QoS, UNI VLAN, bridge FDB limit and multi-profile MAC bridge implemented; Ethernet offload pending |
@@ -234,12 +234,18 @@ coupling are also rejected rather than silently approximated. These limits and
 real OLT/optical-module testing remain explicit deployment blockers.
 
 Extended-VLAN treatment now supports fixed PCP/VID, exact-filter copies,
-same-tag PCP/VID/TPID/DEI preservation, constant DSCP mappings and explicit
-DEI 0/1. Single-tag downstream modes 3/6 and 4/7 invert only VID or PCP and
-preserve the other TCI fields. The Airoha kernel/iproute2 VLAN action extension
-allows each MODIFY field to be omitted; partial MODIFY is deliberately kept in
-software because the flow-offload ABI has no field mask. DEI matching uses a
-classic-BPF gate before the existing VLAN action chain.
+same-tag PCP/VID/TPID/DEI preservation, packet-dependent DSCP-to-PCP mappings
+and explicit DEI 0/1. Selector 10 expands the 64-entry mapping into ordered
+IPv4 and IPv6 `tc flower` classifiers; the downstream inverse is deduplicated
+to the P-bit values that can actually appear. G.988 defines no DSCP field for a
+non-IP frame, so a wildcard-Ethertype selector-10 row applies only to IPv4 and
+IPv6 rather than inventing a default PCP for other protocols. Single-tag
+downstream modes 3/6 and 4/7 invert only VID or PCP and preserve the other TCI
+fields. The Airoha kernel/iproute2 VLAN action extension allows each MODIFY
+field to be omitted; partial MODIFY is deliberately kept in software because
+the flow-offload ABI has no field mask. The target kernel and `tc flower`
+expose outer and inner DEI keys, so DEI, VID, PCP, protocol and DSCP criteria
+are matched atomically without a child chain that could hide later EVTO rows.
 
 The MIB and service graph are persisted as one root-only ABI 5 document after
 every acknowledged mutation. A daemon restart restores OLT-created MEs and the
@@ -250,8 +256,8 @@ transactional factory reset. Software-image commands use a record-only helper
 mode so their MIB changes are durable without reconfiguring an unchanged data
 path.
 
-The remaining Ethernet blockers are packet-dependent DSCP mapping, wildcard
-copies into a newly added tag, double-tag and non-replacement partial inverse,
-per-port learning-depth, and native Airoha offload. These unsupported forms are
-rejected before platform state changes. Physical baseline/extended OLT
-interoperability remains a completion gate.
+The remaining Ethernet blockers are wildcard copies into a newly added tag,
+double-tag and non-replacement partial inverse, per-port learning-depth, and
+native Airoha offload. These unsupported forms are rejected before platform
+state changes. Physical baseline/extended OLT interoperability remains a
+completion gate.

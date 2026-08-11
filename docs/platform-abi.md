@@ -209,8 +209,12 @@ represents a same-tag copy with an omitted field in `tc vlan modify`. Its
 kernel/iproute2 extension treats omitted VID, protocol, priority and DEI fields
 as preserve operations, while PUSH retains the upstream required-VID and
 default-value behavior. Single-tag downstream modes 3/6 and 4/7 use this
-partial MODIFY path to pass PCP or VID and DEI through unchanged. A wildcard
-copy into a newly added tag, a non-constant DSCP-to-P-bit treatment, or a
+partial MODIFY path to pass PCP or VID and DEI through unchanged. A priority-10
+treatment uses the exported 64-entry `dscp_to_pbit` map to produce ordered IPv4
+and IPv6 classifiers, with the inverse direction reduced to its distinct
+resulting P-bit matches. Outer and inner DEI criteria use the platform's
+`vlan_dei` and `cvlan_dei` flower keys in those same classifiers. A wildcard
+copy into a newly added tag or a
 double-tag/non-replacement partial inverse is rejected before the transaction
 starts because the current Linux backend cannot reproduce it packet by packet.
 
