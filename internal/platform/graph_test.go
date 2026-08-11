@@ -828,6 +828,37 @@ func TestBuildServiceGraphExportsDot1RateLimiter(t *testing.T) {
 	}
 }
 
+func TestBuildServiceGraphExportsDirectMapperDot1RateLimiter(t *testing.T) {
+	snapshot := withoutInstance(validServiceSnapshot(),
+		me.MacBridgePortConfigurationDataClassID, mapperPort)
+	mapper := findInstance(snapshot, me.Ieee8021PMapperServiceProfileClassID, testMapper)
+	mapper.Attributes[me.Ieee8021PMapperServiceProfile_TpType] = uint8(1)
+	mapper.Attributes[me.Ieee8021PMapperServiceProfile_TpPointer] = uint16(testUNI)
+	findInstance(snapshot, me.GemInterworkingTerminationPointClassID,
+		testMapperIW).Attributes[me.GemInterworkingTerminationPoint_InterworkingTerminationPointPointer] = uint16(testUNI)
+	snapshot = append(snapshot,
+		trafficDescriptorInstance(0x8800, me.AttributeValueMap{
+			me.TrafficDescriptor_Pir: uint32(2000),
+			me.TrafficDescriptor_Pbs: uint32(128),
+		}),
+		dot1RateLimiterInstance(0x8900, testMapper, 2, 0x8800, 0, 0),
+	)
+	graph, err := BuildServiceGraph(snapshot)
+	if err != nil {
+		t.Fatalf("BuildServiceGraph() error = %v", err)
+	}
+	if len(graph.Dot1RateLimiters) != 1 {
+		t.Fatalf("direct mapper dot1 rate limiter graph = %#v", graph.Dot1RateLimiters)
+	}
+	limiter := graph.Dot1RateLimiters[0]
+	if limiter.ParentME != testMapper || limiter.TPType != 2 ||
+		limiter.UpstreamUnicastFloodTD != 0x8800 ||
+		limiter.UpstreamBroadcastTD != nullPointer ||
+		limiter.UpstreamMulticastPayloadTD != nullPointer {
+		t.Fatalf("direct mapper dot1 rate limiter = %#v", limiter)
+	}
+}
+
 func TestBuildServiceGraphRejectsInvalidDot1RateLimiter(t *testing.T) {
 	tests := []struct {
 		name string

@@ -2117,9 +2117,12 @@ func buildDot1RateLimiter(instance mib.Instance,
 			&limiter.UpstreamMulticastPayloadTD},
 	}
 	for _, pointer := range pointers {
-		*pointer.target, err = uint16AttributeDefault(instance, pointer.field, nullPointer)
+		*pointer.target, err = uint16AttributeDefault(instance, pointer.field, 0)
 		if err != nil {
 			return Dot1RateLimiter{}, mib.Key{}, err
+		}
+		if *pointer.target == 0 {
+			*pointer.target = nullPointer
 		}
 		if *pointer.target != nullPointer &&
 			!hasInstance(instances, me.TrafficDescriptorClassID, *pointer.target) {

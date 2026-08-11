@@ -276,11 +276,12 @@ broadcast and multicast payload traffic. Linux bridge `l2_miss` metadata makes
 the categories disjoint after FDB/MDB lookup. The backend enforces the explicit
 class-280 PIR/PBS as a red-drop bucket and removes all three filters when the
 OLT replaces or deletes the limiter. A mapper used by exactly one active bridge
-resolves to that bridge endpoint. A direct mapper is rejected because it has no
-FDB state with which to implement unknown-unicast semantics faithfully.
+resolves to that bridge endpoint. A direct mapper with a non-null limiter is
+routed through a private two-port Linux bridge containing its UNI and an
+internal ANI. This supplies the real learned-FDB decision required to distinguish
+unknown from known unicast without changing the OLT-visible OMCI graph.
 
-Direct-mapper class-298 policing still requires an ingress/FDB-aware hardware
-backend and is rejected. Colour-aware marking/remarking, green/yellow
+Colour-aware marking/remarking, green/yellow
 propagation and RFC 4115 meter coupling are also rejected rather than silently
 approximated. These limits and real
 OLT/optical-module testing remain explicit deployment blockers.

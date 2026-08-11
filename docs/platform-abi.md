@@ -230,11 +230,17 @@ The current policer preserves the class-280 G.988 byte units until apply, then
 uses `PIR * 8` bit/s and PBS bytes as the red-drop bucket. It accepts only
 colour-blind descriptors without ingress or egress remarking and rejects RFC
 4115 coupling. CIR/CBS remain available to the native QDMA TRTCM path but Linux
-does not preserve a green/yellow colour for later queues. A direct mapper has no
-FDB decision and is therefore rejected when a non-null class-298 pointer is
-present; an implementation must not reinterpret all direct unicast as unknown
-unicast or let broadcast consume a second multicast meter. Non-zero PIR and PBS
-are required because Linux cannot infer the ONU's G.988 factory meter policy.
+does not preserve a green/yellow colour for later queues. A direct mapper with
+a non-null class-298 pointer is materialized as a private two-port Linux bridge
+between its Ethernet UNI and an internal ANI. Upstream mapper classification
+sets the GEM mark before bridge lookup; the ANI egress then supplies the same
+`l2_miss` metadata as an explicit MAC bridge. Downstream GEM traffic enters via
+the ANI peer. The private `ommXXXX` bridge and `omxXXXX`/`omyXXXX` veth pair are
+transactional platform objects and are not advertised as OMCI MEs. This avoids
+reinterpreting all direct unicast as unknown or letting broadcast consume a
+second multicast meter. Non-zero PIR and PBS are required because Linux cannot
+infer the ONU's G.988 factory meter policy. Class-298 wire/default null pointer
+`0` is normalized to the platform ABI null value `0xffff`.
 
 The standalone OMCI daemon still owns the corresponding G.988 entities,
 attribute validation, MIB data-sync and response status. Therefore migrating
