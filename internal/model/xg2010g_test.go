@@ -27,10 +27,13 @@ func TestXG2010GFactoryMIB(t *testing.T) {
 	configurations := make(map[uint16]uint8)
 	sensedTypes := make(map[uint16]uint8)
 	var ani mib.Instance
+	var onu mib.Instance
 	var onu2 mib.Instance
 	circuitPacks := make(map[uint16]mib.Instance)
 	for _, item := range store.Snapshot() {
 		switch item.ClassID {
+		case me.OnuGClassID:
+			onu = item
 		case me.AniGClassID:
 			ani = item
 		case me.Onu2GClassID:
@@ -69,6 +72,10 @@ func TestXG2010GFactoryMIB(t *testing.T) {
 	wantQueues := (defaultTContCount + len(ethernetConfiguration)) * queuesPerPort
 	if queues != wantQueues {
 		t.Fatalf("priority queue count = %d, want %d", queues, wantQueues)
+	}
+	if onu.Attributes[me.OnuG_TrafficManagementOption] != uint8(0) {
+		t.Fatalf("ONU-G traffic management option = %#v, want priority controlled",
+			onu.Attributes[me.OnuG_TrafficManagementOption])
 	}
 	if onu2.Attributes[me.Onu2G_TotalPriorityQueueNumber] != uint16(0) ||
 		onu2.Attributes[me.Onu2G_TotalTrafficSchedulerNumber] != uint8(0) {

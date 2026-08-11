@@ -58,9 +58,11 @@ func XG2010G(identity Identity) ([]mib.Instance, error) {
 			me.OnuData_MibDataSync: uint8(0),
 		}),
 		instance(me.OnuGClassID, 0, me.AttributeValueMap{
-			me.OnuG_VendorId:                cloneBytes(vendor),
-			me.OnuG_Version:                 octets(identity.Version, 14),
-			me.OnuG_SerialNumber:            serial,
+			me.OnuG_VendorId:     cloneBytes(vendor),
+			me.OnuG_Version:      octets(identity.Version, 14),
+			me.OnuG_SerialNumber: serial,
+			// EN7581 meters a T-CONT, not each GEM connection. Advertising
+			// option 2 would promise per-connection shaping that it cannot do.
 			me.OnuG_TrafficManagementOption: uint8(0),
 			me.OnuG_BatteryBackup:           uint8(0),
 			me.OnuG_AdministrativeState:     uint8(0),

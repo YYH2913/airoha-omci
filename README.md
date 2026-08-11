@@ -31,7 +31,7 @@ multicast runtime parses IGMPv1/v2/v3
 and MLDv1/v2, enforces class 309/310 policy, runs the proxy querier and delayed
 last-member state machine, and publishes live class 311 state. The daemon is
 not yet ready for operator deployment
-because advanced VLAN/bridge associations, hardware offload and real OLT
+because advanced traffic-descriptor colour handling, hardware offload and real OLT
 interoperability are incomplete; see
 [the implementation matrix](docs/implementation.md).
 
@@ -43,6 +43,12 @@ only privileged Airoha and OpenWrt operations: GEM/T-CONT programming,
 Ethernet/VLAN application, alarms, reboot/time control and persistent software
 slots. This keeps proprietary SDK source out of the protocol repository while
 still allowing the required hardware ABI to be implemented independently.
+
+XG2010G advertises ONU-G traffic-management option 0 deliberately. Its native
+QDMA meter is shared by every GEM on a T-CONT, so advertising option 2 would
+incorrectly promise per-connection upstream shaping. The platform still applies
+compatible OLT traffic descriptors as per-T-CONT upstream meters and per-GEM
+downstream red-drop policers without overstating that hardware capability.
 
 The helper contracts are documented in
 [the platform ABI](docs/platform-abi.md). XG2010G software-slot storage and

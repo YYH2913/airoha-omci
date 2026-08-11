@@ -13,12 +13,12 @@ and extended messages.  A successful build or reaching GPON O5 is not enough.
 | Tables | stable Get/Get Next cache and baseline/enhanced extended Set Table | implemented; OLT verification pending |
 | Notifications | alarm audit/sequence, event-driven Alarm/AVC, requested optical tests and ARC | implemented; physical OLT verification pending |
 | Equipment | ONU-G, ONU2-G, ANI-G, four speed-specific Ethernet UNIs, software images | implemented; physical OLT verification pending |
-| Traffic | 8 advertised T-CONTs, scheduler/queue graph, GEM CTP/IW and class-298 rate-limit validation and apply | upstream SP/WRR/TRTCM and bridge flood/broadcast/multicast policing implemented; physical verification pending |
+| Traffic | 8 advertised T-CONTs, scheduler/queue graph, GEM CTP/IW and class-298 rate-limit validation and apply | upstream SP/WRR/TRTCM, per-GEM downstream red-drop and bridge flood/broadcast/multicast policing implemented; physical verification pending |
 | Performance | common 15-minute engine, FEC, GEM CTP and Ethernet UNI/frame PM | class 312, 341, 24, 296, 321 and 322 counters, threshold data 1/2 and TCA implemented; physical verification pending |
 | Ethernet service | resolved bridge, mapper, VLAN and extended VLAN graph | UNI, bridge-port, mapper, GEM-IW, packet-dependent cross-tag copy, structural multi-tag inverse and DSCP-derived PCP implemented; physical verification pending |
 | Multicast | multicast GEM-IW, IGMP/MLD policy, subscriber limits and live groups | class 281 and class 309/310 tables, ACL/preview enforcement, native report/query interception, proxy querier and sampled class 311 monitoring implemented; physical OLT verification pending |
 | Lifecycle | reboot, time sync, software download/activate/commit | implemented; OLT verification pending |
-| Platform | multi-T-CONT/GEM Airoha ABI and transactional Linux backend | GEM and 16-channel GPON QDMA QoS, UNI VLAN, bridge FDB/rate limits and multi-profile MAC bridge implemented; Ethernet offload pending |
+| Platform | multi-T-CONT/GEM Airoha ABI and transactional Linux backend | GEM, 16-channel GPON QDMA QoS, downstream GEM policing, UNI VLAN, bridge FDB/rate limits and multi-profile MAC bridge implemented; Ethernet offload pending |
 | OpenWrt | package, procd, UCI, rpcd/ubus and LuCI | optical configuration, live service status and automatic/manual service handover implemented |
 | Verification | unit/fuzz/race/cross-build plus physical OLT traces | pending |
 
@@ -251,6 +251,16 @@ bytes-per-second units until the driver converts them to kbit/s; CBS/PBS are
 bytes. Multiple GEMs sharing a T-CONT must select the same upstream traffic
 descriptor because EN7581 exposes one egress meter per channel.
 
+ONU-G traffic-management option 0 remains the advertised capability because
+the native meter is per T-CONT rather than per GEM connection. Advertising
+option 2 would promise per-connection upstream shaping. A compatible OLT that
+supplies a downstream GEM traffic-descriptor pointer is supported: the receive
+GEM Port-ID carried in the reserved skb mark selects a `pon` ingress policer.
+For colour-blind descriptors without remarking, CIR/CBS distinguish green from
+yellow but both continue, while PIR/PBS identify red traffic and drop it. A
+zero PIR selects the XG2010G unlimited factory policy; a non-zero rate with a
+zero burst uses one maximum Ethernet frame, 2000 bytes.
+
 Dot1 rate limiter (class 298) parent and descriptor references are now part of
 the same validated graph. On an active MAC bridge profile, separate software
 policers run at the bridge-facing ANI egress for unknown-unicast flood,
@@ -261,10 +271,10 @@ OLT replaces or deletes the limiter. A mapper used by exactly one active bridge
 resolves to that bridge endpoint. A direct mapper is rejected because it has no
 FDB state with which to implement unknown-unicast semantics faithfully.
 
-Downstream per-GEM traffic descriptors and direct-mapper class-298 policing
-still require an ingress hardware backend and are rejected. Colour-aware
-marking/remarking, green/yellow propagation and RFC 4115 meter coupling are also
-rejected rather than silently approximated. These limits and real
+Direct-mapper class-298 policing still requires an ingress/FDB-aware hardware
+backend and is rejected. Colour-aware marking/remarking, green/yellow
+propagation and RFC 4115 meter coupling are also rejected rather than silently
+approximated. These limits and real
 OLT/optical-module testing remain explicit deployment blockers.
 
 Extended-VLAN treatment supports fixed and packet-dependent PCP/VID/TPID/DEI,

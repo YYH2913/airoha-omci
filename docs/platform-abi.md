@@ -179,7 +179,7 @@ the OMCI mutation:
 | T-CONT (class 262) | GPON Alloc-ID and WAN channel | allocate or release the T-CONT slot |
 | GEM CTP (class 268) | GPON GEM table and channel direction | enable GEM, encryption and GEM/mark mapping |
 | Priority queue (class 277) | QDMA WAN channel queue 0-7 | set SP/WRR mode and weight |
-| Traffic descriptor (class 280) | QDMA TRTCM meter | set CIR/PIR/CBS/PBS and enable/disable |
+| Traffic descriptor (class 280) | QDMA TRTCM meter or PON ingress GEM policer | set CIR/PIR/CBS/PBS and enable/disable |
 | Dot1 rate limiter (class 298) | Linux bridge ANI egress flower/police rules | police unknown-unicast flood, broadcast and multicast payload independently |
 
 The SDK names these capabilities `qdmamgr_lib_set_channel_qos`,
@@ -197,9 +197,15 @@ maps to WRR8 and requires at least one non-zero queue weight. Class-280 CIR and
 PIR values are G.988 bytes/s and are converted by the driver to kbit/s with
 `bytes/s * 8 / 1000`; CBS and PBS remain bytes. One egress TRTCM meter exists
 per T-CONT channel, so all GEMs sharing a T-CONT must use the same upstream
-traffic descriptor. Downstream per-GEM metering, colour-aware marking or
-remarking, and RFC 4115 coupling are rejected explicitly because the current
-hardware adapter cannot represent them faithfully.
+traffic descriptor. The factory MIB therefore advertises ONU-G
+traffic-management option 0; option 2 would incorrectly claim per-connection
+upstream shaping. A downstream GEM descriptor is selected by the receive GEM
+Port-ID in the reserved skb mark and applies a `pon` ingress PIR/PBS red-drop
+policer before bridge or direct delivery. A zero PIR selects the unlimited
+factory policy. When a non-zero CIR or PIR has a zero burst, the XG2010G
+factory burst is one maximum Ethernet frame (2000 bytes). Colour-aware marking
+or remarking and RFC 4115 coupling are rejected explicitly because the current
+adapter cannot represent them faithfully.
 
 Class 298 is resolved against either a MAC bridge service profile or an IEEE
 802.1p mapper. At most one limiter may reference a given parent, and every
