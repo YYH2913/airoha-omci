@@ -37,6 +37,7 @@ const (
 	OperationSetTable Operation = "set-table"
 	OperationDelete   Operation = "delete"
 	OperationReset    Operation = "reset"
+	OperationCommand  Operation = "command"
 	// OperationAutonomous applies an ONU-originated service-graph change while
 	// preserving MIB data sync. It is currently used when a timed class-310 row
 	// expires and must be removed from both the MIB and platform desired state.
@@ -396,8 +397,8 @@ func (s *Store) UpdateAutonomousBatch(updates map[Key]me.AttributeValueMap) erro
 
 // UpdateByCommand atomically records read-only state changed as the result of
 // one OLT action. Multiple MEs can change, but MIB data sync advances only once
-// for the command. The action's dedicated controller has already applied the
-// platform operation, so the service-graph applier is not invoked here.
+// for the command. OperationCommand lets a transactional applier persist the
+// MIB without reapplying an unchanged service graph.
 func (s *Store) UpdateByCommand(updates map[Key]me.AttributeValueMap) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -458,9 +459,7 @@ func (s *Store) UpdateByCommand(updates map[Key]me.AttributeValueMap) error {
 
 	dataSync := s.nextDataSyncLocked()
 	setDataSync(proposed, dataSync)
-	s.current = proposed
-	s.dataSync = dataSync
-	return nil
+	return s.commitLocked(OperationCommand, nil, nil, proposed, dataSync)
 }
 
 func (s *Store) Delete(key Key) error {
@@ -750,6 +749,8 @@ func cloneValue(value interface{}) interface{} {
 		return append([]uint16(nil), typed...)
 	case []uint32:
 		return append([]uint32(nil), typed...)
+	case []uint64:
+		return append([]uint64(nil), typed...)
 	case me.TableRows:
 		return me.TableRows{NumRows: typed.NumRows, Rows: append([]byte(nil), typed.Rows...)}
 	default:

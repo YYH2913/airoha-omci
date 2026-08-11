@@ -7,7 +7,7 @@ and extended messages.  A successful build or reaching GPON O5 is not enough.
 | --- | --- | --- |
 | OMCC transport | raw RX/TX, cancellation, frame bounds, counters | implemented; physical adapter verification pending |
 | Transactions | per-priority scheduling, stop-and-wait replay and TCI validation | implemented; physical saturation verification pending |
-| MIB | ONU defaults, platform-gated create/delete/set, reset, data sync | in progress |
+| MIB | ONU defaults, platform-gated create/delete/set, reset, data sync | implemented; physical OLT verification pending |
 | MIB upload | baseline fragmentation and extended multi-ME packing | in progress |
 | Tables | stable Get/Get Next cache and baseline/enhanced extended Set Table | implemented; OLT verification pending |
 | Notifications | alarm audit/sequence, event-driven Alarm/AVC, requested optical tests and ARC | in progress |
@@ -154,7 +154,7 @@ CTP are programmed as downstream-only flows, and their receive marks are
 dispatched to that ANI endpoint. The OpenWrt backend disables Linux bridge
 multicast snooping so the native G.988 runtime is the sole membership authority.
 
-The native `airoha-mcastd` backend consumes the committed ABI 4 graph and
+The native `airoha-mcastd` backend consumes the committed ABI 5 graph and
 intercepts IGMPv1/v2/v3 and MLDv1/v2 reports before Linux bridge snooping. It
 enforces class 309 dynamic/static ACL ranges and class 310 service-package,
 allowed-preview, group and imputed-bandwidth policy per UNI. Static ranges and
@@ -222,8 +222,17 @@ allows each MODIFY field to be omitted; partial MODIFY is deliberately kept in
 software because the flow-offload ABI has no field mask. DEI matching uses a
 classic-BPF gate before the existing VLAN action chain.
 
+The MIB and service graph are persisted as one root-only ABI 5 document after
+every acknowledged mutation. A daemon restart restores OLT-created MEs and the
+MIB data-sync counter only after validating the state version, attribute types,
+factory completeness, ONU vendor/serial identity and a graph reconstructed from
+the MIB. Corrupt, stale or identity-mismatched state is replaced by a
+transactional factory reset. Software-image commands use a record-only helper
+mode so their MIB changes are durable without reconfiguring an unchanged data
+path.
+
 The remaining Ethernet blockers are packet-dependent DSCP mapping, wildcard
 copies into a newly added tag, double-tag and non-replacement partial inverse,
 per-port learning-depth, and native Airoha offload. These unsupported forms are
-rejected before platform state changes. Transactional crash recovery and
-physical baseline/extended OLT interoperability also remain completion gates.
+rejected before platform state changes. Physical baseline/extended OLT
+interoperability remains a completion gate.

@@ -40,15 +40,30 @@ an OLT may retransmit a request.
 
 ## Other helpers
 
-The apply helper receives a complete, resolved candidate service graph on
-stdin and must apply it transactionally. ABI version 4 has this top-level
+The apply helper receives a complete, resolved candidate service graph and its
+corresponding MIB state on stdin and must commit them transactionally. ABI
+version 5 has this top-level
 shape:
 
 ```json
 {
-  "version": 4,
+  "version": 5,
   "operation": "set-table",
   "mib_data_sync": 17,
+  "mib_state": {
+    "version": 1,
+    "mib_data_sync": 17,
+    "instances": [{
+      "class_id": 2,
+      "entity_id": 0,
+      "origin": 0,
+      "attributes": [{
+        "name": "MibDataSync",
+        "kind": "uint8",
+        "unsigned": 17
+      }]
+    }]
+  },
   "service_graph": {
     "unis": [],
     "tconts": [{
@@ -83,21 +98,33 @@ shape:
 }
 ```
 
-The graph contains validated and deterministically ordered references. Raw
-managed-entity attributes are not part of this ABI; interpreting G.988 remains
-the daemon's responsibility. Extended VLAN tables are emitted as named filter
-and treatment fields, including enhanced row keys and directions; no encoded
-table rows cross this boundary. ABI 4 likewise emits class 309 ACLs and class
-310 service-package/allowed-preview rows as normalized logical entries. Set
+The graph contains validated and deterministically ordered references. The
+versioned `mib_state` is an opaque daemon recovery record; the platform backend
+must not interpret it as hardware configuration. Attribute values carry an
+explicit scalar, octet, integer-array or table type so JSON cannot erase their
+G.988 representation. Extended VLAN tables are emitted in `service_graph` as
+named filter and treatment fields, including enhanced row keys and directions;
+no encoded table rows cross the hardware boundary. ABI 5 retains the class 309
+ACLs and class 310 service-package/allowed-preview rows introduced by ABI 4 as
+normalized logical entries. Set
 control, row-part, test and reserved bits never cross the boundary. Unknown ABI
 versions must be rejected before any platform state is changed.
+
+For Create, Set, Set table, Delete, Reset and autonomous service changes, the
+OpenWrt helper applies the candidate graph and atomically replaces
+`desired.json` only after hardware programming succeeds. The `command`
+operation records software-image lifecycle MIB changes by atomically replacing
+the document without reapplying its unchanged graph. On daemon startup, a
+committed state is accepted only when its ONU vendor/serial, factory MEs,
+MIB-data-sync value and graph reconstructed from the MIB all match. Otherwise
+the daemon commits a factory reset, which also removes the stale platform graph.
 
 `airoha-mcastd -validate FILE` applies the same strict JSON decoder, graph
 resolution and G.988 multicast policy compiler without opening packet sockets
 or changing Linux state. The transactional OpenWrt apply helper runs this
 validation before programming a candidate graph.
 
-At runtime the multicast daemon watches the atomically replaced
+At runtime the multicast daemon watches the root-only, atomically replaced
 `/var/run/airoha-omcid/desired.json`. For each configured subscriber it writes
 one atomic class-311 monitor document to
 `/var/run/airoha-omci/multicast/ENTITY.json`:

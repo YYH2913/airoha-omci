@@ -116,7 +116,8 @@ func run(opts options) error {
 	// Class 309 expresses last-member query intervals in 0.1 s units.
 	expiry := time.NewTicker(100 * time.Millisecond)
 	defer expiry.Stop()
-	var applied [sha256.Size]byte
+	var appliedDocument [sha256.Size]byte
+	var appliedPolicy [sha256.Size]byte
 	var appliedMIBDataSync uint8
 	loaded := false
 	reload := func() {
@@ -127,8 +128,8 @@ func run(opts options) error {
 			}
 			return
 		}
-		digest := sha256.Sum256(document)
-		if loaded && digest == applied {
+		documentDigest := sha256.Sum256(document)
+		if loaded && documentDigest == appliedDocument {
 			return
 		}
 		request, err := platform.DecodeApplyRequest(bytes.NewReader(document))
@@ -141,11 +142,26 @@ func run(opts options) error {
 			log.Printf("resolve desired multicast policy: %v", err)
 			return
 		}
+		policyDocument, err := json.Marshal(policy)
+		if err != nil {
+			log.Printf("encode desired multicast policy: %v", err)
+			return
+		}
+		policyDigest := sha256.Sum256(policyDocument)
+		if loaded && policyDigest == appliedPolicy {
+			appliedDocument = documentDigest
+			appliedMIBDataSync = request.MIBDataSync
+			if err := publishMonitors(opts.stateDir, runtime, appliedMIBDataSync); err != nil {
+				log.Printf("publish multicast monitors: %v", err)
+			}
+			return
+		}
 		if err := runtime.Configure(policy); err != nil {
 			log.Printf("apply desired multicast policy: %v", err)
 			return
 		}
-		applied, appliedMIBDataSync, loaded = digest, request.MIBDataSync, true
+		appliedDocument, appliedPolicy = documentDigest, policyDigest
+		appliedMIBDataSync, loaded = request.MIBDataSync, true
 		log.Printf("applied multicast policy MIB data sync %d on %v",
 			request.MIBDataSync, runtime.Interfaces())
 		if err := publishMonitors(opts.stateDir, runtime, appliedMIBDataSync); err != nil {

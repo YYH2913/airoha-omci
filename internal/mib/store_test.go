@@ -354,6 +354,7 @@ func TestAutonomousBatchValidationFailureIsAtomic(t *testing.T) {
 
 func TestCommandUpdateChangesMultipleMEsAndAdvancesDataSyncOnce(t *testing.T) {
 	applyCalls := 0
+	var changes []Change
 	store, err := NewWithApplier([]Instance{
 		{
 			Key: Key{ClassID: me.OnuDataClassID, EntityID: 0},
@@ -373,8 +374,9 @@ func TestCommandUpdateChangesMultipleMEsAndAdvancesDataSyncOnce(t *testing.T) {
 				me.SoftwareImage_IsActive: uint8(0),
 			},
 		},
-	}, ApplyFunc(func(Change) error {
+	}, ApplyFunc(func(change Change) error {
 		applyCalls++
+		changes = append(changes, change)
 		return nil
 	}))
 	if err != nil {
@@ -387,8 +389,10 @@ func TestCommandUpdateChangesMultipleMEsAndAdvancesDataSyncOnce(t *testing.T) {
 	if err := store.UpdateByCommand(updates); err != nil {
 		t.Fatalf("UpdateByCommand() error = %v", err)
 	}
-	if store.DataSync() != 1 || applyCalls != 0 {
-		t.Fatalf("command update state: sync=%d apply calls=%d, want 1/0", store.DataSync(), applyCalls)
+	if store.DataSync() != 1 || applyCalls != 1 || len(changes) != 1 ||
+		changes[0].Operation != OperationCommand {
+		t.Fatalf("command update state: sync=%d changes=%+v, want one command commit",
+			store.DataSync(), changes)
 	}
 	for entityID, want := range map[uint16]uint8{0: 0, 1: 1} {
 		instance, err := store.Get(Key{ClassID: me.SoftwareImageClassID, EntityID: entityID}, 0x2000)
@@ -405,6 +409,9 @@ func TestCommandUpdateChangesMultipleMEsAndAdvancesDataSyncOnce(t *testing.T) {
 	}
 	if store.DataSync() != 1 {
 		t.Fatalf("unchanged command update advanced data sync to %d", store.DataSync())
+	}
+	if applyCalls != 1 {
+		t.Fatalf("unchanged command update caused %d apply calls, want 1 total", applyCalls)
 	}
 }
 

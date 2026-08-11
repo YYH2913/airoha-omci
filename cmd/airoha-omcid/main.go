@@ -10,6 +10,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"reflect"
 	"syscall"
 	"time"
 
@@ -34,6 +35,7 @@ type options struct {
 	serialNumber   string
 	equipmentID    string
 	statusPath     string
+	statePath      string
 	applyHelper    string
 	controlHelper  string
 	eventHelper    string
@@ -46,6 +48,7 @@ func main() {
 	flag.StringVar(&opts.serialNumber, "serial", "", "ONU serial: four vendor characters and eight hex digits")
 	flag.StringVar(&opts.equipmentID, "equipment-id", "XG2010G", "ONU equipment identifier")
 	flag.StringVar(&opts.statusPath, "status", "/var/run/airoha-omcid/status.json", "atomic JSON status path")
+	flag.StringVar(&opts.statePath, "state", "", "committed platform state used to restore the ONU MIB")
 	flag.StringVar(&opts.applyHelper, "apply-helper", "", "fixed executable receiving candidate service graphs as JSON")
 	flag.StringVar(&opts.controlHelper, "control-helper", "", "fixed executable handling time sync and scheduled reboot")
 	flag.StringVar(&opts.eventHelper, "event-helper", "", "fixed executable streaming platform events as JSON lines")
@@ -73,7 +76,7 @@ func run(opts options) error {
 		applier = platform.ExecApplier{Path: opts.applyHelper}
 		platformBackend = opts.applyHelper
 	}
-	store, err := mib.NewWithApplier(factory, applier)
+	store, err := initializeMIB(factory, applier, opts.statePath)
 	if err != nil {
 		return fmt.Errorf("initialize ONU MIB: %w", err)
 	}
@@ -367,4 +370,51 @@ func run(opts options) error {
 			}
 		}
 	}
+}
+
+func initializeMIB(factory []mib.Instance, applier mib.Applier, statePath string) (*mib.Store, error) {
+	options := mib.Options{Applier: applier}
+	if statePath == "" {
+		return mib.NewWithOptions(factory, options)
+	}
+
+	restoreError := error(nil)
+	document, err := os.Open(statePath)
+	if err == nil {
+		request, decodeErr := platform.DecodeApplyRequest(document)
+		closeErr := document.Close()
+		if decodeErr != nil {
+			restoreError = decodeErr
+		} else if closeErr != nil {
+			restoreError = closeErr
+		} else {
+			store, stateErr := mib.NewFromState(factory, *request.MIBState, options)
+			if stateErr != nil {
+				restoreError = stateErr
+			} else {
+				graph, graphErr := platform.BuildServiceGraph(store.Snapshot())
+				if graphErr != nil {
+					restoreError = graphErr
+				} else if !reflect.DeepEqual(graph, request.Service) {
+					restoreError = fmt.Errorf("persisted service graph does not match restored MIB")
+				} else {
+					return store, nil
+				}
+			}
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		restoreError = err
+	}
+	if restoreError != nil {
+		log.Printf("discard committed OMCI state %s: %v", statePath, restoreError)
+	}
+
+	store, err := mib.NewWithOptions(factory, options)
+	if err != nil {
+		return nil, err
+	}
+	if err := store.Reset(); err != nil {
+		return nil, fmt.Errorf("commit factory MIB reset: %w", err)
+	}
+	return store, nil
 }

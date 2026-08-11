@@ -19,6 +19,8 @@ independently from kernel and LuCI changes.  The OpenWrt tree contains only:
    dispatches requests and serializes responses.
 3. `mib` owns ONU-created defaults and OLT-created managed entities.  Every
    mutation is validated before it becomes visible and advances MIB data sync.
+   Its versioned, type-preserving snapshot is committed in the same platform
+   transaction as the resolved service graph and restored after daemon failure.
 4. `backend` translates service managed entities into a desired hardware and
    Linux network state, validates the complete dependency graph, then applies
    it atomically.

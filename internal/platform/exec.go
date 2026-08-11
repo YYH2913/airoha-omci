@@ -18,7 +18,7 @@ import (
 
 const defaultApplyTimeout = 10 * time.Second
 
-const ApplyABIVersion = 4
+const ApplyABIVersion = 5
 
 // ApplyRequest is the versioned boundary between the G.988 engine and a
 // privileged platform helper. The helper consumes resolved connectivity, not
@@ -27,6 +27,7 @@ type ApplyRequest struct {
 	Version     uint8         `json:"version"`
 	Operation   mib.Operation `json:"operation"`
 	MIBDataSync uint8         `json:"mib_data_sync"`
+	MIBState    *mib.State    `json:"mib_state"`
 	Service     ServiceGraph  `json:"service_graph"`
 }
 
@@ -52,9 +53,20 @@ func DecodeApplyRequest(reader io.Reader) (ApplyRequest, error) {
 	}
 	switch request.Operation {
 	case mib.OperationCreate, mib.OperationSet, mib.OperationSetTable,
-		mib.OperationDelete, mib.OperationReset, mib.OperationAutonomous:
+		mib.OperationDelete, mib.OperationReset, mib.OperationCommand,
+		mib.OperationAutonomous:
 	default:
 		return ApplyRequest{}, fmt.Errorf("invalid platform operation %q", request.Operation)
+	}
+	if request.MIBState == nil {
+		return ApplyRequest{}, fmt.Errorf("platform request has no MIB state")
+	}
+	if err := request.MIBState.Validate(); err != nil {
+		return ApplyRequest{}, fmt.Errorf("invalid platform MIB state: %w", err)
+	}
+	if request.MIBState.MIBDataSync != request.MIBDataSync {
+		return ApplyRequest{}, fmt.Errorf("platform MIB data sync %d does not match state %d",
+			request.MIBDataSync, request.MIBState.MIBDataSync)
 	}
 	policy, err := request.Service.MulticastPolicy()
 	if err != nil {
@@ -89,6 +101,10 @@ func (a ExecApplier) Apply(change mib.Change) error {
 	if err := multicast.Validate(policy); err != nil {
 		return err
 	}
+	mibState, err := mib.ExportState(change.Snapshot, change.MIBDataSync)
+	if err != nil {
+		return err
+	}
 	timeout := a.Timeout
 	if timeout <= 0 {
 		timeout = defaultApplyTimeout
@@ -97,6 +113,7 @@ func (a ExecApplier) Apply(change mib.Change) error {
 		Version:     ApplyABIVersion,
 		Operation:   change.Operation,
 		MIBDataSync: change.MIBDataSync,
+		MIBState:    &mibState,
 		Service:     graph,
 	})
 	if err != nil {
@@ -105,7 +122,11 @@ func (a ExecApplier) Apply(change mib.Change) error {
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	command := exec.CommandContext(ctx, a.Path)
+	arguments := []string(nil)
+	if change.Operation == mib.OperationCommand {
+		arguments = []string{"record"}
+	}
+	command := exec.CommandContext(ctx, a.Path, arguments...)
 	command.Stdin = bytes.NewReader(payload)
 	output, err := command.CombinedOutput()
 	if ctx.Err() != nil {

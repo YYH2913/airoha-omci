@@ -1,0 +1,138 @@
+// SPDX-License-Identifier: Apache-2.0
+
+package mib
+
+import (
+	"encoding/json"
+	"reflect"
+	"strings"
+	"testing"
+
+	me "github.com/opencord/omci-lib-go/v2/generated"
+)
+
+func TestStateRoundTripRestoresCommittedMIB(t *testing.T) {
+	factory := stateTestFactory("ABCD")
+	store, err := New(factory)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	if err := store.Create(me.GalEthernetProfileClassID, 1, me.AttributeValueMap{
+		me.GalEthernetProfile_MaximumGemPayloadSize: uint16(48),
+	}); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	state, err := ExportState(store.Snapshot(), store.DataSync())
+	if err != nil {
+		t.Fatalf("ExportState() error = %v", err)
+	}
+	document, err := json.Marshal(state)
+	if err != nil {
+		t.Fatalf("Marshal(state) error = %v", err)
+	}
+	var decoded State
+	if err := json.Unmarshal(document, &decoded); err != nil {
+		t.Fatalf("Unmarshal(state) error = %v", err)
+	}
+	restored, err := NewFromState(factory, decoded, Options{})
+	if err != nil {
+		t.Fatalf("NewFromState() error = %v", err)
+	}
+	if restored.DataSync() != store.DataSync() ||
+		!reflect.DeepEqual(restored.Snapshot(), store.Snapshot()) {
+		t.Fatalf("restored MIB differs: sync=%d/%d\nrestored=%#v\nwant=%#v",
+			restored.DataSync(), store.DataSync(), restored.Snapshot(), store.Snapshot())
+	}
+}
+
+func TestStateCodecPreservesSupportedAttributeTypes(t *testing.T) {
+	snapshot := []Instance{{
+		Key:    Key{ClassID: me.OnuDataClassID},
+		Origin: OriginONU,
+		Attributes: me.AttributeValueMap{
+			me.OnuData_MibDataSync: uint8(0),
+			"u8":                   uint8(1),
+			"u16":                  uint16(2),
+			"u32":                  uint32(3),
+			"u64":                  uint64(4),
+			"bytes":                []byte{5, 6},
+			"u16s":                 []uint16{7, 8},
+			"u32s":                 []uint32{9, 10},
+			"u64s":                 []uint64{11, 12},
+			"table":                me.TableRows{NumRows: 1, Rows: []byte{13, 14}},
+		},
+	}}
+	state, err := ExportState(snapshot, 0)
+	if err != nil {
+		t.Fatalf("ExportState() error = %v", err)
+	}
+	decoded, err := state.decode()
+	if err != nil {
+		t.Fatalf("decode() error = %v", err)
+	}
+	if !reflect.DeepEqual(decoded, snapshot) {
+		t.Fatalf("decoded state = %#v, want %#v", decoded, snapshot)
+	}
+}
+
+func TestNewFromStateRejectsIdentityMismatch(t *testing.T) {
+	store, err := New(stateTestFactory("ABCD"))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	state, err := ExportState(store.Snapshot(), store.DataSync())
+	if err != nil {
+		t.Fatalf("ExportState() error = %v", err)
+	}
+	_, err = NewFromState(stateTestFactory("WXYZ"), state, Options{})
+	if err == nil || !strings.Contains(err.Error(), "configured identity") {
+		t.Fatalf("NewFromState(identity mismatch) error = %v", err)
+	}
+}
+
+func TestStateValidationRejectsStructuralCorruption(t *testing.T) {
+	valid := State{Version: StateVersion, Instances: []StateInstance{{
+		ClassID: me.OnuDataClassID, Origin: OriginONU,
+		Attributes: []StateAttribute{{Name: me.OnuData_MibDataSync, Kind: "uint8"}},
+	}}}
+	tests := map[string]State{
+		"version":   {Version: StateVersion + 1, Instances: valid.Instances},
+		"empty":     {Version: StateVersion},
+		"duplicate": {Version: StateVersion, Instances: append(valid.Instances, valid.Instances[0])},
+		"origin": {Version: StateVersion, Instances: []StateInstance{{
+			ClassID: me.OnuDataClassID, Origin: Origin(9), Attributes: valid.Instances[0].Attributes,
+		}}},
+		"attribute": {Version: StateVersion, Instances: []StateInstance{{
+			ClassID: me.OnuDataClassID, Origin: OriginONU,
+			Attributes: []StateAttribute{{Name: me.OnuData_MibDataSync, Kind: "uint8", Unsigned: 256}},
+		}}},
+	}
+	for name, state := range tests {
+		t.Run(name, func(t *testing.T) {
+			if err := state.Validate(); err == nil {
+				t.Fatalf("Validate(%s) unexpectedly succeeded", name)
+			}
+		})
+	}
+}
+
+func stateTestFactory(vendor string) []Instance {
+	serial := append([]byte(vendor), 1, 2, 3, 4)
+	return []Instance{
+		{
+			Key: Key{ClassID: me.OnuDataClassID},
+			Attributes: me.AttributeValueMap{
+				me.OnuData_MibDataSync: uint8(0),
+			},
+		},
+		{
+			Key: Key{ClassID: me.OnuGClassID},
+			Attributes: me.AttributeValueMap{
+				me.OnuG_VendorId:                []byte(vendor),
+				me.OnuG_SerialNumber:            serial,
+				me.OnuG_TrafficManagementOption: uint8(0),
+			},
+		},
+	}
+}

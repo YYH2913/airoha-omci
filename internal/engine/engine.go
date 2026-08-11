@@ -955,7 +955,7 @@ func (e *Engine) synchronizeTime(year uint16, month, day, hour, minute, second u
 func buildUpload(snapshot []mib.Instance, device omci.DeviceIdent) ([]uploadCommand, error) {
 	entities := make([]me.ManagedEntity, 0, len(snapshot))
 	for _, instance := range snapshot {
-		if instance.ClassID == me.ManagedEntityMeClassID || instance.ClassID == me.AttributeMeClassID {
+		if excludedFromMibUpload(instance.ClassID) {
 			continue
 		}
 		definition, omciErr := me.LoadManagedEntityDefinition(instance.ClassID, me.ParamData{EntityID: instance.EntityID})
@@ -1045,6 +1045,21 @@ func buildUpload(snapshot []mib.Instance, device omci.DeviceIdent) ([]uploadComm
 		commands = append(commands, current)
 	}
 	return commands, nil
+}
+
+func excludedFromMibUpload(classID me.ClassID) bool {
+	switch classID {
+	case me.PhysicalPathTerminationPointLctUniClassID,
+		me.SipConfigPortalClassID,
+		me.MgcConfigPortalClassID,
+		me.OmciClassID,
+		me.ManagedEntityMeClassID,
+		me.AttributeMeClassID,
+		me.GeneralPurposeBufferClassID:
+		return true
+	default:
+		return false
+	}
 }
 
 func isPerformanceMonitoringDefinition(name string) bool {

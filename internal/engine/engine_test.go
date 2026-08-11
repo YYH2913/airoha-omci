@@ -407,7 +407,7 @@ func TestMibUploadExcludesPerformanceCounters(t *testing.T) {
 	}
 }
 
-func TestMibUploadExcludesGeneralPurposeDefinitionMEs(t *testing.T) {
+func TestMibUploadExcludesManagedEntitiesProhibitedByG988(t *testing.T) {
 	snapshot := []mib.Instance{
 		{
 			Key: mib.Key{ClassID: me.OnuDataClassID, EntityID: 0},
@@ -415,16 +415,29 @@ func TestMibUploadExcludesGeneralPurposeDefinitionMEs(t *testing.T) {
 				me.OnuData_MibDataSync: uint8(0),
 			},
 		},
+		{Key: mib.Key{ClassID: me.PhysicalPathTerminationPointLctUniClassID, EntityID: 0},
+			Attributes: me.AttributeValueMap{
+				me.PhysicalPathTerminationPointLctUni_AdministrativeState: uint8(0),
+			}},
+		{Key: mib.Key{ClassID: me.SipConfigPortalClassID, EntityID: 0}},
+		{Key: mib.Key{ClassID: me.MgcConfigPortalClassID, EntityID: 0}},
+		{Key: mib.Key{ClassID: me.OmciClassID, EntityID: 0}},
 		{Key: mib.Key{ClassID: me.ManagedEntityMeClassID, EntityID: uint16(me.OnuDataClassID)}},
 		{Key: mib.Key{ClassID: me.AttributeMeClassID, EntityID: 1}},
+		{Key: mib.Key{ClassID: me.GeneralPurposeBufferClassID, EntityID: 1},
+			Attributes: me.AttributeValueMap{
+				me.GeneralPurposeBuffer_MaximumSize: uint32(4096),
+			}},
 	}
-	commands, err := buildUpload(snapshot, omci.BaselineIdent)
-	if err != nil {
-		t.Fatalf("buildUpload() error = %v", err)
-	}
-	if len(commands) != 1 || len(commands[0]) != 1 ||
-		commands[0][0].GetClassID() != me.OnuDataClassID {
-		t.Fatalf("MIB upload commands = %#v, want only ONU data", commands)
+	for _, device := range []omci.DeviceIdent{omci.BaselineIdent, omci.ExtendedIdent} {
+		commands, err := buildUpload(snapshot, device)
+		if err != nil {
+			t.Fatalf("buildUpload(%#x) error = %v", byte(device), err)
+		}
+		if len(commands) != 1 || len(commands[0]) != 1 ||
+			commands[0][0].GetClassID() != me.OnuDataClassID {
+			t.Fatalf("MIB upload %#x commands = %#v, want only ONU data", byte(device), commands)
+		}
 	}
 }
 
