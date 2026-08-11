@@ -47,8 +47,9 @@ still allowing the required hardware ABI to be implemented independently.
 XG2010G advertises ONU-G traffic-management option 0 deliberately. Its native
 QDMA meter is shared by every GEM on a T-CONT, so advertising option 2 would
 incorrectly promise per-connection upstream shaping. The platform still applies
-compatible OLT traffic descriptors as per-T-CONT upstream meters and per-GEM
-downstream red-drop policers without overstating that hardware capability.
+compatible OLT traffic descriptors as per-T-CONT upstream meters, per-GEM
+downstream red-drop policers and per-MAC-bridge-port aggregate policers without
+overstating that hardware capability.
 
 The helper contracts are documented in
 [the platform ABI](docs/platform-abi.md). XG2010G software-slot storage and

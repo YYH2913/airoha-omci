@@ -729,6 +729,14 @@ func BuildServiceGraph(snapshot []mib.Instance) (ServiceGraph, error) {
 		if err != nil {
 			return ServiceGraph{}, err
 		}
+		if err := validateBridgePortTrafficDescriptorPointer(instances, instance.EntityID,
+			"outbound", port.OutboundTD); err != nil {
+			return ServiceGraph{}, err
+		}
+		if err := validateBridgePortTrafficDescriptorPointer(instances, instance.EntityID,
+			"inbound", port.InboundTD); err != nil {
+			return ServiceGraph{}, err
+		}
 		bridge.Ports = append(bridge.Ports, port)
 		bridgePorts[instance.EntityID] = port
 	}
@@ -975,14 +983,20 @@ func buildMACBridgePort(instance mib.Instance, portNumber, tpType uint8, tp uint
 		return MACBridgePort{}, err
 	}
 	port.OutboundTD, err = uint16AttributeDefault(instance,
-		me.MacBridgePortConfigurationData_OutboundTdPointer, nullPointer)
+		me.MacBridgePortConfigurationData_OutboundTdPointer, 0)
 	if err != nil {
 		return MACBridgePort{}, err
 	}
+	if port.OutboundTD == 0 {
+		port.OutboundTD = nullPointer
+	}
 	port.InboundTD, err = uint16AttributeDefault(instance,
-		me.MacBridgePortConfigurationData_InboundTdPointer, nullPointer)
+		me.MacBridgePortConfigurationData_InboundTdPointer, 0)
 	if err != nil {
 		return MACBridgePort{}, err
+	}
+	if port.InboundTD == 0 {
+		port.InboundTD = nullPointer
 	}
 	port.MACLearningDepth, err = uint8AttributeDefault(instance,
 		me.MacBridgePortConfigurationData_MacLearningDepth, 0)
@@ -1997,6 +2011,18 @@ func validateTrafficDescriptorPointer(instances map[mib.Key]mib.Instance, gem ui
 	if !hasInstance(instances, me.TrafficDescriptorClassID, pointer) {
 		return fmt.Errorf("GEM CTP %#x references missing %s traffic descriptor %#x",
 			gem, direction, pointer)
+	}
+	return nil
+}
+
+func validateBridgePortTrafficDescriptorPointer(instances map[mib.Key]mib.Instance,
+	port uint16, direction string, pointer uint16) error {
+	if pointer == nullPointer {
+		return nil
+	}
+	if !hasInstance(instances, me.TrafficDescriptorClassID, pointer) {
+		return fmt.Errorf("MAC bridge port %#x references missing %s traffic descriptor %#x",
+			port, direction, pointer)
 	}
 	return nil
 }

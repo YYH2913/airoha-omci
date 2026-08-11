@@ -541,6 +541,24 @@ func TestValidateServiceGraphRejectsBrokenReferencesAndConstraints(t *testing.T)
 			want: "missing upstream traffic descriptor",
 		},
 		{
+			name: "dangling bridge port outbound traffic descriptor",
+			edit: func(snapshot []mib.Instance) []mib.Instance {
+				findInstance(snapshot, me.MacBridgePortConfigurationDataClassID,
+					uniBridgePort).Attributes[me.MacBridgePortConfigurationData_OutboundTdPointer] = uint16(0x7777)
+				return snapshot
+			},
+			want: "missing outbound traffic descriptor",
+		},
+		{
+			name: "dangling bridge port inbound traffic descriptor",
+			edit: func(snapshot []mib.Instance) []mib.Instance {
+				findInstance(snapshot, me.MacBridgePortConfigurationDataClassID,
+					uniBridgePort).Attributes[me.MacBridgePortConfigurationData_InboundTdPointer] = uint16(0x7777)
+				return snapshot
+			},
+			want: "missing inbound traffic descriptor",
+		},
+		{
 			name: "multiple schedulers serve one T-CONT",
 			edit: func(snapshot []mib.Instance) []mib.Instance {
 				for _, entityID := range []uint16{0x9000, 0x9001} {
@@ -756,6 +774,9 @@ func TestBuildServiceGraphExportsWRRScheduler(t *testing.T) {
 func TestBuildServiceGraphExportsTrafficDescriptor(t *testing.T) {
 	snapshot := validServiceSnapshot()
 	findInstance(snapshot, me.GemPortNetworkCtpClassID, testMapperGEM).Attributes[me.GemPortNetworkCtp_TrafficDescriptorProfilePointerForUpstream] = uint16(0x8800)
+	bridgePort := findInstance(snapshot, me.MacBridgePortConfigurationDataClassID, uniBridgePort)
+	bridgePort.Attributes[me.MacBridgePortConfigurationData_OutboundTdPointer] = uint16(0x8800)
+	bridgePort.Attributes[me.MacBridgePortConfigurationData_InboundTdPointer] = uint16(0x8800)
 	snapshot = append(snapshot, mib.Instance{
 		Key: mib.Key{ClassID: me.TrafficDescriptorClassID, EntityID: 0x8800},
 		Attributes: me.AttributeValueMap{
@@ -772,6 +793,10 @@ func TestBuildServiceGraphExportsTrafficDescriptor(t *testing.T) {
 	if len(graph.TrafficDescs) != 1 || graph.TrafficDescs[0].EntityID != 0x8800 ||
 		graph.TrafficDescs[0].CIR != 1000 || graph.GEMPorts[0].UpstreamTD != 0x8800 {
 		t.Fatalf("traffic descriptor graph = %#v", graph)
+	}
+	if graph.Bridges[0].Ports[0].OutboundTD != 0x8800 ||
+		graph.Bridges[0].Ports[0].InboundTD != 0x8800 {
+		t.Fatalf("bridge port traffic descriptors = %#v", graph.Bridges[0].Ports[0])
 	}
 }
 

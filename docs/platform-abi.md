@@ -179,7 +179,7 @@ the OMCI mutation:
 | T-CONT (class 262) | GPON Alloc-ID and WAN channel | allocate or release the T-CONT slot |
 | GEM CTP (class 268) | GPON GEM table and channel direction | enable GEM, encryption and GEM/mark mapping |
 | Priority queue (class 277) | QDMA WAN channel queue 0-7 | set SP/WRR mode and weight |
-| Traffic descriptor (class 280) | QDMA TRTCM meter or PON ingress GEM policer | set CIR/PIR/CBS/PBS and enable/disable |
+| Traffic descriptor (class 280) | QDMA TRTCM meter, PON ingress GEM policer or Linux bridge-port policer | set CIR/PIR/CBS/PBS and enable/disable |
 | Dot1 rate limiter (class 298) | Linux bridge ANI egress flower/police rules | police unknown-unicast flood, broadcast and multicast payload independently |
 
 The SDK names these capabilities `qdmamgr_lib_set_channel_qos`,
@@ -206,6 +206,15 @@ factory policy. When a non-zero CIR or PIR has a zero burst, the XG2010G
 factory burst is one maximum Ethernet frame (2000 bytes). Colour-aware marking
 or remarking and RFC 4115 coupling are rejected explicitly because the current
 adapter cannot represent them faithfully.
+
+MAC bridge port class-47 outbound and inbound traffic-descriptor pointers use
+the same supported class-280 profile. `outbound` limits traffic leaving the
+bridge on the resolved UNI or profile ANI endpoint and maps to interface
+egress; `inbound` limits traffic entering the bridge and maps to ingress. The
+platform ABI emits `port-meter INTERFACE HOOK PIR:PBS`. A zero PIR omits the
+meter. The class-47 wire/default null pointer `0` is normalized to the platform
+ABI null value `0xffff`. Logical ANI ports collapsed onto one endpoint must
+carry identical descriptor pointers.
 
 Class 298 is resolved against either a MAC bridge service profile or an IEEE
 802.1p mapper. At most one limiter may reference a given parent, and every

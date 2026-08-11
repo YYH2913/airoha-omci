@@ -13,12 +13,12 @@ and extended messages.  A successful build or reaching GPON O5 is not enough.
 | Tables | stable Get/Get Next cache and baseline/enhanced extended Set Table | implemented; OLT verification pending |
 | Notifications | alarm audit/sequence, event-driven Alarm/AVC, requested optical tests and ARC | implemented; physical OLT verification pending |
 | Equipment | ONU-G, ONU2-G, ANI-G, four speed-specific Ethernet UNIs, software images | implemented; physical OLT verification pending |
-| Traffic | 8 advertised T-CONTs, scheduler/queue graph, GEM CTP/IW and class-298 rate-limit validation and apply | upstream SP/WRR/TRTCM, per-GEM downstream red-drop and bridge flood/broadcast/multicast policing implemented; physical verification pending |
+| Traffic | 8 advertised T-CONTs, scheduler/queue graph, GEM CTP/IW and class-298 rate-limit validation and apply | upstream SP/WRR/TRTCM, per-GEM downstream red-drop, per-bridge-port aggregate policing and bridge flood/broadcast/multicast policing implemented; physical verification pending |
 | Performance | common 15-minute engine, FEC, GEM CTP and Ethernet UNI/frame PM | class 312, 341, 24, 296, 321 and 322 counters, threshold data 1/2 and TCA implemented; physical verification pending |
 | Ethernet service | resolved bridge, mapper, VLAN and extended VLAN graph | UNI, bridge-port, mapper, GEM-IW, packet-dependent cross-tag copy, structural multi-tag inverse and DSCP-derived PCP implemented; physical verification pending |
 | Multicast | multicast GEM-IW, IGMP/MLD policy, subscriber limits and live groups | class 281 and class 309/310 tables, ACL/preview enforcement, native report/query interception, proxy querier and sampled class 311 monitoring implemented; physical OLT verification pending |
 | Lifecycle | reboot, time sync, software download/activate/commit | implemented; OLT verification pending |
-| Platform | multi-T-CONT/GEM Airoha ABI and transactional Linux backend | GEM, 16-channel GPON QDMA QoS, downstream GEM policing, UNI VLAN, bridge FDB/rate limits and multi-profile MAC bridge implemented; Ethernet offload pending |
+| Platform | multi-T-CONT/GEM Airoha ABI and transactional Linux backend | GEM, 16-channel GPON QDMA QoS, downstream GEM/bridge-port policing, UNI VLAN, bridge FDB/rate limits and multi-profile MAC bridge implemented; Ethernet offload pending |
 | OpenWrt | package, procd, UCI, rpcd/ubus and LuCI | optical configuration, live service status and automatic/manual service handover implemented |
 | Verification | unit/fuzz/race/cross-build plus physical OLT traces | pending |
 
@@ -260,6 +260,14 @@ For colour-blind descriptors without remarking, CIR/CBS distinguish green from
 yellow but both continue, while PIR/PBS identify red traffic and drop it. A
 zero PIR selects the XG2010G unlimited factory policy; a non-zero rate with a
 zero burst uses one maximum Ethernet frame, 2000 bytes.
+
+Class-47 outbound and inbound traffic-descriptor pointers are applied at the
+Linux bridge-port boundary. Inbound means traffic entering the MAC bridge and
+maps to the attached interface ingress hook; outbound means traffic leaving
+the bridge and maps to egress. The same colour-blind PIR/PBS red-drop semantics
+and factory policy apply. Logical unicast and multicast ANI ports share one
+Linux endpoint, so their descriptor pointers must agree before that profile is
+accepted.
 
 Dot1 rate limiter (class 298) parent and descriptor references are now part of
 the same validated graph. On an active MAC bridge profile, separate software
