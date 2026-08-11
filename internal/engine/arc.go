@@ -117,6 +117,11 @@ func (e *Engine) arcOwnerLocked(key mib.Key) (mib.Key, bool, error) {
 		if owner == (mib.Key{}) {
 			return key, false, nil
 		}
+	case key.ClassID == me.FecPerformanceMonitoringHistoryDataClassID:
+		owner = mib.Key{ClassID: me.AniGClassID, EntityID: key.EntityID}
+		if !e.mib.Exists(owner) {
+			return key, false, nil
+		}
 	default:
 		return key, false, nil
 	}

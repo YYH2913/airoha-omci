@@ -108,6 +108,46 @@ func TestExecControllerRejectsMismatchedGEMPortCounters(t *testing.T) {
 	}
 }
 
+func TestExecControllerReadsFECCounters(t *testing.T) {
+	directory := t.TempDir()
+	requestPath := filepath.Join(directory, "request.json")
+	helper := filepath.Join(directory, "control")
+	script := "#!/bin/sh\ncat > " + requestPath + "\n" +
+		"printf '%s\\n' '{\"ani_entity_id\":32769,\"corrected_bytes\":11,\"corrected_codewords\":22,\"uncorrectable_codewords\":33,\"total_codewords\":44,\"fec_seconds\":55}'\n"
+	if err := os.WriteFile(helper, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile(helper) error = %v", err)
+	}
+	counters, err := (ExecController{Path: helper}).FECCounters(0x8001)
+	if err != nil {
+		t.Fatalf("FECCounters() error = %v", err)
+	}
+	if counters.CorrectedBytes != 11 || counters.CorrectedCodeWords != 22 ||
+		counters.UncorrectableCodeWords != 33 || counters.TotalCodeWords != 44 ||
+		counters.FECSeconds != 55 {
+		t.Fatalf("FEC counters = %#v", counters)
+	}
+	payload, err := os.ReadFile(requestPath)
+	if err != nil {
+		t.Fatalf("ReadFile(request) error = %v", err)
+	}
+	if !strings.Contains(string(payload), `"action":"fec-counters"`) ||
+		!strings.Contains(string(payload), `"ani_entity_id":32769`) {
+		t.Fatalf("request = %s", payload)
+	}
+}
+
+func TestExecControllerRejectsIncompleteFECCounters(t *testing.T) {
+	helper := filepath.Join(t.TempDir(), "control")
+	response := `{"ani_entity_id":32769,"corrected_bytes":0}`
+	if err := os.WriteFile(helper, []byte("#!/bin/sh\nprintf '%s\\n' '"+response+"'\n"), 0o755); err != nil {
+		t.Fatalf("WriteFile(helper) error = %v", err)
+	}
+	if _, err := (ExecController{Path: helper}).FECCounters(0x8001); err == nil ||
+		!strings.Contains(err.Error(), "required or matching field") {
+		t.Fatalf("FECCounters() error = %v", err)
+	}
+}
+
 func TestExecControllerReadsEthernetCounters(t *testing.T) {
 	directory := t.TempDir()
 	requestPath := filepath.Join(directory, "request.json")

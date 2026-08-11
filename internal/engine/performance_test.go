@@ -18,13 +18,16 @@ import (
 const (
 	testGEMEntity = uint16(0x101)
 	testGEMPort   = uint16(42)
+	testANIEntity = uint16(0x8001)
 )
 
 type recordingPerformanceController struct {
 	counters         performance.GEMPortCounters
+	fecCounters      performance.FECCounters
 	ethernetCounters performance.EthernetCounters
 	err              error
 	calls            int
+	fecCalls         int
 	ethernetCalls    int
 	synced           time.Time
 }
@@ -54,6 +57,248 @@ func (c *recordingPerformanceController) EthernetCounters(entityID uint16) (perf
 		return performance.EthernetCounters{}, errors.New("unexpected Ethernet UNI")
 	}
 	return c.ethernetCounters, c.err
+}
+
+func (c *recordingPerformanceController) FECCounters(entityID uint16) (performance.FECCounters, error) {
+	c.fecCalls++
+	if entityID != testANIEntity {
+		return performance.FECCounters{}, errors.New("unexpected ANI-G")
+	}
+	return c.fecCounters, c.err
+}
+
+func TestFECPerformanceCurrentHistoryAndTCA(t *testing.T) {
+	protocol, store, controller := newFECPerformanceEngine(t)
+	now := time.Date(2026, 8, 11, 7, 0, 0, 0, time.UTC)
+	protocol.now = func() time.Time { return now }
+	thresholdID := uint16(0x940)
+	if err := store.Create(me.ThresholdData1ClassID, thresholdID, me.AttributeValueMap{
+		me.ThresholdData1_ThresholdValue3: uint32(5),
+	}); err != nil {
+		t.Fatalf("Create(FEC threshold) error = %v", err)
+	}
+	controller.fecCounters = performance.FECCounters{
+		CorrectedBytes: 100, CorrectedCodeWords: 200,
+		UncorrectableCodeWords: 10, TotalCodeWords: 1000, FECSeconds: 20,
+	}
+	request := encodeRequest(t, 0x680, omci.CreateRequestType, &omci.CreateRequest{
+		MeBasePacket: omci.MeBasePacket{
+			EntityClass:    me.FecPerformanceMonitoringHistoryDataClassID,
+			EntityInstance: testANIEntity,
+		},
+		Attributes: me.AttributeValueMap{
+			me.FecPerformanceMonitoringHistoryData_ThresholdData12Id: thresholdID,
+		},
+	})
+	encoded, err := protocol.Handle(request)
+	if err != nil {
+		t.Fatalf("Handle(Create FEC PM) error = %v", err)
+	}
+	created := decodeResponse(t, encoded).Layer(omci.LayerTypeCreateResponse).(*omci.CreateResponse)
+	if created.Result != me.Success || controller.fecCalls != 1 {
+		t.Fatalf("Create FEC PM result=%v calls=%d", created.Result, controller.fecCalls)
+	}
+	pollPerformance(t, protocol)
+
+	controller.fecCounters = performance.FECCounters{
+		CorrectedBytes: 111, CorrectedCodeWords: 222,
+		UncorrectableCodeWords: 15, TotalCodeWords: 1100, FECSeconds: 23,
+	}
+	for index, device := range []omci.DeviceIdent{omci.BaselineIdent, omci.ExtendedIdent} {
+		base := omci.MeBasePacket{
+			EntityClass:    me.FecPerformanceMonitoringHistoryDataClassID,
+			EntityInstance: testANIEntity,
+			Extended:       device == omci.ExtendedIdent,
+		}
+		var currentRequest []byte
+		if device == omci.ExtendedIdent {
+			// omci-lib-go's Get Current serializer omits the extended content
+			// length. Get has the same request wire layout and supplies it.
+			currentRequest = encodeRequestForDevice(t, uint16(0x681+index),
+				omci.GetCurrentDataRequestType, &omci.GetRequest{
+					MeBasePacket: base, AttributeMask: 0x3e00,
+				}, device)
+		} else {
+			currentRequest = encodeRequestForDevice(t, uint16(0x681+index),
+				omci.GetCurrentDataRequestType, &omci.GetCurrentDataRequest{
+					MeBasePacket: base, AttributeMask: 0x3e00,
+				}, device)
+		}
+		currentEncoded, err := protocol.Handle(currentRequest)
+		if err != nil {
+			t.Fatalf("Handle(%v FEC Get Current Data) error = %v", device, err)
+		}
+		current := decodeResponse(t, currentEncoded).Layer(omci.LayerTypeGetCurrentDataResponse).(*omci.GetCurrentDataResponse)
+		if current.Result != me.Success ||
+			current.Attributes[me.FecPerformanceMonitoringHistoryData_CorrectedBytes] != uint32(11) ||
+			current.Attributes[me.FecPerformanceMonitoringHistoryData_CorrectedCodeWords] != uint32(22) ||
+			current.Attributes[me.FecPerformanceMonitoringHistoryData_UncorrectableCodeWords] != uint32(5) ||
+			current.Attributes[me.FecPerformanceMonitoringHistoryData_TotalCodeWords] != uint32(100) ||
+			current.Attributes[me.FecPerformanceMonitoringHistoryData_FecSeconds] != uint16(3) {
+			t.Fatalf("%v FEC current performance = %#v", device, current)
+		}
+	}
+
+	frames := pollPerformance(t, protocol)
+	if len(frames) != 1 {
+		t.Fatalf("FEC threshold frames = %d, want 1", len(frames))
+	}
+	alarm := decodeResponse(t, frames[0]).Layer(omci.LayerTypeAlarmNotification).(*omci.AlarmNotificationMsg)
+	if alarm.EntityClass != me.FecPerformanceMonitoringHistoryDataClassID ||
+		alarm.EntityInstance != testANIEntity || alarm.AlarmBitmap[0] != 0x20 {
+		t.Fatalf("FEC TCA = %#v", alarm)
+	}
+
+	now = now.Add(performanceInterval)
+	controller.fecCounters = performance.FECCounters{
+		CorrectedBytes: 150, CorrectedCodeWords: 260,
+		UncorrectableCodeWords: 18, TotalCodeWords: 1200, FECSeconds: 29,
+	}
+	frames = pollPerformance(t, protocol)
+	if len(frames) != 1 {
+		t.Fatalf("FEC interval clear frames = %d, want 1", len(frames))
+	}
+	history, err := store.Get(mib.Key{
+		ClassID:  me.FecPerformanceMonitoringHistoryDataClassID,
+		EntityID: testANIEntity,
+	}, 0xbe00)
+	if err != nil {
+		t.Fatalf("Get(FEC history) error = %v", err)
+	}
+	if history.Attributes[me.FecPerformanceMonitoringHistoryData_IntervalEndTime] != uint8(1) ||
+		history.Attributes[me.FecPerformanceMonitoringHistoryData_CorrectedBytes] != uint32(50) ||
+		history.Attributes[me.FecPerformanceMonitoringHistoryData_UncorrectableCodeWords] != uint32(8) ||
+		history.Attributes[me.FecPerformanceMonitoringHistoryData_TotalCodeWords] != uint32(200) ||
+		history.Attributes[me.FecPerformanceMonitoringHistoryData_FecSeconds] != uint16(9) {
+		t.Fatalf("FEC history = %#v", history.Attributes)
+	}
+}
+
+func TestFECPerformanceCounterResetAndSaturation(t *testing.T) {
+	delta := deltaFECCounters(
+		performance.FECCounters{CorrectedBytes: 100},
+		performance.FECCounters{CorrectedBytes: 5, FECSeconds: math.MaxUint16 + 10})
+	attributes := fecPerformanceAttributes(0, delta)
+	if attributes[me.FecPerformanceMonitoringHistoryData_CorrectedBytes] != uint32(5) ||
+		attributes[me.FecPerformanceMonitoringHistoryData_FecSeconds] != uint16(math.MaxUint16) {
+		t.Fatalf("reset/saturated FEC attributes = %#v", attributes)
+	}
+}
+
+func TestFECPerformanceCreateRequiresANIAndCounterBackend(t *testing.T) {
+	store, err := mib.New(fecPerformanceFactory())
+	if err != nil {
+		t.Fatalf("mib.New(FEC performance) error = %v", err)
+	}
+	protocol := New(store)
+	encoded, err := protocol.Handle(createFECPerformanceRequest(t, 0x690))
+	if err != nil {
+		t.Fatalf("Handle(Create FEC PM without backend) error = %v", err)
+	}
+	response := decodeResponse(t, encoded).Layer(omci.LayerTypeCreateResponse).(*omci.CreateResponse)
+	key := mib.Key{ClassID: me.FecPerformanceMonitoringHistoryDataClassID, EntityID: testANIEntity}
+	if response.Result != me.NotSupported || store.Exists(key) {
+		t.Fatalf("Create FEC PM without backend result=%v exists=%v", response.Result, store.Exists(key))
+	}
+
+	missingANI, err := mib.New(fecPerformanceFactory()[:2])
+	if err != nil {
+		t.Fatalf("mib.New(without ANI-G) error = %v", err)
+	}
+	protocol = New(missingANI)
+	protocol.SetPerformanceController(&recordingPerformanceController{})
+	encoded, err = protocol.Handle(createFECPerformanceRequest(t, 0x691))
+	if err != nil {
+		t.Fatalf("Handle(Create FEC PM without ANI-G) error = %v", err)
+	}
+	response = decodeResponse(t, encoded).Layer(omci.LayerTypeCreateResponse).(*omci.CreateResponse)
+	if response.Result != me.ParameterError || missingANI.Exists(key) {
+		t.Fatalf("Create FEC PM without ANI-G result=%v exists=%v", response.Result, missingANI.Exists(key))
+	}
+}
+
+func TestFECPerformanceRestoresPersistedInstanceAndRebasesCounters(t *testing.T) {
+	protocol, store, controller := newFECPerformanceEngine(t)
+	controller.fecCounters.CorrectedBytes = 100
+	encoded, err := protocol.Handle(createFECPerformanceRequest(t, 0x692))
+	if err != nil {
+		t.Fatalf("Handle(Create FEC PM) error = %v", err)
+	}
+	response := decodeResponse(t, encoded).Layer(omci.LayerTypeCreateResponse).(*omci.CreateResponse)
+	if response.Result != me.Success {
+		t.Fatalf("Create FEC PM result = %v", response.Result)
+	}
+	state, err := mib.ExportState(store.Snapshot(), store.DataSync())
+	if err != nil {
+		t.Fatalf("ExportState() error = %v", err)
+	}
+	restored, err := mib.NewFromState(fecPerformanceFactory(), state, mib.Options{})
+	if err != nil {
+		t.Fatalf("NewFromState() error = %v", err)
+	}
+
+	restoredController := &recordingPerformanceController{}
+	restoredController.fecCounters.CorrectedBytes = 150
+	restoredProtocol := New(restored)
+	restoredProtocol.SetPerformanceController(restoredController)
+	current := getCurrentPerformance(t, restoredProtocol,
+		me.FecPerformanceMonitoringHistoryDataClassID, testANIEntity, 0x2000, 0x693)
+	if current.Result != me.Success ||
+		current.Attributes[me.FecPerformanceMonitoringHistoryData_CorrectedBytes] != uint32(0) ||
+		restoredController.fecCalls != 2 {
+		t.Fatalf("restored initial FEC current=%#v calls=%d", current, restoredController.fecCalls)
+	}
+	restoredController.fecCounters.CorrectedBytes = 175
+	current = getCurrentPerformance(t, restoredProtocol,
+		me.FecPerformanceMonitoringHistoryDataClassID, testANIEntity, 0x2000, 0x694)
+	if current.Result != me.Success ||
+		current.Attributes[me.FecPerformanceMonitoringHistoryData_CorrectedBytes] != uint32(25) {
+		t.Fatalf("restored rebased FEC current = %#v", current)
+	}
+}
+
+func TestSynchronizeTimeRebasesFECPerformance(t *testing.T) {
+	protocol, store, controller := newFECPerformanceEngine(t)
+	controller.fecCounters.CorrectedBytes = 100
+	encoded, err := protocol.Handle(createFECPerformanceRequest(t, 0x695))
+	if err != nil {
+		t.Fatalf("Handle(Create FEC PM) error = %v", err)
+	}
+	if response := decodeResponse(t, encoded).Layer(omci.LayerTypeCreateResponse).(*omci.CreateResponse); response.Result != me.Success {
+		t.Fatalf("Create FEC PM result = %v", response.Result)
+	}
+	controller.fecCounters.CorrectedBytes = 150
+	protocol.controller = controller
+	requested := time.Date(2026, 8, 11, 8, 9, 10, 0, time.UTC)
+	request := encodeRequest(t, 0x696, omci.SynchronizeTimeRequestType, &omci.SynchronizeTimeRequest{
+		MeBasePacket: omci.MeBasePacket{EntityClass: me.OnuGClassID, EntityInstance: 0},
+		Year:         uint16(requested.Year()), Month: uint8(requested.Month()), Day: uint8(requested.Day()),
+		Hour: uint8(requested.Hour()), Minute: uint8(requested.Minute()), Second: uint8(requested.Second()),
+	})
+	encoded, err = protocol.Handle(request)
+	if err != nil {
+		t.Fatalf("Handle(SynchronizeTime) error = %v", err)
+	}
+	if me.Results(encoded[8]) != me.Success || !controller.synced.Equal(requested) {
+		t.Fatalf("SynchronizeTime result=%v time=%v", me.Results(encoded[8]), controller.synced)
+	}
+	history, err := store.Get(mib.Key{
+		ClassID: me.FecPerformanceMonitoringHistoryDataClassID, EntityID: testANIEntity,
+	}, 0xa000)
+	if err != nil {
+		t.Fatalf("Get(reset FEC history) error = %v", err)
+	}
+	if history.Attributes[me.FecPerformanceMonitoringHistoryData_IntervalEndTime] != uint8(0) ||
+		history.Attributes[me.FecPerformanceMonitoringHistoryData_CorrectedBytes] != uint32(0) {
+		t.Fatalf("reset FEC history = %#v", history.Attributes)
+	}
+	controller.fecCounters.CorrectedBytes = 175
+	current := getCurrentPerformance(t, protocol,
+		me.FecPerformanceMonitoringHistoryDataClassID, testANIEntity, 0x2000, 0x697)
+	if current.Result != me.Success ||
+		current.Attributes[me.FecPerformanceMonitoringHistoryData_CorrectedBytes] != uint32(25) {
+		t.Fatalf("post-sync FEC current = %#v", current)
+	}
 }
 
 func TestEthernetUNIPerformanceCurrentAndHistory(t *testing.T) {
@@ -681,6 +926,52 @@ func newPerformanceEngine(t *testing.T) (*Engine, *mib.Store, *recordingPerforma
 	protocol := New(store)
 	protocol.SetPerformanceController(controller)
 	return protocol, store, controller
+}
+
+func newFECPerformanceEngine(t *testing.T) (*Engine, *mib.Store, *recordingPerformanceController) {
+	t.Helper()
+	store, err := mib.New(fecPerformanceFactory())
+	if err != nil {
+		t.Fatalf("mib.New(FEC performance) error = %v", err)
+	}
+	controller := &recordingPerformanceController{}
+	protocol := New(store)
+	protocol.SetPerformanceController(controller)
+	return protocol, store, controller
+}
+
+func fecPerformanceFactory() []mib.Instance {
+	return []mib.Instance{
+		{
+			Key:        mib.Key{ClassID: me.OnuDataClassID, EntityID: 0},
+			Attributes: me.AttributeValueMap{me.OnuData_MibDataSync: uint8(0)},
+		},
+		{
+			Key: mib.Key{ClassID: me.OnuGClassID, EntityID: 0},
+			Attributes: me.AttributeValueMap{
+				me.OnuG_AdministrativeState: uint8(0),
+			},
+		},
+		{
+			Key: mib.Key{ClassID: me.AniGClassID, EntityID: testANIEntity},
+			Attributes: me.AttributeValueMap{
+				me.AniG_Arc:         uint8(0),
+				me.AniG_ArcInterval: uint8(0),
+			},
+		},
+	}
+}
+
+func createFECPerformanceRequest(t *testing.T, transactionID uint16) []byte {
+	t.Helper()
+	return encodeRequest(t, transactionID, omci.CreateRequestType, &omci.CreateRequest{
+		MeBasePacket: omci.MeBasePacket{
+			EntityClass: me.FecPerformanceMonitoringHistoryDataClassID, EntityInstance: testANIEntity,
+		},
+		Attributes: me.AttributeValueMap{
+			me.FecPerformanceMonitoringHistoryData_ThresholdData12Id: uint16(0),
+		},
+	})
 }
 
 func newTestStoreForPerformanceCreate(t *testing.T) *mib.Store {

@@ -14,7 +14,7 @@ and extended messages.  A successful build or reaching GPON O5 is not enough.
 | Notifications | alarm audit/sequence, event-driven Alarm/AVC, requested optical tests and ARC | implemented; physical OLT verification pending |
 | Equipment | ONU-G, ONU2-G, ANI-G, four speed-specific Ethernet UNIs, software images | implemented; physical OLT verification pending |
 | Traffic | 8 advertised T-CONTs, scheduler/queue graph, GEM CTP/IW validation and hardware apply | upstream SP/WRR/TRTCM implemented; physical verification pending |
-| Performance | common 15-minute engine, GEM CTP and Ethernet UNI/frame PM | class 341, 24, 296, 321 and 322 counters, threshold data 1/2 and TCA implemented; physical verification pending |
+| Performance | common 15-minute engine, FEC, GEM CTP and Ethernet UNI/frame PM | class 312, 341, 24, 296, 321 and 322 counters, threshold data 1/2 and TCA implemented; physical verification pending |
 | Ethernet service | resolved bridge, mapper, VLAN and extended VLAN graph | UNI, bridge-port, mapper, GEM-IW, packet-dependent cross-tag copy, structural multi-tag inverse and DSCP-derived PCP implemented; physical verification pending |
 | Multicast | multicast GEM-IW, IGMP/MLD policy, subscriber limits and live groups | class 281 and class 309/310 tables, ACL/preview enforcement, native report/query interception, proxy querier and sampled class 311 monitoring implemented; physical OLT verification pending |
 | Lifecycle | reboot, time sync, software download/activate/commit | implemented; OLT verification pending |
@@ -89,8 +89,13 @@ with 255 wrapping to 1; a platform apply failure leaves both the MIB and counter
 unchanged.
 
 Performance monitoring uses one synchronized 15-minute interval across all
-active PM MEs. Class 341 reads per-GEM 64-bit GPON MAC counters. Classes 24 and
-296 read the physical Ethernet UNI selected by their identical entity ID;
+active PM MEs. Class 312 reads the ANI-G FEC counters recovered from the
+EN7581 PHY, while class 341 reads per-GEM 64-bit GPON MAC counters. A class 312
+Create requires the same-ID ANI-G and a readable hardware backend. After a
+daemon restart, the persisted PM instance is reconciled and rebased on the
+current cumulative hardware snapshot so downtime is not reported as one
+measurement interval. Classes 24 and 296 read the physical Ethernet UNI
+selected by their identical entity ID;
 classes 321 and 322 resolve a MAC bridge port whose TP type is PPTP Ethernet
 UNI and use the transmitted and received direction respectively. Bridge-port
 ANI/GEM terminations are rejected because a physical PON netdev counter cannot
@@ -109,8 +114,11 @@ A non-zero PM threshold data 1/2 pointer must resolve to an existing threshold
 data 1 ME; the same-ID threshold data 2 ME supplies optional values 8 through
 14. Zero pointers and threshold values 0 or 0xFFFF disable the corresponding
 TCAs.
-The class-specific G.988 mapping is implemented for GEM CTP class 341 and
-Ethernet classes 24, 296, 321 and 322. A counter reaching its configured value
+The class-specific G.988 mapping is implemented for FEC class 312, GEM CTP
+class 341 and Ethernet classes 24, 296, 321 and 322. Class 312 maps threshold
+values 1 through 4 to corrected bytes, corrected codewords, uncorrectable
+codewords and FEC seconds; total codewords has no TCA. A counter reaching its
+configured value
 raises its TCA bit once in the current interval; later crossings produce a
 cumulative bitmap without repeating an already active bit. At each 15-minute
 boundary the ONU sends the required all-clear TCA notification, including

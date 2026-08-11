@@ -315,7 +315,8 @@ func (e *Engine) notificationsSuppressedLocked(key mib.Key) (bool, error) {
 			return false, resolveErr
 		}
 		parent = mib.Key{ClassID: me.PhysicalPathTerminationPointEthernetUniClassID, EntityID: entityID}
-	} else if key.ClassID == me.GemPortNetworkCtpPerformanceMonitoringHistoryDataClassID {
+	} else if key.ClassID == me.GemPortNetworkCtpPerformanceMonitoringHistoryDataClassID ||
+		key.ClassID == me.FecPerformanceMonitoringHistoryDataClassID {
 		owner, supported, resolveErr := e.arcOwnerLocked(key)
 		if resolveErr != nil {
 			return false, resolveErr

@@ -41,6 +41,7 @@ type performanceThresholdRule struct {
 
 func isPerformanceClass(classID me.ClassID) bool {
 	return classID == me.GemPortNetworkCtpPerformanceMonitoringHistoryDataClassID ||
+		classID == me.FecPerformanceMonitoringHistoryDataClassID ||
 		isEthernetPerformanceClass(classID)
 }
 
@@ -51,6 +52,13 @@ func performanceThresholdRules(classID me.ClassID) []performanceThresholdRule {
 			counter:   me.GemPortNetworkCtpPerformanceMonitoringHistoryData_EncryptionKeyErrors,
 			threshold: 1, alarm: 1,
 		}}
+	case me.FecPerformanceMonitoringHistoryDataClassID:
+		return []performanceThresholdRule{
+			{counter: me.FecPerformanceMonitoringHistoryData_CorrectedBytes, threshold: 1, alarm: 0},
+			{counter: me.FecPerformanceMonitoringHistoryData_CorrectedCodeWords, threshold: 2, alarm: 1},
+			{counter: me.FecPerformanceMonitoringHistoryData_UncorrectableCodeWords, threshold: 3, alarm: 2},
+			{counter: me.FecPerformanceMonitoringHistoryData_FecSeconds, threshold: 4, alarm: 4},
+		}
 	case me.EthernetPerformanceMonitoringHistoryDataClassID:
 		counters := []string{
 			me.EthernetPerformanceMonitoringHistoryData_FcsErrors,

@@ -25,7 +25,9 @@ ImageHash validation, activation and commit are implemented through a fixed
 platform helper ABI.
 ANI-G optical alarms and ARC, extended SetTable handling, the resolved
 Ethernet service graph, and the common multi-profile Linux bridge/VLAN/TC
-data path are implemented. The native multicast runtime parses IGMPv1/v2/v3
+data path are implemented. Class 312 FEC, per-GEM and Ethernet UNI performance
+monitoring share a synchronized 15-minute history and TCA engine. The native
+multicast runtime parses IGMPv1/v2/v3
 and MLDv1/v2, enforces class 309/310 policy, runs the proxy querier and delayed
 last-member state machine, and publishes live class 311 state. The daemon is
 not yet ready for operator deployment

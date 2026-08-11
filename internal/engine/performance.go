@@ -25,8 +25,14 @@ type ethernetPerformanceState struct {
 	baseline    performance.EthernetCounters
 }
 
+type fecPerformanceState struct {
+	aniEntityID uint16
+	baseline    performance.FECCounters
+}
+
 type performanceSynchronization struct {
 	gem      map[mib.Key]performance.GEMPortCounters
+	fec      map[mib.Key]performance.FECCounters
 	ethernet map[mib.Key]performance.EthernetCounters
 }
 
@@ -139,6 +145,25 @@ func (e *Engine) prepareGEMPerformanceCreateLocked(entityID uint16) (*performanc
 	return &performanceState{portID: portID, baseline: baseline}, nil
 }
 
+func (e *Engine) prepareFECPerformanceCreateLocked(entityID uint16) (*fecPerformanceState, error) {
+	key := mib.Key{ClassID: me.FecPerformanceMonitoringHistoryDataClassID, EntityID: entityID}
+	if e.mib.Exists(key) {
+		return nil, nil
+	}
+	if e.fecPerformance == nil {
+		return nil, &mib.ResultError{Result: me.NotSupported}
+	}
+	if !e.mib.Exists(mib.Key{ClassID: me.AniGClassID, EntityID: entityID}) {
+		return nil, &mib.ResultError{Result: me.ParameterError,
+			Cause: fmt.Errorf("FEC PM references missing ANI-G %#x", entityID)}
+	}
+	baseline, err := e.fecPerformance.FECCounters(entityID)
+	if err != nil {
+		return nil, &mib.ResultError{Result: me.ProcessingError, Cause: err}
+	}
+	return &fecPerformanceState{aniEntityID: entityID, baseline: baseline}, nil
+}
+
 // SetPerformanceController installs the platform counter source. It is mainly
 // useful to embedders that do not use the combined platform controller.
 func (e *Engine) SetPerformanceController(controller performance.Controller) {
@@ -146,6 +171,8 @@ func (e *Engine) SetPerformanceController(controller performance.Controller) {
 	defer e.mu.Unlock()
 	e.performance = controller
 	e.performanceState = make(map[mib.Key]performanceState)
+	e.fecPerformance, _ = controller.(performance.FECController)
+	e.fecPMState = make(map[mib.Key]fecPerformanceState)
 	e.ethernetPerformance, _ = controller.(performance.EthernetController)
 	e.ethernetPMState = make(map[mib.Key]ethernetPerformanceState)
 	e.clearAllPerformanceTCAsLocked()
@@ -173,7 +200,7 @@ type performanceThresholdEvaluation struct {
 
 func (e *Engine) pollPerformanceLocked(now time.Time,
 	device omci.DeviceIdent) ([][]byte, error) {
-	if e.performance == nil && e.ethernetPerformance == nil {
+	if e.performance == nil && e.fecPerformance == nil && e.ethernetPerformance == nil {
 		return nil, nil
 	}
 	if err := e.reconcilePerformanceLocked(); err != nil {
@@ -190,10 +217,10 @@ func (e *Engine) pollPerformanceLocked(now time.Time,
 	}
 	intervalEnd := e.performanceIntervalEnd + uint8(intervals)
 	updates := make(map[mib.Key]me.AttributeValueMap,
-		len(e.performanceState)+len(e.ethernetPMState))
+		len(e.performanceState)+len(e.fecPMState)+len(e.ethernetPMState))
 	baselines := make(map[mib.Key]performance.GEMPortCounters, len(e.performanceState))
 	evaluations := make(map[mib.Key]performanceThresholdEvaluation,
-		len(e.performanceState)+len(e.ethernetPMState))
+		len(e.performanceState)+len(e.fecPMState)+len(e.ethernetPMState))
 	for key, state := range e.performanceState {
 		rules, err := e.performanceThresholdsLocked(key)
 		if err != nil {
@@ -215,6 +242,34 @@ func (e *Engine) pollPerformanceLocked(now time.Time,
 		if intervals != 0 {
 			updates[key] = attributes
 			baselines[key] = current
+		}
+		if intervals <= 1 && len(rules) != 0 {
+			evaluations[key] = performanceThresholdEvaluation{attributes: attributes, rules: rules}
+		}
+	}
+	fecBaselines := make(map[mib.Key]performance.FECCounters, len(e.fecPMState))
+	for key, state := range e.fecPMState {
+		rules, err := e.performanceThresholdsLocked(key)
+		if err != nil {
+			return nil, fmt.Errorf("resolve FEC performance thresholds for %v/%#x: %w",
+				key.ClassID, key.EntityID, err)
+		}
+		if intervals == 0 && len(rules) == 0 {
+			continue
+		}
+		current, err := e.fecPerformance.FECCounters(state.aniEntityID)
+		if err != nil {
+			return nil, fmt.Errorf("read ANI-G %#x FEC performance counters: %w",
+				state.aniEntityID, err)
+		}
+		attributes := fecPerformanceAttributes(intervalEnd, performance.FECCounters{})
+		if intervals <= 1 {
+			attributes = fecPerformanceAttributes(intervalEnd,
+				deltaFECCounters(state.baseline, current))
+		}
+		if intervals != 0 {
+			updates[key] = attributes
+			fecBaselines[key] = current
 		}
 		if intervals <= 1 && len(rules) != 0 {
 			evaluations[key] = performanceThresholdEvaluation{attributes: attributes, rules: rules}
@@ -257,6 +312,11 @@ func (e *Engine) pollPerformanceLocked(now time.Time,
 			state := e.performanceState[key]
 			state.baseline = baseline
 			e.performanceState[key] = state
+		}
+		for key, baseline := range fecBaselines {
+			state := e.fecPMState[key]
+			state.baseline = baseline
+			e.fecPMState[key] = state
 		}
 		for key, baseline := range ethernetBaselines {
 			state := e.ethernetPMState[key]
@@ -329,6 +389,35 @@ func (e *Engine) reconcilePerformanceLocked() error {
 		}
 	}
 
+	activeFEC := make(map[mib.Key]struct{})
+	for _, instance := range e.mib.Snapshot() {
+		if instance.ClassID != me.FecPerformanceMonitoringHistoryDataClassID ||
+			e.fecPerformance == nil {
+			continue
+		}
+		key := instance.Key
+		activeFEC[key] = struct{}{}
+		if !e.mib.Exists(mib.Key{ClassID: me.AniGClassID, EntityID: key.EntityID}) {
+			return fmt.Errorf("FEC PM references missing ANI-G %#x", key.EntityID)
+		}
+		if _, present := e.fecPMState[key]; present {
+			continue
+		}
+		baseline, err := e.fecPerformance.FECCounters(key.EntityID)
+		if err != nil {
+			return fmt.Errorf("initialize ANI-G %#x FEC performance counters: %w",
+				key.EntityID, err)
+		}
+		e.fecPMState[key] = fecPerformanceState{
+			aniEntityID: key.EntityID, baseline: baseline,
+		}
+	}
+	for key := range e.fecPMState {
+		if _, present := activeFEC[key]; !present {
+			delete(e.fecPMState, key)
+		}
+	}
+
 	activeEthernet := make(map[mib.Key]struct{})
 	for _, instance := range e.mib.Snapshot() {
 		if !isEthernetPerformanceClass(instance.ClassID) || e.ethernetPerformance == nil {
@@ -363,8 +452,10 @@ func (e *Engine) reconcilePerformanceLocked() error {
 
 func (e *Engine) getCurrentPerformanceLocked(key mib.Key, mask uint16) (mib.Instance, error) {
 	gemPerformance := key.ClassID == me.GemPortNetworkCtpPerformanceMonitoringHistoryDataClassID
+	fecPerformance := key.ClassID == me.FecPerformanceMonitoringHistoryDataClassID
 	ethernetPerformance := isEthernetPerformanceClass(key.ClassID)
 	if (!gemPerformance || e.performance == nil) &&
+		(!fecPerformance || e.fecPerformance == nil) &&
 		(!ethernetPerformance || e.ethernetPerformance == nil) {
 		return mib.Instance{}, &mib.ResultError{Result: me.NotSupported}
 	}
@@ -390,6 +481,17 @@ func (e *Engine) getCurrentPerformanceLocked(key mib.Key, mask uint16) (mib.Inst
 		}
 		values = gemPerformanceAttributes(e.performanceIntervalEnd,
 			deltaGEMCounters(state.baseline, current))
+	} else if fecPerformance {
+		state, present := e.fecPMState[key]
+		if !present {
+			return mib.Instance{}, &mib.ResultError{Result: me.UnknownInstance}
+		}
+		current, err := e.fecPerformance.FECCounters(state.aniEntityID)
+		if err != nil {
+			return mib.Instance{}, &mib.ResultError{Result: me.ProcessingError, Cause: err}
+		}
+		values = fecPerformanceAttributes(e.performanceIntervalEnd,
+			deltaFECCounters(state.baseline, current))
 	} else {
 		state, present := e.ethernetPMState[key]
 		if !present {
@@ -411,7 +513,7 @@ func (e *Engine) getCurrentPerformanceLocked(key mib.Key, mask uint16) (mib.Inst
 }
 
 func (e *Engine) preparePerformanceSynchronizationLocked() (performanceSynchronization, error) {
-	if e.performance == nil && e.ethernetPerformance == nil {
+	if e.performance == nil && e.fecPerformance == nil && e.ethernetPerformance == nil {
 		return performanceSynchronization{}, nil
 	}
 	if err := e.reconcilePerformanceLocked(); err != nil {
@@ -419,6 +521,7 @@ func (e *Engine) preparePerformanceSynchronizationLocked() (performanceSynchroni
 	}
 	baselines := performanceSynchronization{
 		gem:      make(map[mib.Key]performance.GEMPortCounters, len(e.performanceState)),
+		fec:      make(map[mib.Key]performance.FECCounters, len(e.fecPMState)),
 		ethernet: make(map[mib.Key]performance.EthernetCounters, len(e.ethernetPMState)),
 	}
 	for key, state := range e.performanceState {
@@ -428,6 +531,15 @@ func (e *Engine) preparePerformanceSynchronizationLocked() (performanceSynchroni
 				"synchronize GEM port %d performance counters: %w", state.portID, err)
 		}
 		baselines.gem[key] = current
+	}
+	for key, state := range e.fecPMState {
+		current, err := e.fecPerformance.FECCounters(state.aniEntityID)
+		if err != nil {
+			return performanceSynchronization{}, fmt.Errorf(
+				"synchronize ANI-G %#x FEC performance counters: %w",
+				state.aniEntityID, err)
+		}
+		baselines.fec[key] = current
 	}
 	for key, state := range e.ethernetPMState {
 		current, err := e.ethernetPerformance.EthernetCounters(state.uniEntityID)
@@ -444,9 +556,12 @@ func (e *Engine) preparePerformanceSynchronizationLocked() (performanceSynchroni
 func (e *Engine) commitPerformanceSynchronizationLocked(now time.Time,
 	baselines performanceSynchronization) error {
 	updates := make(map[mib.Key]me.AttributeValueMap,
-		len(baselines.gem)+len(baselines.ethernet))
+		len(baselines.gem)+len(baselines.fec)+len(baselines.ethernet))
 	for key := range baselines.gem {
 		updates[key] = zeroGEMPerformanceAttributes(0)
+	}
+	for key := range baselines.fec {
+		updates[key] = fecPerformanceAttributes(0, performance.FECCounters{})
 	}
 	for key := range baselines.ethernet {
 		updates[key] = ethernetPerformanceAttributes(key.ClassID, 0,
@@ -459,6 +574,11 @@ func (e *Engine) commitPerformanceSynchronizationLocked(now time.Time,
 		state := e.performanceState[key]
 		state.baseline = baseline
 		e.performanceState[key] = state
+	}
+	for key, baseline := range baselines.fec {
+		state := e.fecPMState[key]
+		state.baseline = baseline
+		e.fecPMState[key] = state
 	}
 	for key, baseline := range baselines.ethernet {
 		state := e.ethernetPMState[key]
@@ -497,6 +617,18 @@ func gemPerformanceAttributes(intervalEnd uint8, counters performance.GEMPortCou
 
 func zeroGEMPerformanceAttributes(intervalEnd uint8) me.AttributeValueMap {
 	return gemPerformanceAttributes(intervalEnd, performance.GEMPortCounters{})
+}
+
+func fecPerformanceAttributes(intervalEnd uint8,
+	counters performance.FECCounters) me.AttributeValueMap {
+	return me.AttributeValueMap{
+		me.FecPerformanceMonitoringHistoryData_IntervalEndTime:        intervalEnd,
+		me.FecPerformanceMonitoringHistoryData_CorrectedBytes:         saturatingUint32(counters.CorrectedBytes),
+		me.FecPerformanceMonitoringHistoryData_CorrectedCodeWords:     saturatingUint32(counters.CorrectedCodeWords),
+		me.FecPerformanceMonitoringHistoryData_UncorrectableCodeWords: saturatingUint32(counters.UncorrectableCodeWords),
+		me.FecPerformanceMonitoringHistoryData_TotalCodeWords:         saturatingUint32(counters.TotalCodeWords),
+		me.FecPerformanceMonitoringHistoryData_FecSeconds:             saturatingUint16(counters.FECSeconds),
+	}
 }
 
 func ethernetPerformanceAttributes(classID me.ClassID, intervalEnd uint8,
@@ -603,6 +735,16 @@ func deltaGEMCounters(start, current performance.GEMPortCounters) performance.GE
 	}
 }
 
+func deltaFECCounters(start, current performance.FECCounters) performance.FECCounters {
+	return performance.FECCounters{
+		CorrectedBytes:         counterDelta(start.CorrectedBytes, current.CorrectedBytes),
+		CorrectedCodeWords:     counterDelta(start.CorrectedCodeWords, current.CorrectedCodeWords),
+		UncorrectableCodeWords: counterDelta(start.UncorrectableCodeWords, current.UncorrectableCodeWords),
+		TotalCodeWords:         counterDelta(start.TotalCodeWords, current.TotalCodeWords),
+		FECSeconds:             counterDelta(start.FECSeconds, current.FECSeconds),
+	}
+}
+
 func deltaEthernetCounters(start, current performance.EthernetCounters) performance.EthernetCounters {
 	return performance.EthernetCounters{
 		Received:    deltaEthernetDirection(start.Received, current.Received),
@@ -643,4 +785,11 @@ func saturatingUint32(value uint64) uint32 {
 		return math.MaxUint32
 	}
 	return uint32(value)
+}
+
+func saturatingUint16(value uint64) uint16 {
+	if value > math.MaxUint16 {
+		return math.MaxUint16
+	}
+	return uint16(value)
 }

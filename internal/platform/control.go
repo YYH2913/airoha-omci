@@ -28,6 +28,7 @@ type controlRequest struct {
 	UnixTime              int64   `json:"unix_time,omitempty"`
 	RebootCondition       uint8   `json:"reboot_condition,omitempty"`
 	GEMPortID             *uint16 `json:"gem_port_id,omitempty"`
+	ANIEntityID           *uint16 `json:"ani_entity_id,omitempty"`
 	EthernetEntityID      *uint16 `json:"ethernet_entity_id,omitempty"`
 	MulticastSubscriberID *uint16 `json:"multicast_subscriber_id,omitempty"`
 }
@@ -114,6 +115,48 @@ func (c ExecController) GEMPortCounters(portID uint16) (performance.GEMPortCount
 		ReceivedPayloadBytes:    *value.ReceivedPayloadBytes,
 		TransmittedGEMFrames:    *value.TransmittedGEMFrames,
 		TransmittedPayloadBytes: *value.TransmittedPayloadBytes,
+	}, nil
+}
+
+func (c ExecController) FECCounters(entityID uint16) (performance.FECCounters, error) {
+	output, err := c.execute(controlRequest{Action: "fec-counters", ANIEntityID: &entityID})
+	if err != nil {
+		return performance.FECCounters{}, err
+	}
+	type response struct {
+		ANIEntityID            *uint16 `json:"ani_entity_id"`
+		CorrectedBytes         *uint64 `json:"corrected_bytes"`
+		CorrectedCodeWords     *uint64 `json:"corrected_codewords"`
+		UncorrectableCodeWords *uint64 `json:"uncorrectable_codewords"`
+		TotalCodeWords         *uint64 `json:"total_codewords"`
+		FECSeconds             *uint64 `json:"fec_seconds"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(output))
+	decoder.DisallowUnknownFields()
+	var value response
+	if err := decoder.Decode(&value); err != nil {
+		return performance.FECCounters{}, fmt.Errorf("decode FEC counters: %w", err)
+	}
+	var trailing interface{}
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return performance.FECCounters{}, fmt.Errorf("decode FEC counters: trailing JSON value")
+		}
+		return performance.FECCounters{}, fmt.Errorf("decode FEC counters: %w", err)
+	}
+	if value.ANIEntityID == nil || *value.ANIEntityID != entityID ||
+		value.CorrectedBytes == nil || value.CorrectedCodeWords == nil ||
+		value.UncorrectableCodeWords == nil || value.TotalCodeWords == nil ||
+		value.FECSeconds == nil {
+		return performance.FECCounters{}, fmt.Errorf(
+			"decode FEC counters: required or matching field is missing")
+	}
+	return performance.FECCounters{
+		CorrectedBytes:         *value.CorrectedBytes,
+		CorrectedCodeWords:     *value.CorrectedCodeWords,
+		UncorrectableCodeWords: *value.UncorrectableCodeWords,
+		TotalCodeWords:         *value.TotalCodeWords,
+		FECSeconds:             *value.FECSeconds,
 	}, nil
 }
 

@@ -292,6 +292,26 @@ and returns four cumulative 64-bit hardware counters:
 {"gem_port_id":42,"received_gem_frames":11,"received_payload_bytes":22,"transmitted_gem_frames":33,"transmitted_payload_bytes":44}
 ```
 
+For FEC performance monitoring, the request contains the fixed XG2010G ANI-G
+entity ID. No register address crosses the helper ABI.
+
+```json
+{"action":"fec-counters","ani_entity_id":32769}
+```
+
+The response contains five cumulative unsigned 64-bit values:
+
+```json
+{"ani_entity_id":32769,"corrected_bytes":11,"corrected_codewords":22,"uncorrectable_codewords":33,"total_codewords":44,"fec_seconds":55}
+```
+
+The GPON driver snapshots the EN7581 PHY counters at `phy-csr` offsets `0xba8`,
+`0xb28`, `0xb24`, `0xba4` and `0xbbc`, respectively. This order and mapping
+match the vendor GPON FEC statistics API `0x800d`; the SDK binary was used only
+to establish the hardware ABI. The helper reads the read-only `fec_counters`
+attribute and rejects an unknown ANI-G, a missing field, a reordered kernel
+snapshot or a non-decimal value.
+
 For Ethernet performance monitoring, the request contains only the fixed
 G.988 PPTP Ethernet UNI entity ID. The XG2010G helper maps `0x0101` through
 `0x0104` to `lan1` through `lan4`; no interface name crosses this ABI.

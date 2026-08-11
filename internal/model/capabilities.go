@@ -47,6 +47,7 @@ func XG2010GSupportedClasses() []me.ClassID {
 		me.AttributeMeClassID,
 		me.ThresholdData1ClassID,
 		me.ThresholdData2ClassID,
+		me.FecPerformanceMonitoringHistoryDataClassID,
 		me.GemPortNetworkCtpPerformanceMonitoringHistoryDataClassID,
 	}
 	sort.Slice(classes, func(i, j int) bool { return classes[i] < classes[j] })

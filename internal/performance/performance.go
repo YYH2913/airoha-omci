@@ -11,6 +11,14 @@ type GEMPortCounters struct {
 	TransmittedPayloadBytes uint64 `json:"transmitted_payload_bytes"`
 }
 
+type FECCounters struct {
+	CorrectedBytes         uint64 `json:"corrected_bytes"`
+	CorrectedCodeWords     uint64 `json:"corrected_codewords"`
+	UncorrectableCodeWords uint64 `json:"uncorrectable_codewords"`
+	TotalCodeWords         uint64 `json:"total_codewords"`
+	FECSeconds             uint64 `json:"fec_seconds"`
+}
+
 type EthernetDirectionCounters struct {
 	Frames          uint64
 	Octets          uint64
@@ -38,4 +46,8 @@ type Controller interface {
 
 type EthernetController interface {
 	EthernetCounters(entityID uint16) (EthernetCounters, error)
+}
+
+type FECController interface {
+	FECCounters(aniEntityID uint16) (FECCounters, error)
 }

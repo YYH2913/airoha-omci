@@ -102,6 +102,8 @@ type Engine struct {
 	extendedSeen           bool
 	performance            performance.Controller
 	performanceState       map[mib.Key]performanceState
+	fecPerformance         performance.FECController
+	fecPMState             map[mib.Key]fecPerformanceState
 	ethernetPerformance    performance.EthernetController
 	ethernetPMState        map[mib.Key]ethernetPerformanceState
 	performanceTCA         map[mib.Key][28]byte
@@ -133,6 +135,7 @@ func NewWithControllers(store *mib.Store, controller Controller, softwareControl
 		software:         softwareController,
 		softwareState:    SoftwareStatus{Phase: "idle"},
 		performanceState: make(map[mib.Key]performanceState),
+		fecPMState:       make(map[mib.Key]fecPerformanceState),
 		ethernetPMState:  make(map[mib.Key]ethernetPerformanceState),
 		performanceTCA:   make(map[mib.Key][28]byte),
 	}
@@ -141,6 +144,9 @@ func NewWithControllers(store *mib.Store, controller Controller, softwareControl
 	}
 	if ethernetController, ok := controller.(performance.EthernetController); ok {
 		result.ethernetPerformance = ethernetController
+	}
+	if fecController, ok := controller.(performance.FECController); ok {
+		result.fecPerformance = fecController
 	}
 	if multicastController, ok := controller.(multicast.Controller); ok {
 		result.multicast = multicastController
@@ -281,6 +287,7 @@ func (e *Engine) dispatch(packet gopacket.Packet, header *omci.OMCI) ([]byte, er
 			return nil, err
 		}
 		var preparedPerformance *performanceState
+		var preparedFEC *fecPerformanceState
 		var preparedEthernet *ethernetPerformanceState
 		var operationError error
 		requestKey := mib.Key{ClassID: request.EntityClass, EntityID: request.EntityInstance}
@@ -291,6 +298,9 @@ func (e *Engine) dispatch(packet gopacket.Packet, header *omci.OMCI) ([]byte, er
 		if operationError == nil &&
 			request.EntityClass == me.GemPortNetworkCtpPerformanceMonitoringHistoryDataClassID {
 			preparedPerformance, operationError = e.prepareGEMPerformanceCreateLocked(request.EntityInstance)
+		} else if operationError == nil &&
+			request.EntityClass == me.FecPerformanceMonitoringHistoryDataClassID {
+			preparedFEC, operationError = e.prepareFECPerformanceCreateLocked(request.EntityInstance)
 		} else if operationError == nil && isEthernetPerformanceClass(request.EntityClass) {
 			preparedEthernet, operationError = e.prepareEthernetPerformanceCreateLocked(
 				request.EntityClass, request.EntityInstance)
@@ -305,6 +315,11 @@ func (e *Engine) dispatch(packet gopacket.Packet, header *omci.OMCI) ([]byte, er
 				e.performanceState[mib.Key{
 					ClassID: request.EntityClass, EntityID: request.EntityInstance,
 				}] = *preparedPerformance
+			}
+			if preparedFEC != nil {
+				e.fecPMState[mib.Key{
+					ClassID: request.EntityClass, EntityID: request.EntityInstance,
+				}] = *preparedFEC
 			}
 			if preparedEthernet != nil {
 				e.ethernetPMState[mib.Key{
@@ -353,6 +368,7 @@ func (e *Engine) dispatch(packet gopacket.Packet, header *omci.OMCI) ([]byte, er
 		if result == me.Success {
 			e.tables = make(map[tableKey][]byte)
 			delete(e.performanceState, key)
+			delete(e.fecPMState, key)
 			delete(e.ethernetPMState, key)
 			e.clearPerformanceTCAKeyLocked(key)
 		}
@@ -475,6 +491,7 @@ func (e *Engine) dispatch(packet gopacket.Packet, header *omci.OMCI) ([]byte, er
 			e.tables = make(map[tableKey][]byte)
 			e.arcFreeSince = make(map[mib.Key]time.Time)
 			e.performanceState = make(map[mib.Key]performanceState)
+			e.fecPMState = make(map[mib.Key]fecPerformanceState)
 			e.ethernetPMState = make(map[mib.Key]ethernetPerformanceState)
 			e.clearAllPerformanceTCAsLocked()
 			e.performanceNext = time.Time{}
