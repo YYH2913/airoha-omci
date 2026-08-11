@@ -21,10 +21,13 @@ import (
 	"github.com/xg2010g/airoha-omci/internal/platform"
 	"github.com/xg2010g/airoha-omci/internal/software"
 	"github.com/xg2010g/airoha-omci/internal/status"
+	"github.com/xg2010g/airoha-omci/internal/transaction"
 	"github.com/xg2010g/airoha-omci/internal/transport"
 )
 
 var version = "devel"
+
+const transactionQueueCapacity = 1024
 
 type options struct {
 	interfaceName  string
@@ -135,20 +138,29 @@ func run(opts options) error {
 		return nil
 	}
 
-	type receiveResult struct {
-		frame []byte
-		err   error
+	dispatcher, err := transaction.NewDispatcher(ctx, transactionQueueCapacity)
+	if err != nil {
+		return fmt.Errorf("initialize OMCI transaction queue: %w", err)
 	}
-	received := make(chan receiveResult, 1)
+	receiveErrors := make(chan error, 1)
 	go func() {
 		for {
+			generation := dispatcher.Generation()
 			frame, err := conn.ReadFrame(ctx)
-			select {
-			case received <- receiveResult{frame: frame, err: err}:
-			case <-ctx.Done():
+			if err != nil {
+				select {
+				case receiveErrors <- err:
+				case <-ctx.Done():
+				}
 				return
 			}
-			if err != nil {
+			if err := dispatcher.Enqueue(ctx, generation, frame); err != nil {
+				if ctx.Err() == nil {
+					select {
+					case receiveErrors <- err:
+					case <-ctx.Done():
+					}
+				}
 				return
 			}
 		}
@@ -198,6 +210,19 @@ func run(opts options) error {
 			return sourceErr
 
 		case value := <-platformEvents:
+			if value.Type == "omcc-session-reset" {
+				if err := dispatcher.Reset(ctx); err != nil {
+					if errors.Is(err, context.Canceled) {
+						state.State = "stopped"
+						_ = statusWriter.Write(state)
+						return nil
+					}
+					state.TransportErrors++
+					state.LastError = err.Error()
+					_ = statusWriter.Write(state)
+					return fmt.Errorf("reset OMCI transaction queue: %w", err)
+				}
+			}
 			frames, err := value.Dispatch(protocol)
 			if err != nil {
 				state.EventErrors++
@@ -274,20 +299,26 @@ func run(opts options) error {
 				continue
 			}
 
-		case result := <-received:
-			if result.err != nil {
-				if errors.Is(result.err, context.Canceled) {
+		case queueErr := <-dispatcher.Errors():
+			state.TransportErrors++
+			state.LastError = queueErr.Error()
+			_ = statusWriter.Write(state)
+			return queueErr
+
+		case receiveErr := <-receiveErrors:
+			if receiveErr != nil {
+				if errors.Is(receiveErr, context.Canceled) {
 					state.State = "stopped"
 					_ = statusWriter.Write(state)
 					return nil
 				}
 				state.TransportErrors++
-				state.LastError = result.err.Error()
+				state.LastError = receiveErr.Error()
 				_ = statusWriter.Write(state)
-				return result.err
+				return receiveErr
 			}
 
-			frame := result.frame
+		case frame := <-dispatcher.Frames():
 			state.RXFrames++
 			if len(frame) >= 4 {
 				state.LastTransactionID = uint16(frame[0])<<8 | uint16(frame[1])

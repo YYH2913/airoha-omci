@@ -15,10 +15,11 @@ after the configured fixed-path helper accepts the complete candidate state.
 ## Status
 
 This repository is under active development. The raw OMCC transport,
-transactional MIB, baseline table transfer and core MIB audit operations are
-implemented. Driver-originated alarm/AVC events have a validated upstream
-notification path. Software download, CRC-32A and ImageHash validation,
-activation and commit are implemented through a fixed platform helper ABI.
+bounded priority scheduler, transactional MIB, baseline table transfer and
+core MIB audit operations are implemented. Driver-originated alarm/AVC events
+have a validated upstream notification path. Software download, CRC-32A and
+ImageHash validation, activation and commit are implemented through a fixed
+platform helper ABI.
 ANI-G optical alarms and ARC, extended SetTable handling, the resolved
 Ethernet service graph, and the common multi-profile Linux bridge/VLAN/TC
 data path are implemented. The native multicast runtime parses IGMPv1/v2/v3

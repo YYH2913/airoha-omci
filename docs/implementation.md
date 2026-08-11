@@ -6,7 +6,7 @@ and extended messages.  A successful build or reaching GPON O5 is not enough.
 | Area | Required behavior | State |
 | --- | --- | --- |
 | OMCC transport | raw RX/TX, cancellation, frame bounds, counters | implemented; physical adapter verification pending |
-| Transactions | per-priority stop-and-wait replay and TCI validation | implemented; queue integration pending |
+| Transactions | per-priority scheduling, stop-and-wait replay and TCI validation | implemented; physical saturation verification pending |
 | MIB | ONU defaults, platform-gated create/delete/set, reset, data sync | in progress |
 | MIB upload | baseline fragmentation and extended multi-ME packing | in progress |
 | Tables | stable Get/Get Next cache and baseline/enhanced extended Set Table | implemented; OLT verification pending |
@@ -34,6 +34,14 @@ extended format uses one priority class. Only the last response in each class
 is replayed, including when a retransmitted frame differs after the header;
 older reused TCIs are executed as new commands. Immediate duplicate
 unacknowledged software sections are suppressed separately.
+
+The OMCC receive loop drains frames into a bounded scheduler while a platform
+transaction is running. Baseline high-priority frames are selected before the
+baseline-low and extended FIFO, without reordering either class internally.
+Queue exhaustion terminates the daemon instead of silently dropping one-way
+software sections. An OMCC session-reset event atomically clears queued frames
+and advances a generation counter, so a receive started before re-ranging
+cannot leak a stale frame into the new transaction replay state.
 
 Transport validation accepts only the explicit OMCC adapter forms: a 48-byte
 baseline frame, the 44-byte MIC-stripped form emitted by the protocol library,
