@@ -406,9 +406,16 @@ func restoreONU3Factory(factory []mib.Instance, path string) ([]mib.Instance, er
 }
 
 func initializeMIB(factory []mib.Instance, applier mib.Applier, statePath string) (*mib.Store, error) {
+	attributeMasks, err := model.XG2010GSupportedAttributeMasks(factory)
+	if err != nil {
+		return nil, fmt.Errorf("build XG2010G attribute policy: %w", err)
+	}
 	options := mib.Options{
-		Applier:          applier,
-		SupportedClasses: model.XG2010GSupportedClasses(),
+		Applier:                 applier,
+		SupportedClasses:        model.XG2010GSupportedClasses(),
+		SupportedAttributeMasks: attributeMasks,
+		ValidateInstance:        model.XG2010GValidateInstance,
+		AttributeCapabilities:   model.XG2010GAttributeCapabilities(),
 	}
 	if statePath == "" {
 		return mib.NewWithOptions(factory, options)

@@ -193,7 +193,7 @@ the OMCI mutation:
 | G.988 object | EN7581/QDMA object | Required operation |
 | --- | --- | --- |
 | T-CONT (class 262) | GPON Alloc-ID and WAN channel | allocate or release the T-CONT slot |
-| GEM CTP (class 268) | GPON GEM table and channel direction | enable GEM, encryption and GEM/mark mapping |
+| GEM CTP (class 268) | GPON GEM table and channel direction | enable GEM and GEM/mark mapping |
 | Priority queue (class 277) | QDMA WAN channel queue 0-7 | set SP/WRR mode and weight |
 | Traffic descriptor (class 280) | QDMA TRTCM meter, PON ingress GEM policer or Linux bridge-port policer | set CIR/PIR/CBS/PBS and enable/disable |
 | Dot1 rate limiter (class 298) | Linux bridge ANI egress flower/police rules | police unknown-unicast flood, broadcast and multicast payload independently |
@@ -207,6 +207,11 @@ QDMA channels; the current factory MIB advertises eight T-CONTs. Channels 0
 through 3 share allocation state with regular Linux qdiscs, while GPON-only
 channels 4 through 15 do not consume one of the four ordinary netdev QoS
 slots.
+
+GPON downstream encryption is negotiated by the PLOAM `Encrypted_Port`
+message and applied by the GPON MAC. It is intentionally absent from the OMCI
+service graph. The class-268 `encryption key ring` attribute is an optional
+G.987/XG-PON capability and is not advertised by this GPON ONU.
 
 Scheduler policy 0 (null) and 1 (strict priority) map to EN7581 SP; policy 2
 maps to WRR8 and requires at least one non-zero queue weight. Class-280 CIR and

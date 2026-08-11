@@ -165,6 +165,14 @@ func (e *Engine) capabilityInstanceLocked(key mib.Key, classes []me.ClassID) (mi
 			return mib.Instance{}, &mib.ResultError{Result: me.UnknownInstance}
 		}
 		lower, upper, bitField := capabilityAttributeBounds(*attribute)
+		var codePoints []byte
+		if capability, constrained := e.mib.AttributeCapability(classID, attribute.GetName()); constrained {
+			lower, upper, bitField = capability.LowerLimit, capability.UpperLimit, capability.BitField
+			codePoints = make([]byte, len(capability.CodePoints)*2)
+			for index, value := range capability.CodePoints {
+				binary.BigEndian.PutUint16(codePoints[index*2:], value)
+			}
+		}
 		attributes[me.AttributeMe_Name] = fixedCapabilityName(attribute.GetName())
 		attributes[me.AttributeMe_Size] = uint16(attribute.GetSize())
 		attributes[me.AttributeMe_Access] = capabilityAttributeAccess(*attribute)
@@ -172,7 +180,7 @@ func (e *Engine) capabilityInstanceLocked(key mib.Key, classes []me.ClassID) (mi
 		attributes[me.AttributeMe_LowerLimit] = lower
 		attributes[me.AttributeMe_UpperLimit] = upper
 		attributes[me.AttributeMe_BitField] = bitField
-		attributes[me.AttributeMe_CodePointsTable] = me.TableRows{}
+		attributes[me.AttributeMe_CodePointsTable] = tableValue(codePoints, 2)
 		attributes[me.AttributeMe_Support] = uint8(me.PartiallySupported)
 	}
 	return mib.Instance{Key: key, Attributes: attributes, Origin: mib.OriginONU}, nil

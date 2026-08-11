@@ -101,7 +101,7 @@ func NewFromState(factory []Instance, state State, options Options) (*Store, err
 		if _, duplicate := current[instance.Key]; duplicate {
 			return nil, fmt.Errorf("duplicate restored ME %v/%#x", instance.ClassID, instance.EntityID)
 		}
-		normalized, err := normalize(instance)
+		normalized, err := store.normalize(instance)
 		if err != nil {
 			return nil, fmt.Errorf("invalid restored ME %v/%#x: %w",
 				instance.ClassID, instance.EntityID, err)

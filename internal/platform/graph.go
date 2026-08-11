@@ -70,7 +70,6 @@ type GEMPort struct {
 	DownstreamQueue uint16 `json:"downstream_queue"`
 	UpstreamTD      uint16 `json:"upstream_traffic_descriptor"`
 	DownstreamTD    uint16 `json:"downstream_traffic_descriptor"`
-	EncryptionRing  uint8  `json:"encryption_ring"`
 }
 
 // TrafficDescriptor is the normalized class-280 ME consumed by a native
@@ -641,17 +640,10 @@ func BuildServiceGraph(snapshot []mib.Instance) (ServiceGraph, error) {
 			"downstream", downstreamTD); err != nil {
 			return ServiceGraph{}, err
 		}
-		encryptionRing, err := uint8AttributeDefault(instance, me.GemPortNetworkCtp_EncryptionKeyRing, 0)
-		if err != nil {
-			return ServiceGraph{}, err
-		}
-		if encryptionRing > 3 {
-			return ServiceGraph{}, fmt.Errorf("GEM CTP %#x has invalid encryption key ring %d", instance.EntityID, encryptionRing)
-		}
 		gemPort := GEMPort{EntityID: instance.EntityID, PortID: portID, TCONT: tcontID,
 			AllocID: tcont.AllocID, Direction: direction, UpstreamQueue: upstreamQueue,
 			DownstreamQueue: downstreamQueue, UpstreamTD: upstreamTD,
-			DownstreamTD: downstreamTD, EncryptionRing: encryptionRing}
+			DownstreamTD: downstreamTD}
 		gemPorts[instance.EntityID] = gemPort
 		graph.GEMPorts = append(graph.GEMPorts, gemPort)
 	}
@@ -1169,8 +1161,17 @@ func buildGEMInterworking(instance mib.Instance, instances map[mib.Key]mib.Insta
 	if err != nil {
 		return GEMInterworking{}, err
 	}
-	if !hasInstance(instances, me.GalEthernetProfileClassID, gal) {
-		return GEMInterworking{}, fmt.Errorf("GEM IW TP %#x references missing GAL Ethernet profile %#x", instance.EntityID, gal)
+	if err := validateGALProfile(instances, instance.EntityID, gal); err != nil {
+		return GEMInterworking{}, err
+	}
+	loopback, err := uint8AttributeDefault(instance,
+		me.GemInterworkingTerminationPoint_GalLoopbackConfiguration, 0)
+	if err != nil {
+		return GEMInterworking{}, err
+	}
+	if loopback != 0 {
+		return GEMInterworking{}, fmt.Errorf("GEM IW TP %#x requests unsupported GAL loopback mode %d",
+			instance.EntityID, loopback)
 	}
 	return GEMInterworking{EntityID: instance.EntityID, GEMPort: pointer, Option: option,
 		ServiceProfile: service, InterworkingTermination: interworkingTP, GALProfile: gal}, nil
@@ -1244,9 +1245,10 @@ func buildMulticastGEMInterworking(instance mib.Instance, instances map[mib.Key]
 	if err != nil {
 		return MulticastGEMInterworking{}, err
 	}
-	if gal != 0 && !hasInstance(instances, me.GalEthernetProfileClassID, gal) {
-		return MulticastGEMInterworking{}, fmt.Errorf("multicast GEM IW TP %#x references missing GAL Ethernet profile %#x",
-			instance.EntityID, gal)
+	if gal != 0 {
+		if err := validateGALProfile(instances, instance.EntityID, gal); err != nil {
+			return MulticastGEMInterworking{}, fmt.Errorf("multicast %w", err)
+		}
 	}
 
 	ipv4, err := multicastIPv4Ranges(instance)
@@ -1262,6 +1264,21 @@ func buildMulticastGEMInterworking(instance mib.Instance, instances map[mib.Key]
 		TCONT: gem.TCONT, AllocID: gem.AllocID, Option: option,
 		ServiceProfile: service, GALProfile: gal, IPv4Ranges: ipv4, IPv6Ranges: ipv6,
 	}, nil
+}
+
+func validateGALProfile(instances map[mib.Key]mib.Instance, interworking, gal uint16) error {
+	profile, exists := instances[mib.Key{ClassID: me.GalEthernetProfileClassID, EntityID: gal}]
+	if !exists {
+		return fmt.Errorf("GEM IW TP %#x references missing GAL Ethernet profile %#x", interworking, gal)
+	}
+	payload, err := uint16Attribute(profile, me.GalEthernetProfile_MaximumGemPayloadSize)
+	if err != nil {
+		return err
+	}
+	if payload != 48 {
+		return fmt.Errorf("GAL Ethernet profile %#x has unsupported maximum GEM payload size %d", gal, payload)
+	}
+	return nil
 }
 
 func multicastIPv4Ranges(instance mib.Instance) ([]MulticastIPv4Range, error) {

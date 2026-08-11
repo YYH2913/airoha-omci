@@ -277,6 +277,73 @@ func TestSupportedClassPolicyRejectsKnownUnimplementedClass(t *testing.T) {
 	}
 }
 
+func TestExplicitAttributePolicyMustCoverExactlySupportedClasses(t *testing.T) {
+	factory := []Instance{{
+		Key:        Key{ClassID: me.OnuDataClassID, EntityID: 0},
+		Attributes: me.AttributeValueMap{me.OnuData_MibDataSync: uint8(0)},
+	}}
+	classes := []me.ClassID{me.OnuDataClassID, me.GalEthernetProfileClassID}
+	if _, err := NewWithOptions(factory, Options{
+		SupportedClasses: classes,
+		SupportedAttributeMasks: map[me.ClassID]uint16{
+			me.OnuDataClassID: 0x8000,
+		},
+	}); err == nil || !strings.Contains(err.Error(), "has no attribute policy") {
+		t.Fatalf("incomplete attribute policy error = %v", err)
+	}
+	if _, err := NewWithOptions(factory, Options{
+		SupportedClasses: classes,
+		SupportedAttributeMasks: map[me.ClassID]uint16{
+			me.OnuDataClassID:            0x8000,
+			me.GalEthernetProfileClassID: 0x8000,
+			me.IpHostConfigDataClassID:   0x8000,
+		},
+	}); err == nil || !strings.Contains(err.Error(), "contains unsupported") {
+		t.Fatalf("extra attribute policy error = %v", err)
+	}
+}
+
+func TestAttributeCapabilitiesRequireAdvertisedAttributes(t *testing.T) {
+	factory := []Instance{{
+		Key:        Key{ClassID: me.OnuDataClassID, EntityID: 0},
+		Attributes: me.AttributeValueMap{me.OnuData_MibDataSync: uint8(0)},
+	}}
+	options := Options{
+		SupportedClasses: []me.ClassID{me.OnuDataClassID},
+		SupportedAttributeMasks: map[me.ClassID]uint16{
+			me.OnuDataClassID: 0x8000,
+		},
+		AttributeCapabilities: map[AttributeCapabilityKey]AttributeCapability{
+			{ClassID: me.OnuDataClassID, Name: me.OnuData_MibDataSync}: {
+				LowerLimit: 0, UpperLimit: 255,
+			},
+		},
+	}
+	store, err := NewWithOptions(factory, options)
+	if err != nil {
+		t.Fatalf("NewWithOptions() error = %v", err)
+	}
+	capability, present := store.AttributeCapability(me.OnuDataClassID, me.OnuData_MibDataSync)
+	if !present || capability.UpperLimit != 255 {
+		t.Fatalf("AttributeCapability() = %#v/%t", capability, present)
+	}
+
+	options.AttributeCapabilities = map[AttributeCapabilityKey]AttributeCapability{
+		{ClassID: me.OnuDataClassID, Name: "Missing"}: {},
+	}
+	if _, err := NewWithOptions(factory, options); err == nil || !strings.Contains(err.Error(), "invalid attribute capability") {
+		t.Fatalf("unknown attribute capability error = %v", err)
+	}
+	options.AttributeCapabilities = map[AttributeCapabilityKey]AttributeCapability{
+		{ClassID: me.OnuDataClassID, Name: me.OnuData_MibDataSync}: {
+			LowerLimit: 2, UpperLimit: 1,
+		},
+	}
+	if _, err := NewWithOptions(factory, options); err == nil || !strings.Contains(err.Error(), "above upper limit") {
+		t.Fatalf("invalid attribute bounds error = %v", err)
+	}
+}
+
 func TestSupportedAttributePolicyRejectsUnadvertisedFactoryAttribute(t *testing.T) {
 	store, err := NewWithOptions([]Instance{{
 		Key: Key{ClassID: me.OnuGClassID, EntityID: 0},

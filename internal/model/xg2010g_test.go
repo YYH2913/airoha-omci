@@ -3,7 +3,9 @@
 package model
 
 import (
+	"errors"
 	"slices"
+	"strings"
 	"testing"
 
 	me "github.com/opencord/omci-lib-go/v2/generated"
@@ -148,5 +150,212 @@ func TestXG2010GSupportedClassesAreExplicitAndSorted(t *testing.T) {
 	}
 	if _, present := seen[me.IpHostConfigDataClassID]; present {
 		t.Fatalf("unsupported IP host class is advertised")
+	}
+}
+
+func TestXG2010GAttributePolicyMatchesImplementedSurface(t *testing.T) {
+	factory, err := XG2010G(Identity{SerialNumber: "TEST01020304"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	masks, err := XG2010GSupportedAttributeMasks(factory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	classes := XG2010GSupportedClasses()
+	if len(masks) != len(classes) {
+		t.Fatalf("attribute policies = %d, supported classes = %d", len(masks), len(classes))
+	}
+	for _, classID := range classes {
+		if mask, present := masks[classID]; !present || mask == 0 {
+			t.Fatalf("class %v attribute mask = %#x/%t", classID, mask, present)
+		}
+	}
+	for classID, want := range map[me.ClassID]uint16{
+		me.GemInterworkingTerminationPointClassID:                   0xf300,
+		me.GemPortNetworkCtpClassID:                                 0xfa80,
+		me.MacBridgePortConfigurationDataClassID:                    0xfe38,
+		me.TrafficDescriptorClassID:                                 0xf100,
+		me.MulticastOperationsProfileClassID:                        0xff7f,
+		me.GemPortNetworkCtpPerformanceMonitoringHistoryDataClassID: 0xfc00,
+	} {
+		if got := masks[classID]; got != want {
+			t.Fatalf("class %v attribute mask = %#x, want %#x", classID, got, want)
+		}
+	}
+
+	store, err := mib.NewWithOptions(factory, mib.Options{
+		SupportedClasses: XG2010GSupportedClasses(), SupportedAttributeMasks: masks,
+		ValidateInstance:      XG2010GValidateInstance,
+		AttributeCapabilities: XG2010GAttributeCapabilities(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := mib.Key{ClassID: me.GemInterworkingTerminationPointClassID, EntityID: 0x100}
+	if err := store.Create(key.ClassID, key.EntityID, me.AttributeValueMap{
+		me.GemInterworkingTerminationPoint_GemPortNetworkCtpConnectivityPointer: uint16(0x200),
+		me.GemInterworkingTerminationPoint_InterworkingOption:                   uint8(1),
+		me.GemInterworkingTerminationPoint_ServiceProfilePointer:                uint16(0x300),
+		me.GemInterworkingTerminationPoint_InterworkingTerminationPointPointer:  uint16(0),
+		me.GemInterworkingTerminationPoint_GalProfilePointer:                    uint16(1),
+	}); err != nil {
+		t.Fatalf("Create(GEM IW) error = %v", err)
+	}
+	created, err := store.Get(key, masks[key.ClassID])
+	if err != nil {
+		t.Fatalf("Get(GEM IW) error = %v", err)
+	}
+	for _, omitted := range []string{
+		me.GemInterworkingTerminationPoint_PptpCounter,
+		me.GemInterworkingTerminationPoint_OperationalState,
+	} {
+		if _, present := created.Attributes[omitted]; present {
+			t.Fatalf("GEM IW snapshot retained unsupported default attribute %s", omitted)
+		}
+	}
+	_, err = store.Get(key, 0x0800)
+	var result *mib.ResultError
+	if !errors.As(err, &result) || result.Result != me.AttributeFailure || result.UnsupportedMask != 0x0800 {
+		t.Fatalf("Get(unsupported GEM IW attribute) error = %#v", err)
+	}
+
+	err = store.Create(me.TrafficDescriptorClassID, 0x101, me.AttributeValueMap{
+		me.TrafficDescriptor_ColourMode: uint8(0),
+	})
+	if !errors.As(err, &result) || result.Result != me.AttributeFailure || result.UnsupportedMask != 0x0800 {
+		t.Fatalf("Create(unadvertised colour mode) error = %#v", err)
+	}
+}
+
+func TestXG2010GRejectsUnsupportedFixedAttributeValues(t *testing.T) {
+	factory, err := XG2010G(Identity{SerialNumber: "TEST01020304"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	masks, err := XG2010GSupportedAttributeMasks(factory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := mib.NewWithOptions(factory, mib.Options{
+		SupportedClasses: XG2010GSupportedClasses(), SupportedAttributeMasks: masks,
+		ValidateInstance:      XG2010GValidateInstance,
+		AttributeCapabilities: XG2010GAttributeCapabilities(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name       string
+		classID    me.ClassID
+		entityID   uint16
+		attributes me.AttributeValueMap
+		failedMask uint16
+	}{
+		{
+			name: "GAL payload", classID: me.GalEthernetProfileClassID, entityID: 1,
+			attributes: me.AttributeValueMap{
+				me.GalEthernetProfile_MaximumGemPayloadSize: uint16(64),
+			}, failedMask: 0x8000,
+		},
+		{
+			name: "GAL loopback", classID: me.GemInterworkingTerminationPointClassID, entityID: 2,
+			attributes: me.AttributeValueMap{
+				me.GemInterworkingTerminationPoint_GemPortNetworkCtpConnectivityPointer: uint16(0x200),
+				me.GemInterworkingTerminationPoint_InterworkingOption:                   uint8(1),
+				me.GemInterworkingTerminationPoint_ServiceProfilePointer:                uint16(0x300),
+				me.GemInterworkingTerminationPoint_InterworkingTerminationPointPointer:  uint16(0),
+				me.GemInterworkingTerminationPoint_GalProfilePointer:                    uint16(1),
+				me.GemInterworkingTerminationPoint_GalLoopbackConfiguration:             uint8(1),
+			}, failedMask: 0x0100,
+		},
+		{
+			name: "RFC 4115 meter", classID: me.TrafficDescriptorClassID, entityID: 3,
+			attributes: me.AttributeValueMap{
+				me.TrafficDescriptor_MeterType: uint8(1),
+			}, failedMask: 0x0100,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := store.Create(test.classID, test.entityID, test.attributes)
+			var result *mib.ResultError
+			if !errors.As(err, &result) || result.Result != me.AttributeFailure ||
+				result.FailedMask != test.failedMask {
+				t.Fatalf("Create() error = %#v, want AttributeFailure/%#x", err, test.failedMask)
+			}
+		})
+	}
+
+	for _, test := range []struct {
+		name       string
+		key        mib.Key
+		attributes me.AttributeValueMap
+		failedMask uint16
+	}{
+		{
+			name: "battery monitoring", key: mib.Key{ClassID: me.OnuGClassID, EntityID: 0},
+			attributes: me.AttributeValueMap{me.OnuG_BatteryBackup: uint8(1)}, failedMask: 0x0400,
+		},
+		{
+			name: "fixed GEM block", key: mib.Key{ClassID: me.AniGClassID, EntityID: aniEntityID},
+			attributes: me.AttributeValueMap{me.AniG_GemBlockLength: uint16(64)}, failedMask: 0x2000,
+		},
+		{
+			name: "mismatched Ethernet type",
+			key:  mib.Key{ClassID: me.PhysicalPathTerminationPointEthernetUniClassID, EntityID: 0x0101},
+			attributes: me.AttributeValueMap{
+				me.PhysicalPathTerminationPointEthernetUni_ExpectedType: uint8(47),
+			}, failedMask: 0x8000,
+		},
+		{
+			name: "fixed maximum frame size",
+			key:  mib.Key{ClassID: me.PhysicalPathTerminationPointEthernetUniClassID, EntityID: 0x0101},
+			attributes: me.AttributeValueMap{
+				me.PhysicalPathTerminationPointEthernetUni_MaxFrameSize: uint16(1518),
+			}, failedMask: 0x0100,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := store.Set(test.key, test.attributes)
+			var result *mib.ResultError
+			if !errors.As(err, &result) || result.Result != me.AttributeFailure ||
+				result.FailedMask != test.failedMask {
+				t.Fatalf("Set() error = %#v, want AttributeFailure/%#x", err, test.failedMask)
+			}
+		})
+	}
+}
+
+func TestXG2010GCapabilitiesCoverAdvertisedEnumerations(t *testing.T) {
+	factory, err := XG2010G(Identity{SerialNumber: "TEST01020304"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	masks, err := XG2010GSupportedAttributeMasks(factory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	capabilities := XG2010GAttributeCapabilities()
+	var missing []string
+	for classID, mask := range masks {
+		definitions, omciErr := me.GetAttributesDefinitions(classID)
+		if omciErr.StatusCode() != me.Success {
+			t.Fatal(omciErr.GetError())
+		}
+		for _, definition := range definitions {
+			if definition.AttributeType != me.EnumerationAttributeType || definition.Mask&mask == 0 {
+				continue
+			}
+			key := mib.AttributeCapabilityKey{ClassID: classID, Name: definition.GetName()}
+			if capability, present := capabilities[key]; !present || len(capability.CodePoints) == 0 {
+				missing = append(missing, classID.String()+"/"+definition.GetName())
+			}
+		}
+	}
+	if len(missing) != 0 {
+		slices.Sort(missing)
+		t.Fatalf("advertised enumerations without code points:\n%s", strings.Join(missing, "\n"))
 	}
 }

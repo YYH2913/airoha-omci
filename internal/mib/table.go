@@ -128,7 +128,7 @@ func (s *Store) SetTable(key Key, mask uint16, attributes me.AttributeValueMap) 
 
 	next := cloneInstance(current)
 	next.Attributes[definition.GetName()] = updated
-	normalized, err := normalize(next)
+	normalized, err := s.normalize(next)
 	if err != nil {
 		return err
 	}
@@ -702,7 +702,7 @@ func (s *Store) ExpireAllowedPreviewRows(key Key, timers []AllowedPreviewTimer) 
 	next.Attributes[me.MulticastSubscriberConfigInfo_AllowedPreviewGroupsTable] = me.TableRows{
 		NumRows: len(kept) / multicastPreviewRowSize, Rows: kept,
 	}
-	normalized, err := normalize(next)
+	normalized, err := s.normalize(next)
 	if err != nil {
 		return false, err
 	}

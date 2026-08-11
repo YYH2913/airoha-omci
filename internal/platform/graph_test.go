@@ -992,6 +992,38 @@ func TestBuildServiceGraphRejectsReservedVLANForwardOperation(t *testing.T) {
 	}
 }
 
+func TestBuildServiceGraphRejectsUnsupportedGALConfiguration(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func([]mib.Instance)
+		want   string
+	}{
+		{
+			name: "payload size",
+			mutate: func(snapshot []mib.Instance) {
+				findInstance(snapshot, me.GalEthernetProfileClassID, testGAL).Attributes[me.GalEthernetProfile_MaximumGemPayloadSize] = uint16(64)
+			},
+			want: "unsupported maximum GEM payload size 64",
+		},
+		{
+			name: "loopback",
+			mutate: func(snapshot []mib.Instance) {
+				findInstance(snapshot, me.GemInterworkingTerminationPointClassID, testMapperIW).Attributes[me.GemInterworkingTerminationPoint_GalLoopbackConfiguration] = uint8(1)
+			},
+			want: "unsupported GAL loopback mode 1",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			snapshot := validServiceSnapshot()
+			test.mutate(snapshot)
+			_, err := BuildServiceGraph(snapshot)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("BuildServiceGraph() error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
 func TestOLTCanBuildServiceGraphTransactionByTransaction(t *testing.T) {
 	factory, err := model.XG2010G(model.Identity{SerialNumber: "TEST01020304"})
 	if err != nil {
@@ -1096,7 +1128,12 @@ func validServiceSnapshot() []mib.Instance {
 				me.PriorityQueue_RelatedPort: uint32(testUNI) << 16,
 			},
 		},
-		{Key: mib.Key{ClassID: me.GalEthernetProfileClassID, EntityID: testGAL}, Attributes: me.AttributeValueMap{}},
+		{
+			Key: mib.Key{ClassID: me.GalEthernetProfileClassID, EntityID: testGAL},
+			Attributes: me.AttributeValueMap{
+				me.GalEthernetProfile_MaximumGemPayloadSize: uint16(48),
+			},
+		},
 		{
 			Key: mib.Key{ClassID: me.MacBridgeServiceProfileClassID, EntityID: testBridge},
 			Attributes: me.AttributeValueMap{
@@ -1172,7 +1209,6 @@ func gemPortInstance(entityID, portID uint16) mib.Instance {
 			me.GemPortNetworkCtp_Direction:                           uint8(3),
 			me.GemPortNetworkCtp_TrafficManagementPointerForUpstream: uint16(0x8000),
 			me.GemPortNetworkCtp_PriorityQueuePointerForDownStream:   uint16(0),
-			me.GemPortNetworkCtp_EncryptionKeyRing:                   uint8(0),
 		},
 	}
 }

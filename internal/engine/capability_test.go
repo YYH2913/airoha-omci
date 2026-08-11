@@ -164,6 +164,160 @@ func TestCapabilityInstanceTableTracksMIBAndUsesGetNext(t *testing.T) {
 	}
 }
 
+func TestCapabilityAttributeCodePointsUseGetNext(t *testing.T) {
+	protocol, _, _ := newCapabilityEngine(t)
+	definition, err := capabilityDefinition(me.MulticastOperationsProfileClassID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attribute, err := me.GetAttributeDefinitionByName(definition.AttributeDefinitions,
+		me.MulticastOperationsProfile_IgmpVersion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := mib.Key{ClassID: me.AttributeMeClassID,
+		EntityID: capabilityAttributeID(me.MulticastOperationsProfileClassID, attribute.GetIndex())}
+
+	request := encodeRequest(t, 1, omci.GetRequestType, &omci.GetRequest{
+		MeBasePacket:  omci.MeBasePacket{EntityClass: key.ClassID, EntityInstance: key.EntityID},
+		AttributeMask: 0x0100,
+	})
+	encoded, err := protocol.Handle(request)
+	if err != nil {
+		t.Fatalf("Handle(capability Get) error = %v", err)
+	}
+	get := decodeResponse(t, encoded).Layer(omci.LayerTypeGetResponse).(*omci.GetResponse)
+	if get.Result != me.Success || get.Attributes[me.AttributeMe_CodePointsTable] != uint32(10) {
+		t.Fatalf("code-point table Get response = %#v", get)
+	}
+
+	request = encodeRequest(t, 2, omci.GetNextRequestType, &omci.GetNextRequest{
+		MeBasePacket:  omci.MeBasePacket{EntityClass: key.ClassID, EntityInstance: key.EntityID},
+		AttributeMask: 0x0100,
+	})
+	encoded, err = protocol.Handle(request)
+	if err != nil {
+		t.Fatalf("Handle(capability Get Next) error = %v", err)
+	}
+	next := decodeResponse(t, encoded).Layer(omci.LayerTypeGetNextResponse).(*omci.GetNextResponse)
+	rows, ok := next.Attributes[me.AttributeMe_CodePointsTable].([]byte)
+	if !ok || len(rows) < 10 {
+		t.Fatalf("code-point table Get Next rows = %#v", next.Attributes[me.AttributeMe_CodePointsTable])
+	}
+	got := make([]uint16, 5)
+	for index := range got {
+		got[index] = binary.BigEndian.Uint16(rows[index*2:])
+	}
+	if want := []uint16{1, 2, 3, 16, 17}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("IGMP/MLD code points = %v, want %v", got, want)
+	}
+	for _, value := range rows[10:] {
+		if value != 0 {
+			t.Fatalf("code-point table baseline padding = %x", rows[10:])
+		}
+	}
+}
+
+func TestCapabilityMEsOmitUnsupportedOptionalAttributes(t *testing.T) {
+	protocol, _, _ := newCapabilityEngine(t)
+	for _, test := range []struct {
+		classID me.ClassID
+		name    string
+	}{
+		{me.GemInterworkingTerminationPointClassID, me.GemInterworkingTerminationPoint_PptpCounter},
+		{me.GemInterworkingTerminationPointClassID, me.GemInterworkingTerminationPoint_OperationalState},
+		{me.GemPortNetworkCtpClassID, me.GemPortNetworkCtp_UniCounter},
+		{me.GemPortNetworkCtpClassID, me.GemPortNetworkCtp_EncryptionState},
+		{me.GemPortNetworkCtpClassID, me.GemPortNetworkCtp_EncryptionKeyRing},
+		{me.MacBridgePortConfigurationDataClassID, me.MacBridgePortConfigurationData_Deprecated1},
+		{me.MacBridgePortConfigurationDataClassID, me.MacBridgePortConfigurationData_PortMacAddress},
+		{me.MacBridgePortConfigurationDataClassID, me.MacBridgePortConfigurationData_LaspIdPointer},
+		{me.TrafficDescriptorClassID, me.TrafficDescriptor_ColourMode},
+		{me.TrafficDescriptorClassID, me.TrafficDescriptor_IngressColourMarking},
+		{me.TrafficDescriptorClassID, me.TrafficDescriptor_EgressColourMarking},
+		{me.MulticastOperationsProfileClassID, me.MulticastOperationsProfile_LostGroupsListTable},
+		{me.GemPortNetworkCtpPerformanceMonitoringHistoryDataClassID,
+			me.GemPortNetworkCtpPerformanceMonitoringHistoryData_EncryptionKeyErrors},
+	} {
+		definition, err := capabilityDefinition(test.classID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		attribute, err := me.GetAttributeDefinitionByName(definition.AttributeDefinitions, test.name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err, handled := protocol.getCapabilityLocked(mib.Key{
+			ClassID:  me.AttributeMeClassID,
+			EntityID: capabilityAttributeID(test.classID, attribute.GetIndex()),
+		}, 0xff80)
+		var result *mib.ResultError
+		if !handled || !errors.As(err, &result) || result.Result != me.UnknownInstance {
+			t.Errorf("attribute capability %v/%s error = %#v", test.classID, test.name, err)
+		}
+	}
+
+	definition, err := capabilityDefinition(me.GemInterworkingTerminationPointClassID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loopback, err := me.GetAttributeDefinitionByName(definition.AttributeDefinitions,
+		me.GemInterworkingTerminationPoint_GalLoopbackConfiguration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err, handled := protocol.getCapabilityLocked(mib.Key{
+		ClassID: me.AttributeMeClassID,
+		EntityID: capabilityAttributeID(me.GemInterworkingTerminationPointClassID,
+			loopback.GetIndex()),
+	}, 0xff80)
+	if !handled || err != nil {
+		t.Fatalf("mandatory GAL loopback attribute capability: handled=%t error=%v", handled, err)
+	}
+}
+
+func TestAttributeMEsExposeXG2010GValueConstraints(t *testing.T) {
+	protocol, _, _ := newCapabilityEngine(t)
+	get := func(classID me.ClassID, name string) mib.Instance {
+		t.Helper()
+		definition, err := capabilityDefinition(classID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		attribute, err := me.GetAttributeDefinitionByName(definition.AttributeDefinitions, name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		instance, err, handled := protocol.getCapabilityLocked(mib.Key{
+			ClassID:  me.AttributeMeClassID,
+			EntityID: capabilityAttributeID(classID, attribute.GetIndex()),
+		}, 0xff80)
+		if !handled || err != nil {
+			t.Fatalf("get attribute capability %v/%s: handled=%t error=%v",
+				classID, name, handled, err)
+		}
+		return instance
+	}
+
+	gal := get(me.GalEthernetProfileClassID, me.GalEthernetProfile_MaximumGemPayloadSize)
+	if lower, upper := gal.Attributes[me.AttributeMe_LowerLimit], gal.Attributes[me.AttributeMe_UpperLimit]; lower != uint32(48) || upper != uint32(48) {
+		t.Fatalf("GAL payload bounds = %#v..%#v, want 48..48", lower, upper)
+	}
+
+	loopback := get(me.GemInterworkingTerminationPointClassID,
+		me.GemInterworkingTerminationPoint_GalLoopbackConfiguration)
+	if got := decodeCapabilityUint16Rows(t,
+		loopback.Attributes[me.AttributeMe_CodePointsTable].(me.TableRows), 2); !reflect.DeepEqual(got, []uint16{0}) {
+		t.Fatalf("GAL loopback code points = %v, want [0]", got)
+	}
+
+	meter := get(me.TrafficDescriptorClassID, me.TrafficDescriptor_MeterType)
+	if got := decodeCapabilityUint16Rows(t,
+		meter.Attributes[me.AttributeMe_CodePointsTable].(me.TableRows), 2); !reflect.DeepEqual(got, []uint16{0, 2}) {
+		t.Fatalf("traffic-descriptor meter code points = %v, want [0 2]", got)
+	}
+}
+
 func TestKnownButUnsupportedClassReturnsUnknownEntity(t *testing.T) {
 	protocol, _, _ := newCapabilityEngine(t)
 	request := encodeRequest(t, 1, omci.GetRequestType, &omci.GetRequest{
@@ -249,7 +403,15 @@ func newCapabilityEngine(t *testing.T) (*Engine, *mib.Store, []me.ClassID) {
 		t.Fatal(err)
 	}
 	classes := model.XG2010GSupportedClasses()
-	store, err := mib.NewWithOptions(factory, mib.Options{SupportedClasses: classes})
+	masks, err := model.XG2010GSupportedAttributeMasks(factory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := mib.NewWithOptions(factory, mib.Options{
+		SupportedClasses: classes, SupportedAttributeMasks: masks,
+		ValidateInstance:      model.XG2010GValidateInstance,
+		AttributeCapabilities: model.XG2010GAttributeCapabilities(),
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -17,7 +17,9 @@ after the configured fixed-path helper accepts the complete candidate state.
 This repository is under active development. The raw OMCC transport,
 bounded priority scheduler, transactional MIB, baseline table transfer and
 core MIB audit operations are implemented. Classes 287-289 expose the explicit
-XG2010G ME, action, attribute, alarm, AVC and live-instance capability surface;
+XG2010G ME, action, attribute, value-domain, alarm, AVC and live-instance
+capability surface; every advertised enumeration has explicit code points and
+device-specific fixed/ranged values are enforced before platform application;
 known but unimplemented G.988 classes are rejected as unknown entities rather
 than inherited from the protocol library. Driver-originated alarm/AVC events
 have a validated upstream notification path. Software download, CRC-32A and

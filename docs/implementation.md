@@ -9,7 +9,7 @@ and extended messages.  A successful build or reaching GPON O5 is not enough.
 | Transactions | per-priority scheduling, stop-and-wait replay and TCI validation | implemented; physical saturation verification pending |
 | MIB | ONU defaults, platform-gated create/delete/set, reset, data sync | implemented; physical OLT verification pending |
 | MIB upload | baseline fragmentation and extended multi-ME packing | implemented; physical OLT verification pending |
-| Capability | OMCI, managed-entity and attribute declaration MEs with live instance tables | implemented from explicit XG2010G class/attribute policy; OLT verification pending |
+| Capability | OMCI, managed-entity and attribute declaration MEs with live instance tables | implemented from explicit XG2010G class, attribute and value-domain policy; OLT verification pending |
 | Tables | stable Get/Get Next cache and baseline/enhanced extended Set Table | implemented; OLT verification pending |
 | Notifications | alarm audit/sequence, event-driven Alarm/AVC, requested optical tests and ARC | implemented; physical OLT verification pending |
 | Equipment | ONU-G, ONU2-G, ANI-G, four speed-specific Ethernet UNIs, software images | implemented; physical OLT verification pending |
@@ -46,6 +46,16 @@ state and MIB upload. A known G.988 class outside this policy returns `unknown
 entity`; an unadvertised optional factory attribute returns attribute failure.
 Persisted state containing a removed class or a stale ONU factory attribute
 shape is discarded transactionally.
+
+The attribute policy is also the source for class-289 value domains. Every
+advertised enumeration has an explicit code-point table, including GEM
+direction, bridge TP type, VLAN association/mode and IGMP/MLD version. Narrow
+numeric ranges and fixed hardware values are published as exact bounds and are
+enforced by the MIB before a platform transaction. This prevents an OLT from
+discovering a wide generated type and then receiving a silent no-op. Optional
+attributes with no hardware or live-state implementation are omitted, notably
+GEM encryption key-ring/state, deprecated bridge-port fields, colour-aware
+traffic-descriptor controls and GEM encryption-error PM.
 
 Acknowledged commands follow the G.988 stop-and-wait rules: baseline low and
 high priority retain independent last-command TCI/response state, while the
@@ -193,6 +203,11 @@ table. Receive packets carry a reserved skb mark containing the GEM Port-ID;
 transmit uses the same mark to select the upstream GEM and T-CONT channel. An
 unmarked transmit packet is accepted only when exactly one upstream GEM is
 configured, preventing ambiguous service selection.
+
+GPON downstream encryption remains a PLOAM responsibility. The GPON MAC acts
+on the OLT's `Encrypted_Port` message; class 268 does not advertise the optional
+G.987/XG-PON encryption key-ring attribute and the OMCI platform graph does not
+attempt to select a key ring.
 
 The OpenWrt backend programs all OLT-provisioned GEM CTPs. TC classifiers set
 the reserved skb mark for P-bit, DSCP and default mapper branches, dispatch

@@ -31,6 +31,20 @@ type Instance struct {
 	Origin     Origin               `json:"origin"`
 }
 
+type AttributeCapabilityKey struct {
+	ClassID me.ClassID
+	Name    string
+}
+
+// AttributeCapability overrides the generic wire-width description published
+// by the Attribute ME for a device-constrained attribute.
+type AttributeCapability struct {
+	LowerLimit uint32
+	UpperLimit uint32
+	BitField   uint32
+	CodePoints []uint16
+}
+
 type Operation string
 
 const (
@@ -55,6 +69,17 @@ type Options struct {
 	// empty list preserves the unrestricted behavior used by small unit-test
 	// stores; production callers must provide an explicit platform list.
 	SupportedClasses []me.ClassID
+	// SupportedAttributeMasks is a complete per-class policy for an explicit
+	// SupportedClasses list. A non-nil map must contain exactly one mask for
+	// every supported class. This prevents generated optional attributes from
+	// being advertised merely because the protocol library knows their shape.
+	SupportedAttributeMasks map[me.ClassID]uint16
+	// ValidateInstance applies device-specific value constraints after generic
+	// G.988 type and semantic validation and before a candidate becomes visible.
+	ValidateInstance func(Instance) error
+	// AttributeCapabilities describes the same device constraints to an OLT
+	// through class 289. Every entry must name an advertised attribute.
+	AttributeCapabilities map[AttributeCapabilityKey]AttributeCapability
 }
 
 // Change is the immutable candidate state passed to the platform backend.
@@ -112,6 +137,8 @@ type Store struct {
 	extendedVLANTableSize uint16
 	supportedClasses      map[me.ClassID]struct{}
 	supportedAttributes   map[me.ClassID]uint16
+	attributeCapabilities map[AttributeCapabilityKey]AttributeCapability
+	validateInstance      func(Instance) error
 }
 
 func New(factory []Instance) (*Store, error) {
@@ -135,6 +162,10 @@ func NewWithOptions(factory []Instance, options Options) (*Store, error) {
 		current:               make(map[Key]Instance, len(factory)),
 		applier:               options.Applier,
 		extendedVLANTableSize: tableSize,
+		validateInstance:      options.ValidateInstance,
+	}
+	if options.SupportedAttributeMasks != nil && len(options.SupportedClasses) == 0 {
+		return nil, fmt.Errorf("supported attribute masks require an explicit supported class list")
 	}
 	if len(options.SupportedClasses) != 0 {
 		s.supportedClasses = make(map[me.ClassID]struct{}, len(options.SupportedClasses))
@@ -149,9 +180,88 @@ func NewWithOptions(factory []Instance, options Options) (*Store, error) {
 			}
 			s.supportedClasses[classID] = struct{}{}
 			definition := entity.GetManagedEntityDefinition()
-			if definition.Access != me.CreatedByOnu || isCapabilityClass(classID) {
+			if options.SupportedAttributeMasks != nil {
+				mask, present := options.SupportedAttributeMasks[classID]
+				if !present {
+					return nil, fmt.Errorf("supported managed-entity class %v has no attribute policy", classID)
+				}
+				if unsupported := mask &^ definition.AllowedAttributeMask; unsupported != 0 {
+					return nil, fmt.Errorf("supported managed-entity class %v attribute mask %#x includes unknown bits %#x",
+						classID, mask, unsupported)
+				}
+				s.supportedAttributes[classID] = mask
+			} else if definition.Access != me.CreatedByOnu || isCapabilityClass(classID) {
 				s.supportedAttributes[classID] = definition.AllowedAttributeMask
 			}
+		}
+		if options.SupportedAttributeMasks != nil {
+			for classID := range options.SupportedAttributeMasks {
+				if _, present := s.supportedClasses[classID]; !present {
+					return nil, fmt.Errorf("attribute policy contains unsupported managed-entity class %v", classID)
+				}
+			}
+		}
+	}
+	if len(options.AttributeCapabilities) != 0 {
+		if options.SupportedAttributeMasks == nil {
+			return nil, fmt.Errorf("attribute capabilities require an explicit supported attribute policy")
+		}
+		s.attributeCapabilities = make(map[AttributeCapabilityKey]AttributeCapability,
+			len(options.AttributeCapabilities))
+		for key, capability := range options.AttributeCapabilities {
+			if _, supported := s.supportedClasses[key.ClassID]; !supported {
+				return nil, fmt.Errorf("attribute capability contains unsupported managed-entity class %v", key.ClassID)
+			}
+			definitions, omciErr := me.GetAttributesDefinitions(key.ClassID)
+			if omciErr.StatusCode() != me.Success {
+				return nil, fmt.Errorf("load managed-entity class %v attributes: %w",
+					key.ClassID, omciErr.GetError())
+			}
+			definition, err := me.GetAttributeDefinitionByName(definitions, key.Name)
+			if err != nil {
+				return nil, fmt.Errorf("invalid attribute capability %v/%s: %w", key.ClassID, key.Name, err)
+			}
+			if definition.Mask&s.supportedAttributes[key.ClassID] == 0 {
+				return nil, fmt.Errorf("attribute capability %v/%s is not advertised", key.ClassID, key.Name)
+			}
+			if capability.LowerLimit > capability.UpperLimit {
+				return nil, fmt.Errorf("attribute capability %v/%s has lower limit %d above upper limit %d",
+					key.ClassID, key.Name, capability.LowerLimit, capability.UpperLimit)
+			}
+			if definition.AttributeType != me.EnumerationAttributeType && len(capability.CodePoints) != 0 {
+				return nil, fmt.Errorf("non-enumerated attribute capability %v/%s has code points",
+					key.ClassID, key.Name)
+			}
+			if definition.AttributeType == me.EnumerationAttributeType {
+				if len(capability.CodePoints) == 0 {
+					return nil, fmt.Errorf("enumerated attribute capability %v/%s has no code points",
+						key.ClassID, key.Name)
+				}
+				maximum := uint32(maximumCapabilityValue(definition.GetSize()))
+				for index, value := range capability.CodePoints {
+					if uint32(value) > maximum {
+						return nil, fmt.Errorf("attribute capability %v/%s code point %d exceeds its wire size",
+							key.ClassID, key.Name, value)
+					}
+					if index != 0 && value <= capability.CodePoints[index-1] {
+						return nil, fmt.Errorf("attribute capability %v/%s code points are not strictly increasing",
+							key.ClassID, key.Name)
+					}
+				}
+			} else if definition.AttributeType == me.UnsignedIntegerAttributeType ||
+				definition.AttributeType == me.CounterAttributeType ||
+				definition.AttributeType == me.PointerAttributeType {
+				if uint64(capability.UpperLimit) > maximumCapabilityValue(definition.GetSize()) {
+					return nil, fmt.Errorf("attribute capability %v/%s upper limit %d exceeds its wire size",
+						key.ClassID, key.Name, capability.UpperLimit)
+				}
+			} else if definition.AttributeType != me.BitFieldAttributeType {
+				return nil, fmt.Errorf("attribute capability %v/%s has unsupported format %v",
+					key.ClassID, key.Name, definition.AttributeType)
+			}
+			copy := capability
+			copy.CodePoints = append([]uint16(nil), capability.CodePoints...)
+			s.attributeCapabilities[key] = copy
 		}
 	}
 
@@ -161,7 +271,7 @@ func NewWithOptions(factory []Instance, options Options) (*Store, error) {
 				instance.ClassID, instance.EntityID)
 		}
 		instance.Origin = OriginONU
-		normalized, err := normalize(instance)
+		normalized, err := s.normalize(instance)
 		if err != nil {
 			return nil, fmt.Errorf("invalid factory ME %v/%#x: %w", instance.ClassID, instance.EntityID, err)
 		}
@@ -174,6 +284,13 @@ func NewWithOptions(factory []Instance, options Options) (*Store, error) {
 			entity, result := loadDefinition(normalized.ClassID, normalized.EntityID, normalized.Attributes)
 			if result != nil {
 				return nil, result
+			}
+			if options.SupportedAttributeMasks != nil {
+				if err := s.validateSupportedAttributes(entity, normalized.Attributes); err != nil {
+					return nil, fmt.Errorf("factory ME %v/%#x has unsupported attributes: %w",
+						normalized.ClassID, normalized.EntityID, err)
+				}
+				continue
 			}
 			for name := range normalized.Attributes {
 				if name == me.ManagedEntityID {
@@ -314,16 +431,18 @@ func (s *Store) Create(classID me.ClassID, entityID uint16, attributes me.Attrib
 	if omciErr := me.MergeInDefaultValues(classID, createdAttributes); omciErr.StatusCode() != me.Success {
 		return &ResultError{Result: omciErr.StatusCode(), Cause: omciErr.GetError()}
 	}
-
-	instance, err := normalize(Instance{
+	s.pruneUnsupportedAttributes(classID, createdAttributes)
+	instance := Instance{
 		Key:        key,
 		Attributes: createdAttributes,
 		Origin:     OriginOLT,
-	})
+	}
+	initializeCreatedInstance(&instance, s.extendedVLANTableSize)
+	s.pruneUnsupportedAttributes(classID, instance.Attributes)
+	instance, err := s.normalize(instance)
 	if err != nil {
 		return err
 	}
-	initializeCreatedInstance(&instance, s.extendedVLANTableSize)
 	next := cloneInstances(s.current)
 	next[key] = instance
 	return s.commitLocked(OperationCreate, nil, &instance, next, s.nextDataSyncLocked())
@@ -358,7 +477,7 @@ func (s *Store) Set(key Key, attributes me.AttributeValueMap) error {
 		}
 		next.Attributes[name] = cloneValue(value)
 	}
-	normalized, err := normalize(next)
+	normalized, err := s.normalize(next)
 	if err != nil {
 		return err
 	}
@@ -432,7 +551,7 @@ func (s *Store) UpdateAutonomous(key Key, attributes me.AttributeValueMap) (me.A
 	for name, value := range attributes {
 		next.Attributes[name] = cloneValue(value)
 	}
-	normalized, err := normalize(next)
+	normalized, err := s.normalize(next)
 	if err != nil {
 		return nil, err
 	}
@@ -501,7 +620,7 @@ func (s *Store) UpdateAutonomousBatch(updates map[Key]me.AttributeValueMap) erro
 		for name, value := range attributes {
 			next.Attributes[name] = cloneValue(value)
 		}
-		normalized, err := normalize(next)
+		normalized, err := s.normalize(next)
 		if err != nil {
 			return err
 		}
@@ -581,7 +700,7 @@ func (s *Store) updateByCommand(updates map[Key]me.AttributeValueMap,
 		for name, value := range attributes {
 			next.Attributes[name] = cloneValue(value)
 		}
-		normalized, err := normalize(next)
+		normalized, err := s.normalize(next)
 		if err != nil {
 			return abortCommandTransaction(transaction, err)
 		}
@@ -766,6 +885,90 @@ func normalize(instance Instance) (Instance, error) {
 		return Instance{}, err
 	}
 	return instance, nil
+}
+
+func (s *Store) normalize(instance Instance) (Instance, error) {
+	normalized, err := normalize(instance)
+	if err != nil {
+		return Instance{}, err
+	}
+	if err := s.validateAttributeCapabilities(normalized); err != nil {
+		return Instance{}, err
+	}
+	if s.validateInstance != nil {
+		if err := s.validateInstance(cloneInstance(normalized)); err != nil {
+			return Instance{}, err
+		}
+	}
+	return normalized, nil
+}
+
+func (s *Store) validateAttributeCapabilities(instance Instance) error {
+	for key, capability := range s.attributeCapabilities {
+		if key.ClassID != instance.ClassID {
+			continue
+		}
+		value, present := instance.Attributes[key.Name]
+		if !present {
+			continue
+		}
+		definitions, omciErr := me.GetAttributesDefinitions(key.ClassID)
+		if omciErr.StatusCode() != me.Success {
+			return &ResultError{Result: me.ProcessingError, Cause: omciErr.GetError()}
+		}
+		definition, err := me.GetAttributeDefinitionByName(definitions, key.Name)
+		if err != nil {
+			return &ResultError{Result: me.ProcessingError, Cause: err}
+		}
+		unsigned, valid := unsignedCapabilityValue(value)
+		if !valid {
+			return &ResultError{Result: me.ParameterError,
+				Cause: fmt.Errorf("attribute %s has unsupported capability value type %T", key.Name, value)}
+		}
+		valid = false
+		switch definition.AttributeType {
+		case me.EnumerationAttributeType:
+			for _, codePoint := range capability.CodePoints {
+				if unsigned == uint64(codePoint) {
+					valid = true
+					break
+				}
+			}
+		case me.BitFieldAttributeType:
+			valid = unsigned&^uint64(capability.BitField) == 0
+		default:
+			valid = unsigned >= uint64(capability.LowerLimit) &&
+				unsigned <= uint64(capability.UpperLimit)
+		}
+		if !valid {
+			return &ResultError{Result: me.AttributeFailure, FailedMask: definition.Mask,
+				Cause: fmt.Errorf("attribute %s value %d is outside the advertised device capability",
+					key.Name, unsigned)}
+		}
+	}
+	return nil
+}
+
+func maximumCapabilityValue(size int) uint64 {
+	if size <= 0 || size >= 8 {
+		return ^uint64(0)
+	}
+	return uint64(1)<<(uint(size)*8) - 1
+}
+
+func unsignedCapabilityValue(value interface{}) (uint64, bool) {
+	switch typed := value.(type) {
+	case uint8:
+		return uint64(typed), true
+	case uint16:
+		return uint64(typed), true
+	case uint32:
+		return uint64(typed), true
+	case uint64:
+		return typed, true
+	default:
+		return 0, false
+	}
 }
 
 func validateSemantics(instance Instance) error {
@@ -978,6 +1181,14 @@ func (s *Store) supportedAttributeMask(classID me.ClassID) (uint16, bool) {
 	return mask, supported
 }
 
+func (s *Store) AttributeCapability(classID me.ClassID, name string) (AttributeCapability, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	capability, present := s.attributeCapabilities[AttributeCapabilityKey{ClassID: classID, Name: name}]
+	capability.CodePoints = append([]uint16(nil), capability.CodePoints...)
+	return capability, present
+}
+
 func (s *Store) validateSupportedAttributes(entity *me.ManagedEntity, attributes me.AttributeValueMap) error {
 	supported, explicit := s.supportedAttributeMask(entity.GetClassID())
 	if !explicit {
@@ -1002,6 +1213,26 @@ func (s *Store) validateSupportedAttributes(entity *me.ManagedEntity, attributes
 		return &ResultError{Result: me.AttributeFailure, UnsupportedMask: unsupported}
 	}
 	return nil
+}
+
+func (s *Store) pruneUnsupportedAttributes(classID me.ClassID, attributes me.AttributeValueMap) {
+	supported, explicit := s.supportedAttributeMask(classID)
+	if !explicit {
+		return
+	}
+	definitions, omciErr := me.GetAttributesDefinitions(classID)
+	if omciErr.StatusCode() != me.Success {
+		return
+	}
+	for name := range attributes {
+		if name == me.ManagedEntityID {
+			continue
+		}
+		definition, err := me.GetAttributeDefinitionByName(definitions, name)
+		if err != nil || definition.Mask&supported == 0 {
+			delete(attributes, name)
+		}
+	}
 }
 
 func isCapabilityClass(classID me.ClassID) bool {

@@ -246,8 +246,14 @@ func newONU3Engine(t *testing.T, applier mib.Applier) (*Engine, *mib.Store) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	masks, err := model.XG2010GSupportedAttributeMasks(factory)
+	if err != nil {
+		t.Fatal(err)
+	}
 	store, err := mib.NewWithOptions(factory, mib.Options{
 		Applier: applier, SupportedClasses: model.XG2010GSupportedClasses(),
+		SupportedAttributeMasks: masks, ValidateInstance: model.XG2010GValidateInstance,
+		AttributeCapabilities: model.XG2010GAttributeCapabilities(),
 	})
 	if err != nil {
 		t.Fatal(err)
