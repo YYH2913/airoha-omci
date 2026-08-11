@@ -13,6 +13,7 @@ and extended messages.  A successful build or reaching GPON O5 is not enough.
 | Tables | stable Get/Get Next cache and baseline/enhanced extended Set Table | implemented; OLT verification pending |
 | Notifications | alarm audit/sequence, event-driven Alarm/AVC, requested optical tests and ARC | implemented; physical OLT verification pending |
 | Equipment | ONU-G, ONU2-G, ANI-G, four speed-specific Ethernet UNIs, software images | implemented; physical OLT verification pending |
+| ONU diagnostics | ONU3-G restart reason, enhanced-mode declaration, persistent circular snapshots, Snap/Reset and M/K AVCs | baseline/extended host coverage implemented; power-loss and physical OLT verification pending |
 | Traffic | 8 advertised T-CONTs, scheduler/queue graph, GEM CTP/IW and class-298 rate-limit validation and apply | upstream SP/WRR/TRTCM, per-GEM downstream red-drop, per-bridge-port aggregate policing and bridge flood/broadcast/multicast policing implemented; physical verification pending |
 | Performance | common 15-minute engine, FEC, GEM CTP and Ethernet UNI/frame PM | class 312, 341, 24, 296, 321 and 322 counters, threshold data 1/2 and TCA implemented; physical verification pending |
 | Ethernet service | resolved bridge, mapper, VLAN and extended VLAN graph | UNI, bridge-port, mapper, GEM-IW, packet-dependent cross-tag copy, structural multi-tag inverse and DSCP-derived PCP implemented; physical verification pending |
@@ -87,6 +88,30 @@ Create, delete, Set and SetTable advance the counter only when the committed MIB
 changes. An OLT Set of ONU data MIB data sync to `N` atomically commits `N+1`,
 with 255 wrapping to 1; a platform apply failure leaves both the MIB and counter
 unchanged.
+
+ONU3-G class 441 declares the enhanced received-frame classification already
+implemented by class 171. Its status table is a 16-slot circular buffer of
+25-byte XG2010G records. Snap and Reset are Set actions, commit the table and
+M/K atomically through the record-only platform transaction, advance MIB data
+sync once when state changes and emit one AVC containing the changed M/K
+values. Transaction replay cannot execute an action twice. The complete table
+uses normal Get/Get Next in baseline and extended format; Most recent status
+snapshot returns one fixed-size record directly. MIB reset retains the
+non-volatile table, while an explicit ONU3-G Reset clears M, K, the table and
+the most-recent record.
+
+The record format is vendor-specific but stable:
+
+| Offset | Size | Value |
+| --- | ---: | --- |
+| 0 | 1 | format version, currently 1 |
+| 1 | 1 | trigger, 1 for OLT Snap |
+| 2 | 8 | UTC Unix seconds, big endian |
+| 10 | 1 | MIB data sync at snapshot time |
+| 11 | 2 | managed-entity count, saturating big endian |
+| 13 | 2 | active alarm-bit count, saturating big endian |
+| 15 | 1 | flags; bit 0 records extended-message use |
+| 16 | 9 | zero, reserved for a later record version |
 
 Performance monitoring uses one synchronized 15-minute interval across all
 active PM MEs. Class 312 reads the ANI-G FEC counters recovered from the
@@ -311,7 +336,7 @@ representation for these per-field sources. The target kernel and `tc flower`
 expose outer and inner DEI keys, so DEI, VID, PCP, protocol and DSCP criteria are
 matched atomically without a child chain that could hide later EVTO rows.
 
-The MIB and service graph are persisted as one root-only ABI 6 document after
+The runtime MIB and service graph are persisted as one root-only ABI 6 document after
 every acknowledged mutation. A daemon restart restores OLT-created MEs and the
 MIB data-sync counter only after validating the state version, attribute types,
 factory completeness, ONU vendor/serial identity and a graph reconstructed from
@@ -319,6 +344,11 @@ the MIB. Corrupt, stale or identity-mismatched state is replaced by a
 transactional factory reset. Software-image commands use a record-only helper
 mode so their MIB changes are durable without reconfiguring an unchanged data
 path.
+ONU3-G command transactions also atomically replace a root-only copy in
+non-volatile overlay storage. Startup restores only the validated class-441
+M/K/table payload from that copy, after matching ONU vendor and serial; stale
+service MEs are deliberately ignored. The current boot's restart-reason marker
+and compiled snapshot capacity remain authoritative.
 
 Native Airoha offload for the atomic transform remains an acceleration blocker;
 the complete operation currently runs in the Linux software data path. Physical

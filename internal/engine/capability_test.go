@@ -63,6 +63,23 @@ func TestCapabilityMEsMatchXG2010GPolicy(t *testing.T) {
 		t.Fatalf("T-CONT support = %#v", support)
 	}
 
+	onu3Capability, err, handled := protocol.getCapabilityLocked(mib.Key{
+		ClassID: me.ManagedEntityMeClassID, EntityID: uint16(me.Onu3GClassID),
+	}, 0x0c00)
+	if !handled || err != nil {
+		t.Fatalf("get ONU3-G ME capability: handled=%t error=%v", handled, err)
+	}
+	onu3Actions := onu3Capability.Attributes[me.ManagedEntityMe_Actions].(uint32)
+	for _, action := range []me.MsgType{me.Get, me.GetNext, me.Set} {
+		if onu3Actions&(uint32(1)<<uint(action)) == 0 {
+			t.Fatalf("ONU3-G actions %#08x omit %v", onu3Actions, action)
+		}
+	}
+	onu3AVCs := onu3Capability.Attributes[me.ManagedEntityMe_AvcsTable].(me.TableRows)
+	if !reflect.DeepEqual(onu3AVCs.Rows, []byte{4, 5}) {
+		t.Fatalf("ONU3-G AVC table = %#v", onu3AVCs)
+	}
+
 	onuDefinition, definitionErr := capabilityDefinition(me.OnuGClassID)
 	if definitionErr != nil {
 		t.Fatal(definitionErr)

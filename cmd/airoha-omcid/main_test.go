@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -92,6 +93,52 @@ func TestInitializeMIBResetsMismatchedServiceGraph(t *testing.T) {
 	}
 	if applyCalls != 1 {
 		t.Fatalf("mismatched graph caused %d apply calls, want factory reset", applyCalls)
+	}
+}
+
+func TestRestoreONU3FactoryLoadsPersistentSnapshots(t *testing.T) {
+	persisted, err := mib.New(daemonTestFactory(t, "ABCD01020304"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := make([]byte, 25)
+	record[0] = 1
+	if err := persisted.UpdateByCommand(map[mib.Key]me.AttributeValueMap{
+		{ClassID: me.Onu3GClassID}: {
+			me.Onu3G_NumberOfValidStatusSnapshots: uint16(1),
+			me.Onu3G_NextStatusSnapshotIndex:      uint16(1),
+			me.Onu3G_StatusSnapshotRecordTable: me.TableRows{
+				NumRows: 1, Rows: append([]byte(nil), record...),
+			},
+			me.Onu3G_MostRecentStatusSnapshot: append([]byte(nil), record...),
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	persistentPath := writeDaemonState(t, persisted)
+	currentFactory, err := model.XG2010G(model.Identity{
+		SerialNumber: "ABCD01020304", Version: "test", RestartReason: 9,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	restoredFactory, err := restoreONU3Factory(currentFactory, persistentPath)
+	if err != nil {
+		t.Fatalf("restoreONU3Factory() error = %v", err)
+	}
+	restored, err := mib.New(restoredFactory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance, err := restored.Get(mib.Key{ClassID: me.Onu3GClassID}, 0x5d00)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if instance.Attributes[me.Onu3G_LatestRestartReason] != uint8(9) ||
+		instance.Attributes[me.Onu3G_NumberOfValidStatusSnapshots] != uint16(1) ||
+		instance.Attributes[me.Onu3G_NextStatusSnapshotIndex] != uint16(1) ||
+		!bytes.Equal(instance.Attributes[me.Onu3G_MostRecentStatusSnapshot].([]byte), record) {
+		t.Fatalf("restored ONU3-G = %#v", instance.Attributes)
 	}
 }
 

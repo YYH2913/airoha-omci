@@ -310,6 +310,8 @@ func capabilityAVCIndexes(classID me.ClassID) []byte {
 		return []byte{10, 14}
 	case me.PhysicalPathTerminationPointEthernetUniClassID:
 		return []byte{6}
+	case me.Onu3GClassID:
+		return []byte{4, 5}
 	default:
 		return nil
 	}

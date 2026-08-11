@@ -40,6 +40,8 @@ type options struct {
 	controlHelper  string
 	eventHelper    string
 	softwareHelper string
+	onu3StatePath  string
+	restartReason  uint
 }
 
 func main() {
@@ -53,6 +55,8 @@ func main() {
 	flag.StringVar(&opts.controlHelper, "control-helper", "", "fixed executable handling time sync and scheduled reboot")
 	flag.StringVar(&opts.eventHelper, "event-helper", "", "fixed executable streaming platform events as JSON lines")
 	flag.StringVar(&opts.softwareHelper, "software-helper", "", "fixed executable handling software image lifecycle")
+	flag.StringVar(&opts.onu3StatePath, "onu3-state", "", "persistent platform document used to restore ONU3-G snapshots")
+	flag.UintVar(&opts.restartReason, "restart-reason", 0, "G.988 ONU3-G latest restart reason (0..255)")
 	flag.Parse()
 
 	if err := run(opts); err != nil {
@@ -62,13 +66,25 @@ func main() {
 }
 
 func run(opts options) error {
+	if opts.restartReason > 0xff {
+		return fmt.Errorf("restart reason %d is outside 0..255", opts.restartReason)
+	}
 	factory, err := model.XG2010G(model.Identity{
-		SerialNumber: opts.serialNumber,
-		Version:      version,
-		EquipmentID:  opts.equipmentID,
+		SerialNumber:  opts.serialNumber,
+		Version:       version,
+		EquipmentID:   opts.equipmentID,
+		RestartReason: uint8(opts.restartReason),
 	})
 	if err != nil {
 		return err
+	}
+	if opts.onu3StatePath != "" {
+		restored, restoreErr := restoreONU3Factory(factory, opts.onu3StatePath)
+		if restoreErr != nil {
+			log.Printf("discard persistent ONU3-G state %s: %v", opts.onu3StatePath, restoreErr)
+		} else {
+			factory = restored
+		}
 	}
 	var applier mib.Applier
 	platformBackend := "memory-only"
@@ -370,6 +386,23 @@ func run(opts options) error {
 			}
 		}
 	}
+}
+
+func restoreONU3Factory(factory []mib.Instance, path string) ([]mib.Instance, error) {
+	document, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return factory, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer document.Close()
+
+	request, err := platform.DecodeApplyRequest(document)
+	if err != nil {
+		return nil, fmt.Errorf("decode persistent platform document: %w", err)
+	}
+	return mib.RestoreONU3Factory(factory, *request.MIBState)
 }
 
 func initializeMIB(factory []mib.Instance, applier mib.Applier, statePath string) (*mib.Store, error) {

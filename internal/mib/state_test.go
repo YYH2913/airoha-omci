@@ -144,6 +144,92 @@ func TestNewFromStateRejectsStaleFactoryAttributeSet(t *testing.T) {
 	}
 }
 
+func TestNewFromStateAddsONU3GToLegacyFactoryState(t *testing.T) {
+	legacyFactory := stateTestFactory("ABCD")
+	legacy, err := New(legacyFactory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := ExportState(legacy.Snapshot(), legacy.DataSync())
+	if err != nil {
+		t.Fatal(err)
+	}
+	upgradedFactory := append(append([]Instance(nil), legacyFactory...), onu3TestInstance())
+	restored, err := NewFromState(upgradedFactory, state, Options{})
+	if err != nil {
+		t.Fatalf("NewFromState(legacy state) error = %v", err)
+	}
+	instance, err := restored.Get(Key{ClassID: me.Onu3GClassID}, 0x7dc0)
+	if err != nil {
+		t.Fatalf("Get(added ONU3-G) error = %v", err)
+	}
+	if instance.Attributes[me.Onu3G_EnhancedMode] != uint8(1) ||
+		instance.Attributes[me.Onu3G_TotalNumberOfStatusSnapshots] != uint16(16) {
+		t.Fatalf("added ONU3-G = %#v", instance.Attributes)
+	}
+}
+
+func TestRestoreONU3FactoryMergesSnapshotsButKeepsCurrentRestartReason(t *testing.T) {
+	factory := append(stateTestFactory("ABCD"), onu3TestInstance())
+	store, err := New(factory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := make([]byte, 25)
+	record[0] = 1
+	if err := store.UpdateByCommand(map[Key]me.AttributeValueMap{
+		{ClassID: me.Onu3GClassID}: {
+			me.Onu3G_NumberOfValidStatusSnapshots: uint16(1),
+			me.Onu3G_NextStatusSnapshotIndex:      uint16(1),
+			me.Onu3G_StatusSnapshotRecordTable: me.TableRows{
+				NumRows: 1, Rows: append([]byte(nil), record...),
+			},
+			me.Onu3G_MostRecentStatusSnapshot: append([]byte(nil), record...),
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	state, err := ExportState(store.Snapshot(), store.DataSync())
+	if err != nil {
+		t.Fatal(err)
+	}
+	currentFactory := append(stateTestFactory("ABCD"), onu3TestInstance())
+	currentFactory[len(currentFactory)-1].Attributes[me.Onu3G_LatestRestartReason] = uint8(9)
+	merged, err := RestoreONU3Factory(currentFactory, state)
+	if err != nil {
+		t.Fatalf("RestoreONU3Factory() error = %v", err)
+	}
+	mergedStore, err := New(merged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance, err := mergedStore.Get(Key{ClassID: me.Onu3GClassID}, 0x5d00)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if instance.Attributes[me.Onu3G_LatestRestartReason] != uint8(9) ||
+		instance.Attributes[me.Onu3G_NumberOfValidStatusSnapshots] != uint16(1) ||
+		instance.Attributes[me.Onu3G_NextStatusSnapshotIndex] != uint16(1) ||
+		!reflect.DeepEqual(instance.Attributes[me.Onu3G_MostRecentStatusSnapshot], record) {
+		t.Fatalf("merged ONU3-G = %#v", instance.Attributes)
+	}
+}
+
+func TestRestoreONU3FactoryRejectsDifferentONUIdentity(t *testing.T) {
+	persisted, err := New(append(stateTestFactory("ABCD"), onu3TestInstance()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := ExportState(persisted.Snapshot(), persisted.DataSync())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = RestoreONU3Factory(append(stateTestFactory("WXYZ"), onu3TestInstance()), state)
+	if err == nil || !strings.Contains(err.Error(), "configured identity") {
+		t.Fatalf("RestoreONU3Factory(identity mismatch) error = %v", err)
+	}
+}
+
 func TestStateValidationRejectsStructuralCorruption(t *testing.T) {
 	valid := State{Version: StateVersion, Instances: []StateInstance{{
 		ClassID: me.OnuDataClassID, Origin: OriginONU,
@@ -186,6 +272,23 @@ func stateTestFactory(vendor string) []Instance {
 				me.OnuG_SerialNumber:            serial,
 				me.OnuG_TrafficManagementOption: uint8(0),
 			},
+		},
+	}
+}
+
+func onu3TestInstance() Instance {
+	return Instance{
+		Key: Key{ClassID: me.Onu3GClassID},
+		Attributes: me.AttributeValueMap{
+			me.Onu3G_LatestRestartReason:          uint8(0),
+			me.Onu3G_TotalNumberOfStatusSnapshots: uint16(16),
+			me.Onu3G_NumberOfValidStatusSnapshots: uint16(0),
+			me.Onu3G_NextStatusSnapshotIndex:      uint16(0),
+			me.Onu3G_StatusSnapshotRecordTable:    me.TableRows{},
+			me.Onu3G_SnapAction:                   uint8(0),
+			me.Onu3G_MostRecentStatusSnapshot:     make([]byte, 25),
+			me.Onu3G_ResetAction:                  uint8(0),
+			me.Onu3G_EnhancedMode:                 uint8(1),
 		},
 	}
 }

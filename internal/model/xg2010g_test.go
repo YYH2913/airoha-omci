@@ -29,6 +29,7 @@ func TestXG2010GFactoryMIB(t *testing.T) {
 	var ani mib.Instance
 	var onu mib.Instance
 	var onu2 mib.Instance
+	var onu3Instance mib.Instance
 	circuitPacks := make(map[uint16]mib.Instance)
 	for _, item := range store.Snapshot() {
 		switch item.ClassID {
@@ -38,6 +39,8 @@ func TestXG2010GFactoryMIB(t *testing.T) {
 			ani = item
 		case me.Onu2GClassID:
 			onu2 = item
+		case me.Onu3GClassID:
+			onu3Instance = item
 		case me.CircuitPackClassID:
 			circuitPacks[item.EntityID] = item
 		case me.PhysicalPathTerminationPointEthernetUniClassID:
@@ -80,6 +83,15 @@ func TestXG2010GFactoryMIB(t *testing.T) {
 	if onu2.Attributes[me.Onu2G_TotalPriorityQueueNumber] != uint16(0) ||
 		onu2.Attributes[me.Onu2G_TotalTrafficSchedulerNumber] != uint8(0) {
 		t.Fatalf("ONU2-G global QoS resources = %#v, want no resources outside circuit packs", onu2.Attributes)
+	}
+	if onu3Instance.Attributes[me.Onu3G_TotalNumberOfStatusSnapshots] != uint16(16) ||
+		onu3Instance.Attributes[me.Onu3G_NumberOfValidStatusSnapshots] != uint16(0) ||
+		onu3Instance.Attributes[me.Onu3G_NextStatusSnapshotIndex] != uint16(0) ||
+		onu3Instance.Attributes[me.Onu3G_EnhancedMode] != uint8(1) {
+		t.Fatalf("ONU3-G defaults = %#v", onu3Instance.Attributes)
+	}
+	if table, valid := onu3Instance.Attributes[me.Onu3G_StatusSnapshotRecordTable].(me.TableRows); !valid || table.NumRows != 0 || len(table.Rows) != 0 {
+		t.Fatalf("ONU3-G status table = %#v, want empty", onu3Instance.Attributes[me.Onu3G_StatusSnapshotRecordTable])
 	}
 	if got := circuitPacks[ethernetCardID].Attributes[me.CircuitPack_TotalPriorityQueueNumber]; got != uint8(len(ethernetConfiguration)*queuesPerPort) {
 		t.Fatalf("Ethernet circuit-pack queues = %#v, want %d", got,
@@ -128,6 +140,7 @@ func TestXG2010GSupportedClassesAreExplicitAndSorted(t *testing.T) {
 		me.OmciClassID, me.ManagedEntityMeClassID, me.AttributeMeClassID,
 		me.GemPortNetworkCtpClassID, me.ExtendedVlanTaggingOperationConfigurationDataClassID,
 		me.Dot1RateLimiterClassID,
+		me.Onu3GClassID,
 	} {
 		if _, present := seen[required]; !present {
 			t.Fatalf("supported classes omit %v", required)

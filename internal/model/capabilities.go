@@ -26,6 +26,7 @@ func XG2010GSupportedClasses() []me.ClassID {
 		me.ExtendedVlanTaggingOperationConfigurationDataClassID,
 		me.OnuGClassID,
 		me.Onu2GClassID,
+		me.Onu3GClassID,
 		me.TContClassID,
 		me.AniGClassID,
 		me.UniGClassID,

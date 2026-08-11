@@ -142,8 +142,12 @@ func NewFromState(factory []Instance, state State, options Options) (*Store, err
 		normalized.Origin = instance.Origin
 		current[normalized.Key] = normalized
 	}
-	for key := range store.factory {
+	for key, factoryInstance := range store.factory {
 		instance, exists := current[key]
+		if !exists && key.ClassID == me.Onu3GClassID && key.EntityID == 0 {
+			current[key] = cloneInstance(factoryInstance)
+			continue
+		}
 		if !exists || instance.Origin != OriginONU {
 			return nil, fmt.Errorf("factory ME %v/%#x is missing from restored state", key.ClassID, key.EntityID)
 		}
@@ -163,6 +167,66 @@ func NewFromState(factory []Instance, state State, options Options) (*Store, err
 	store.current = current
 	store.dataSync = dataSync
 	return store, nil
+}
+
+// RestoreONU3Factory copies only the non-volatile ONU3-G circular-buffer state
+// from a persisted MIB document. Service MEs in that document may be stale and
+// are deliberately ignored; current identity and capability values come from
+// the supplied factory MIB.
+func RestoreONU3Factory(factory []Instance, state State) ([]Instance, error) {
+	if err := state.Validate(); err != nil {
+		return nil, err
+	}
+	restored, err := state.decode()
+	if err != nil {
+		return nil, err
+	}
+	factoryMap := make(map[Key]Instance, len(factory))
+	for _, instance := range factory {
+		factoryMap[instance.Key] = cloneInstance(instance)
+	}
+	restoredMap := make(map[Key]Instance, len(restored))
+	for _, instance := range restored {
+		restoredMap[instance.Key] = instance
+	}
+	if err := validateRestoredIdentity(factoryMap, restoredMap); err != nil {
+		return nil, err
+	}
+
+	key := Key{ClassID: me.Onu3GClassID, EntityID: 0}
+	persisted, present := restoredMap[key]
+	current, supported := factoryMap[key]
+	if !supported {
+		return nil, fmt.Errorf("factory MIB has no ONU3-G ME")
+	}
+	if !present {
+		return snapshotInstances(factoryMap), nil
+	}
+	if persisted.Origin != OriginONU {
+		return nil, fmt.Errorf("persisted ONU3-G ME has origin %d", persisted.Origin)
+	}
+	persisted, err = normalize(persisted)
+	if err != nil {
+		return nil, fmt.Errorf("invalid persisted ONU3-G ME: %w", err)
+	}
+	if persisted.Attributes[me.Onu3G_TotalNumberOfStatusSnapshots] !=
+		current.Attributes[me.Onu3G_TotalNumberOfStatusSnapshots] {
+		return nil, fmt.Errorf("persisted ONU3-G snapshot capacity does not match this ONU")
+	}
+	for _, name := range []string{
+		me.Onu3G_NumberOfValidStatusSnapshots,
+		me.Onu3G_NextStatusSnapshotIndex,
+		me.Onu3G_StatusSnapshotRecordTable,
+		me.Onu3G_MostRecentStatusSnapshot,
+	} {
+		current.Attributes[name] = cloneValue(persisted.Attributes[name])
+	}
+	current, err = normalize(current)
+	if err != nil {
+		return nil, fmt.Errorf("merge persisted ONU3-G ME: %w", err)
+	}
+	factoryMap[key] = current
+	return snapshotInstances(factoryMap), nil
 }
 
 func sameAttributeNames(left, right me.AttributeValueMap) bool {

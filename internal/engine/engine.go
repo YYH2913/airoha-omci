@@ -391,11 +391,14 @@ func (e *Engine) dispatch(packet gopacket.Packet, header *omci.OMCI) ([]byte, er
 			EntityID: request.EntityInstance,
 		}
 		var operationError error
-		if e.mib.Exists(key) {
+		var commandChanges me.AttributeValueMap
+		if request.EntityClass == me.Onu3GClassID {
+			commandChanges, operationError = e.setONU3Locked(key, request.Attributes)
+		} else if e.mib.Exists(key) {
 			operationError = e.validatePerformanceThresholdPointerLocked(
 				request.EntityClass, request.Attributes)
 		}
-		if operationError == nil {
+		if operationError == nil && request.EntityClass != me.Onu3GClassID {
 			if request.EntityClass == me.MacBridgePortConfigurationDataClassID &&
 				e.bridgePortHasPerformanceLocked(request.EntityInstance) &&
 				bridgePortAssociationChanged(request.Attributes) {
@@ -408,7 +411,15 @@ func (e *Engine) dispatch(packet gopacket.Packet, header *omci.OMCI) ([]byte, er
 		result, failed, unsupported := operationResult(operationError)
 		if result == me.Success {
 			e.tables = make(map[tableKey][]byte)
-			notifications, notifyErr := e.afterSetLocked(key, request.Attributes, header.DeviceIdentifier)
+			var notifications [][]byte
+			var notifyErr error
+			if request.EntityClass == me.Onu3GClassID {
+				notifications, notifyErr = e.attributeValueChangeFramesLocked(
+					key, commandChanges, header.DeviceIdentifier)
+			} else {
+				notifications, notifyErr = e.afterSetLocked(
+					key, request.Attributes, header.DeviceIdentifier)
+			}
 			if notifyErr != nil {
 				e.pendingError = fmt.Errorf("derive notifications after Set %v/%#x: %w",
 					key.ClassID, key.EntityID, notifyErr)

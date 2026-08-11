@@ -129,11 +129,16 @@ to `lan1` through `lan4`; it must not take the PON or OMCC transport down.
 For Create, Set, Set table, Delete, Reset and autonomous service changes, the
 OpenWrt helper applies the candidate graph and atomically replaces
 `desired.json` only after hardware programming succeeds. The `command`
-operation records software-image lifecycle MIB changes by atomically replacing
-the document without reapplying its unchanged graph. On daemon startup, a
+operation records software-image lifecycle and ONU3-G action changes by
+atomically replacing the document without reapplying its unchanged graph. The
+OpenWrt adapter keeps the live document in `/var/run` and, for command
+transactions, also atomically replaces the configured non-volatile ONU3-G
+recovery document. On daemon startup, a
 committed state is accepted only when its ONU vendor/serial, factory MEs,
 MIB-data-sync value and graph reconstructed from the MIB all match. Otherwise
 the daemon commits a factory reset, which also removes the stale platform graph.
+Only class-441 circular-buffer values are imported from the non-volatile copy;
+its potentially stale service graph is never restored.
 
 `airoha-mcastd -validate FILE` applies the same strict JSON decoder, graph
 resolution and G.988 multicast policy compiler without opening packet sockets

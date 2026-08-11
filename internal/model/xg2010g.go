@@ -8,6 +8,7 @@ import (
 
 	me "github.com/opencord/omci-lib-go/v2/generated"
 	"github.com/xg2010g/airoha-omci/internal/mib"
+	"github.com/xg2010g/airoha-omci/internal/onu3"
 )
 
 const (
@@ -35,9 +36,10 @@ var ethernetSensedType = [...]uint8{
 }
 
 type Identity struct {
-	SerialNumber string
-	Version      string
-	EquipmentID  string
+	SerialNumber  string
+	Version       string
+	EquipmentID   string
+	RestartReason uint8
 }
 
 func XG2010G(identity Identity) ([]mib.Instance, error) {
@@ -82,6 +84,17 @@ func XG2010G(identity Identity) ([]mib.Instance, error) {
 			me.Onu2G_CurrentConnectivityMode:                                  uint8(0),
 			me.Onu2G_QualityOfServiceQosConfigurationFlexibility:              uint16(0x003f),
 			me.Onu2G_PriorityQueueScaleFactor:                                 uint16(1),
+		}),
+		instance(me.Onu3GClassID, 0, me.AttributeValueMap{
+			me.Onu3G_LatestRestartReason:          identity.RestartReason,
+			me.Onu3G_TotalNumberOfStatusSnapshots: uint16(onu3.SnapshotCapacity),
+			me.Onu3G_NumberOfValidStatusSnapshots: uint16(0),
+			me.Onu3G_NextStatusSnapshotIndex:      uint16(0),
+			me.Onu3G_StatusSnapshotRecordTable:    me.TableRows{},
+			me.Onu3G_SnapAction:                   uint8(0),
+			me.Onu3G_MostRecentStatusSnapshot:     make([]byte, onu3.RecordSize),
+			me.Onu3G_ResetAction:                  uint8(0),
+			me.Onu3G_EnhancedMode:                 uint8(1),
 		}),
 		instance(me.AniGClassID, aniEntityID, me.AttributeValueMap{
 			me.AniG_SrIndication:                uint8(1),

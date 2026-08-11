@@ -26,7 +26,10 @@ platform helper ABI.
 ANI-G optical alarms and ARC, extended SetTable handling, the resolved
 Ethernet service graph, and the common multi-profile Linux bridge/VLAN/TC
 data path are implemented. Class 312 FEC, per-GEM and Ethernet UNI performance
-monitoring share a synchronized 15-minute history and TCA engine. The native
+monitoring share a synchronized 15-minute history and TCA engine. ONU3-G
+advertises enhanced VLAN processing and implements persistent circular status
+snapshots, Snap/Reset actions, Get/Get Next and M/K AVCs in both message sets.
+The native
 multicast runtime parses IGMPv1/v2/v3
 and MLDv1/v2, enforces class 309/310 policy, runs the proxy querier and delayed
 last-member state machine, and publishes live class 311 state. The daemon is
@@ -65,4 +68,7 @@ go test -race ./...
 
 The project is Apache-2.0.  It uses the Apache-2.0
 `github.com/opencord/omci-lib-go/v2` package for message and managed-entity
-encoding.  No proprietary SDK source is included.
+encoding. The dependency is vendored because v2.2.4 has an incorrect ONU3-G
+definition; the local correction is recorded in
+[the dependency notes](docs/dependencies.md). No proprietary SDK source is
+included.

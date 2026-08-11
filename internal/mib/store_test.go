@@ -4,6 +4,7 @@ package mib
 
 import (
 	"errors"
+	"reflect"
 	"testing"
 
 	me "github.com/opencord/omci-lib-go/v2/generated"
@@ -168,6 +169,47 @@ func TestResetRetainsOnlyONUCreatedInstances(t *testing.T) {
 	}
 	if got := len(store.Snapshot()); got != 1 {
 		t.Fatalf("len(Snapshot()) = %d, want 1", got)
+	}
+}
+
+func TestResetPreservesONU3GNonVolatileSnapshots(t *testing.T) {
+	store, err := New([]Instance{
+		{
+			Key:        Key{ClassID: me.OnuDataClassID},
+			Attributes: me.AttributeValueMap{me.OnuData_MibDataSync: uint8(0)},
+		},
+		onu3TestInstance(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := make([]byte, 25)
+	record[0] = 1
+	if err := store.UpdateByCommand(map[Key]me.AttributeValueMap{
+		{ClassID: me.Onu3GClassID}: {
+			me.Onu3G_LatestRestartReason:          uint8(1),
+			me.Onu3G_NumberOfValidStatusSnapshots: uint16(1),
+			me.Onu3G_NextStatusSnapshotIndex:      uint16(1),
+			me.Onu3G_StatusSnapshotRecordTable: me.TableRows{
+				NumRows: 1, Rows: append([]byte(nil), record...),
+			},
+			me.Onu3G_MostRecentStatusSnapshot: append([]byte(nil), record...),
+		},
+	}); err != nil {
+		t.Fatalf("UpdateByCommand() error = %v", err)
+	}
+	if err := store.Reset(); err != nil {
+		t.Fatalf("Reset() error = %v", err)
+	}
+	instance, err := store.Get(Key{ClassID: me.Onu3GClassID}, 0x5d00)
+	if err != nil {
+		t.Fatalf("Get(ONU3-G) error = %v", err)
+	}
+	if store.DataSync() != 0 || instance.Attributes[me.Onu3G_LatestRestartReason] != uint8(1) ||
+		instance.Attributes[me.Onu3G_NumberOfValidStatusSnapshots] != uint16(1) ||
+		instance.Attributes[me.Onu3G_NextStatusSnapshotIndex] != uint16(1) ||
+		!reflect.DeepEqual(instance.Attributes[me.Onu3G_MostRecentStatusSnapshot], record) {
+		t.Fatalf("ONU3-G state after reset: sync=%d attributes=%#v", store.DataSync(), instance.Attributes)
 	}
 }
 

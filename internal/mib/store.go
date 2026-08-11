@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	me "github.com/opencord/omci-lib-go/v2/generated"
+	"github.com/xg2010g/airoha-omci/internal/onu3"
 )
 
 type Origin uint8
@@ -602,7 +603,29 @@ func (s *Store) Reset() error {
 	for key, instance := range s.factory {
 		next[key] = cloneInstance(instance)
 	}
+	preserveONU3State(s.current, next)
 	return s.commitLocked(OperationReset, nil, nil, next, 0)
+}
+
+func preserveONU3State(current, reset map[Key]Instance) {
+	key := Key{ClassID: me.Onu3GClassID, EntityID: 0}
+	before, present := current[key]
+	after, supported := reset[key]
+	if !present || !supported {
+		return
+	}
+	for _, name := range []string{
+		me.Onu3G_LatestRestartReason,
+		me.Onu3G_NumberOfValidStatusSnapshots,
+		me.Onu3G_NextStatusSnapshotIndex,
+		me.Onu3G_StatusSnapshotRecordTable,
+		me.Onu3G_MostRecentStatusSnapshot,
+	} {
+		if value, exists := before.Attributes[name]; exists {
+			after.Attributes[name] = cloneValue(value)
+		}
+	}
+	reset[key] = after
 }
 
 func (s *Store) Snapshot() []Instance {
@@ -665,6 +688,10 @@ func validateSemantics(instance Instance) error {
 			Cause: fmt.Errorf("ARC value %d is not 0 or 1", arc)}
 	}
 	switch instance.ClassID {
+	case me.Onu3GClassID:
+		if err := validateONU3State(instance); err != nil {
+			return err
+		}
 	case me.OnuGClassID, me.CircuitPackClassID,
 		me.PhysicalPathTerminationPointEthernetUniClassID, me.UniGClassID:
 		if state, present := byteAttribute(attributes, "AdministrativeState"); present && state > 1 {
@@ -712,6 +739,50 @@ func validateSemantics(instance Instance) error {
 				attributeMask(instance.ClassID, me.AniG_UpperTransmitPowerThreshold),
 			Cause: fmt.Errorf("lower transmit threshold %d is above upper threshold %d",
 				int8(lowerTX), int8(upperTX))}
+	}
+	return nil
+}
+
+func validateONU3State(instance Instance) error {
+	attributes := instance.Attributes
+	total, totalOK := attributes[me.Onu3G_TotalNumberOfStatusSnapshots].(uint16)
+	valid, validOK := attributes[me.Onu3G_NumberOfValidStatusSnapshots].(uint16)
+	next, nextOK := attributes[me.Onu3G_NextStatusSnapshotIndex].(uint16)
+	table, tableOK := attributes[me.Onu3G_StatusSnapshotRecordTable].(me.TableRows)
+	recent, recentOK := attributes[me.Onu3G_MostRecentStatusSnapshot].([]byte)
+	if !totalOK || !validOK || !nextOK || !tableOK || !recentOK {
+		return &ResultError{Result: me.ParameterError,
+			Cause: fmt.Errorf("ONU3-G status snapshot attributes have invalid types")}
+	}
+	if total == 0 || valid > total || next >= total {
+		return &ResultError{Result: me.ParameterError,
+			Cause: fmt.Errorf("ONU3-G status snapshot S/M/K = %d/%d/%d is invalid", total, valid, next)}
+	}
+	if valid < total && next != valid {
+		return &ResultError{Result: me.ParameterError,
+			Cause: fmt.Errorf("ONU3-G partial status table has M/K = %d/%d", valid, next)}
+	}
+	if table.NumRows != int(valid) || len(table.Rows) != int(valid)*onu3.RecordSize {
+		return &ResultError{Result: me.ParameterError,
+			Cause: fmt.Errorf("ONU3-G status table has %d rows/%d bytes for M=%d",
+				table.NumRows, len(table.Rows), valid)}
+	}
+	if len(recent) != onu3.RecordSize {
+		return &ResultError{Result: me.ParameterError,
+			Cause: fmt.Errorf("ONU3-G most recent snapshot has %d bytes", len(recent))}
+	}
+	if enhanced, present := attributes[me.Onu3G_EnhancedMode].(uint8); present && enhanced > 1 {
+		return &ResultError{Result: me.ParameterError,
+			Cause: fmt.Errorf("ONU3-G enhanced mode %d is not boolean", enhanced)}
+	}
+	if valid != 0 {
+		latest := (int(next) + int(total) - 1) % int(total)
+		offset := latest * onu3.RecordSize
+		if offset+onu3.RecordSize > len(table.Rows) ||
+			!reflect.DeepEqual(recent, table.Rows[offset:offset+onu3.RecordSize]) {
+			return &ResultError{Result: me.ParameterError,
+				Cause: fmt.Errorf("ONU3-G most recent snapshot does not match table index %d", latest)}
+		}
 	}
 	return nil
 }

@@ -157,17 +157,22 @@ func (e *Engine) NotifyAttributeChange(key mib.Key, attributes me.AttributeValue
 
 func (e *Engine) notifyAttributeChangeLocked(key mib.Key, attributes me.AttributeValueMap,
 	device omci.DeviceIdent) ([][]byte, error) {
-	if err := validateDeviceIdentifier(device); err != nil {
-		return nil, err
-	}
-	device = e.notificationDeviceLocked(device)
 	changed, err := e.mib.UpdateAutonomous(key, attributes)
 	if err != nil {
+		return nil, err
+	}
+	return e.attributeValueChangeFramesLocked(key, changed, device)
+}
+
+func (e *Engine) attributeValueChangeFramesLocked(key mib.Key, changed me.AttributeValueMap,
+	device omci.DeviceIdent) ([][]byte, error) {
+	if err := validateDeviceIdentifier(device); err != nil {
 		return nil, err
 	}
 	if len(changed) == 0 {
 		return nil, nil
 	}
+	device = e.notificationDeviceLocked(device)
 	suppressed, err := e.notificationsSuppressedLocked(key)
 	if err != nil {
 		return nil, err

@@ -28,6 +28,9 @@ independently from kernel and LuCI changes.  The OpenWrt tree contains only:
    OMCI credentials.
 6. `event` consumes validated JSON lines from a fixed-path platform helper and
    maps hardware alarm, AVC and test-result events to upstream OMCI frames.
+7. `onu3` defines the stable XG2010G status-record layout. The MIB engine owns
+   circular-buffer semantics; the OpenWrt command transaction provides the
+   non-volatile storage boundary.
 
 The kernel is responsible only for GPON/PLOAM, OMCC frame transport and the
 low-level T-CONT/GEM control ABI.  G.988 policy remains in userspace.
