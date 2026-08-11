@@ -204,28 +204,28 @@ for diagnostics, while `tagged_action` contains the G.988 action letter
 are rejected before the platform helper is called.
 
 Extended VLAN entries retain the G.988 treatment selectors in this JSON ABI.
-The XG2010G platform compiler resolves copies from exact filter values and
-represents a same-tag copy with an omitted field in `tc vlan modify`. Its
-kernel/iproute2 extension treats omitted VID, protocol, priority and DEI fields
-as preserve operations, while PUSH retains the upstream required-VID and
-default-value behavior. The compiler derives the transmitted stack as added
-tags followed by received tags that were not removed. Its inverse can therefore
-match exact depths from zero through four and remove inserted tags without
-discarding retained tags. One innermost remove/add pair is emitted as MODIFY,
-with outer POP and PUSH actions ordered around it. This supports fixed
-double-tag replacement and non-replacement insertion/removal as well as modes
-3/6 and 4/7 when at most one restored tag needs packet-dependent preservation.
-For three- and four-tag downstream frames only the outer tag is used when inner
-packet tag information is unavailable, in accordance with G.988.
+The XG2010G platform compiler retains a `fixed`, received-`outer` or
+received-`inner` source for every treatment PCP, VID, TPID and DEI field. A
+single physical received tag occupies the G.988 inner filter fields but maps to
+the kernel action's outer snapshot. The compiler derives the transmitted stack
+as added tags followed by received tags that were not removed. Its inverse can
+therefore match exact depths from zero through four and remove inserted tags
+without discarding retained tags. Fixed transformations use the existing
+POP/MODIFY/PUSH sequence. A transformation with any packet-dependent output
+field is emitted as one software-only `tc vlan transform` action that snapshots
+both received tags before removing or adding either tag. This supports copies
+into genuinely pushed tags, copies from a tag removed earlier in the operation,
+and independent two-tag restoration in downstream modes 3/4/6/7. For three-
+and four-tag downstream frames only the outer tag is used when inner packet tag
+information is unavailable, in accordance with G.988.
 
 A priority-10 treatment uses the exported 64-entry `dscp_to_pbit` map to
 produce ordered IPv4 and IPv6 classifiers, with the inverse direction reduced
 to its distinct resulting P-bit matches. Outer and inner DEI criteria use the
 platform's `vlan_dei` and `cvlan_dei` flower keys in those same classifiers. A
-packet-dependent copy whose source is not the tag being modified in place, or a
-partial inverse that must restore two independently preserved packet fields,
-is rejected before the transaction starts because the current Linux backend
-cannot reproduce it packet by packet.
+dynamic transform that references a received tag absent at run time drops the
+packet. The action is deliberately rejected by flow offload because the Linux
+flow-action ABI cannot describe its per-field sources.
 
 MAC bridge profiles carry their learning, spanning-tree, port-bridging,
 unknown-MAC, timer and learning-depth policy. Each bridge port carries its

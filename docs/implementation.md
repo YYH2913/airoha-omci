@@ -233,27 +233,29 @@ backend and are rejected. Colour-aware marking/remarking and RFC 4115 meter
 coupling are also rejected rather than silently approximated. These limits and
 real OLT/optical-module testing remain explicit deployment blockers.
 
-Extended-VLAN treatment now supports fixed PCP/VID, exact-filter copies,
-same-tag PCP/VID/TPID/DEI preservation, packet-dependent DSCP-to-PCP mappings
-and explicit DEI 0/1. Selector 10 expands the 64-entry mapping into ordered
-IPv4 and IPv6 `tc flower` classifiers; the downstream inverse is deduplicated
-to the P-bit values that can actually appear. G.988 defines no DSCP field for a
-non-IP frame, so a wildcard-Ethertype selector-10 row applies only to IPv4 and
-IPv6 rather than inventing a default PCP for other protocols. The compiler
+Extended-VLAN treatment supports fixed and packet-dependent PCP/VID/TPID/DEI,
+packet-dependent DSCP-to-PCP mappings and explicit DEI 0/1. Every treatment
+field retains whether its value is fixed or copied from the original outer or
+inner tag; the G.988 inner source of a single-tag frame maps to the physical
+outer snapshot. Selector 10 expands the 64-entry mapping into ordered IPv4 and
+IPv6 `tc flower` classifiers; the downstream inverse is deduplicated to the
+P-bit values that can actually appear. G.988 defines no DSCP field for a non-IP
+frame, so a wildcard-Ethertype selector-10 row applies only to IPv4 and IPv6
+rather than inventing a default PCP for other protocols. The compiler
 constructs the actual transmitted tag stack, including retained received tags,
 so insert and remove operations can be inverted at exact depths from zero to
-four tags. When at least one tag is removed and added, the innermost pair is
-folded into one MODIFY action; any outer removals precede it and any new outer
-tag follows it. This is required both for correct single-tag replacement and
-for G.988 modify-and-insert operations. Downstream modes 3/6 and 4/7 match only
-VID or PCP and preserve the other TCI fields whenever one received tag must be
-restored. For three- and four-tag results, the exact tag depth and outer tag are
-matched as specified when inner packet tag information is unavailable.
+four tags. Downstream modes 3/6 and 4/7 match only VID or PCP and independently
+restore the other TCI fields for both tags. For three- and four-tag results, the
+exact tag depth and outer tag are matched as specified when inner packet tag
+information is unavailable.
 
-The Airoha kernel/iproute2 VLAN action extension allows each MODIFY field to be
-omitted; partial MODIFY is deliberately kept in software because the
-flow-offload ABI has no field mask. The target kernel and `tc flower` expose
-outer and inner DEI keys, so DEI, VID, PCP, protocol and DSCP criteria are
+Fixed rules continue to use POP/MODIFY/PUSH. Dynamic rules use one atomic VLAN
+transform action that snapshots the first two original tags, removes zero to
+two tags, then pushes zero to two tags whose individual fields are fixed or
+copied from either snapshot. Missing source tags cause a run-time drop. The
+action is deliberately software-only because the flow-offload ABI has no
+representation for these per-field sources. The target kernel and `tc flower`
+expose outer and inner DEI keys, so DEI, VID, PCP, protocol and DSCP criteria are
 matched atomically without a child chain that could hide later EVTO rows.
 
 The MIB and service graph are persisted as one root-only ABI 5 document after
@@ -265,9 +267,7 @@ transactional factory reset. Software-image commands use a record-only helper
 mode so their MIB changes are durable without reconfiguring an unchanged data
 path.
 
-The remaining Ethernet blockers are packet-dependent copies whose source is
-not the tag being modified in place (including genuinely pushed tags and an
-earlier removed tag), downstream modes 3/4/6/7 that must restore two tags while
-retaining two independent packet-dependent fields, and native Airoha offload.
-These unsupported forms are rejected before platform state changes. Physical
-baseline/extended OLT interoperability remains a completion gate.
+Native Airoha offload for the atomic transform remains an acceleration blocker;
+the complete operation currently runs in the Linux software data path. Physical
+baseline/extended OLT interoperability, including packet-dependent double-tag
+rules under sustained traffic, remains a completion gate.
