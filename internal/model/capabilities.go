@@ -35,6 +35,7 @@ func XG2010GSupportedClasses() []me.ClassID {
 		me.PriorityQueueClassID,
 		me.TrafficSchedulerClassID,
 		me.TrafficDescriptorClassID,
+		me.Dot1RateLimiterClassID,
 		me.MulticastGemInterworkingTerminationPointClassID,
 		me.EthernetPerformanceMonitoringHistoryData3ClassID,
 		me.MulticastOperationsProfileClassID,

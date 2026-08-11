@@ -120,6 +120,7 @@ func TestXG2010GSupportedClassesAreExplicitAndSorted(t *testing.T) {
 	for _, required := range []me.ClassID{
 		me.OmciClassID, me.ManagedEntityMeClassID, me.AttributeMeClassID,
 		me.GemPortNetworkCtpClassID, me.ExtendedVlanTaggingOperationConfigurationDataClassID,
+		me.Dot1RateLimiterClassID,
 	} {
 		if _, present := seen[required]; !present {
 			t.Fatalf("supported classes omit %v", required)

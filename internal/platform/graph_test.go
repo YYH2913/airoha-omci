@@ -775,6 +775,86 @@ func TestBuildServiceGraphExportsTrafficDescriptor(t *testing.T) {
 	}
 }
 
+func TestBuildServiceGraphExportsDot1RateLimiter(t *testing.T) {
+	snapshot := validServiceSnapshot()
+	snapshot = append(snapshot,
+		trafficDescriptorInstance(0x8800, me.AttributeValueMap{
+			me.TrafficDescriptor_Pir: uint32(2000),
+			me.TrafficDescriptor_Pbs: uint32(128),
+		}),
+		trafficDescriptorInstance(0x8801, me.AttributeValueMap{
+			me.TrafficDescriptor_Pir: uint32(3000),
+			me.TrafficDescriptor_Pbs: uint32(256),
+		}),
+		dot1RateLimiterInstance(0x8900, testBridge, 1, 0x8800, 0x8801, nullPointer),
+	)
+	graph, err := BuildServiceGraph(snapshot)
+	if err != nil {
+		t.Fatalf("BuildServiceGraph() error = %v", err)
+	}
+	if len(graph.Dot1RateLimiters) != 1 {
+		t.Fatalf("dot1 rate limiter graph = %#v", graph.Dot1RateLimiters)
+	}
+	limiter := graph.Dot1RateLimiters[0]
+	if limiter.EntityID != 0x8900 || limiter.ParentME != testBridge || limiter.TPType != 1 ||
+		limiter.UpstreamUnicastFloodTD != 0x8800 || limiter.UpstreamBroadcastTD != 0x8801 ||
+		limiter.UpstreamMulticastPayloadTD != nullPointer {
+		t.Fatalf("dot1 rate limiter = %#v", limiter)
+	}
+}
+
+func TestBuildServiceGraphRejectsInvalidDot1RateLimiter(t *testing.T) {
+	tests := []struct {
+		name string
+		edit func([]mib.Instance) []mib.Instance
+		want string
+	}{
+		{
+			name: "invalid TP type",
+			edit: func(snapshot []mib.Instance) []mib.Instance {
+				return append(snapshot, dot1RateLimiterInstance(0x8900, testBridge, 3,
+					nullPointer, nullPointer, nullPointer))
+			},
+			want: "invalid TP type 3",
+		},
+		{
+			name: "missing parent",
+			edit: func(snapshot []mib.Instance) []mib.Instance {
+				return append(snapshot, dot1RateLimiterInstance(0x8900, 0x7777, 1,
+					nullPointer, nullPointer, nullPointer))
+			},
+			want: "references missing parent",
+		},
+		{
+			name: "missing descriptor",
+			edit: func(snapshot []mib.Instance) []mib.Instance {
+				return append(snapshot, dot1RateLimiterInstance(0x8900, testBridge, 1,
+					0x7777, nullPointer, nullPointer))
+			},
+			want: "missing upstream unknown-unicast flood traffic descriptor",
+		},
+		{
+			name: "duplicate parent",
+			edit: func(snapshot []mib.Instance) []mib.Instance {
+				return append(snapshot,
+					dot1RateLimiterInstance(0x8900, testBridge, 1,
+						nullPointer, nullPointer, nullPointer),
+					dot1RateLimiterInstance(0x8901, testBridge, 1,
+						nullPointer, nullPointer, nullPointer))
+			},
+			want: "share parent",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := BuildServiceGraph(test.edit(validServiceSnapshot()))
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("BuildServiceGraph() error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
 func TestValidateServiceGraphAllowsUnusedTCONTAndNullMapperBranches(t *testing.T) {
 	snapshot := []mib.Instance{
 		{
@@ -1045,6 +1125,20 @@ func trafficDescriptorInstance(entityID uint16, attributes me.AttributeValueMap)
 	return mib.Instance{
 		Key:        mib.Key{ClassID: me.TrafficDescriptorClassID, EntityID: entityID},
 		Attributes: attributes,
+	}
+}
+
+func dot1RateLimiterInstance(entityID, parent uint16, tpType uint8,
+	unknown, broadcast, multicast uint16) mib.Instance {
+	return mib.Instance{
+		Key: mib.Key{ClassID: me.Dot1RateLimiterClassID, EntityID: entityID},
+		Attributes: me.AttributeValueMap{
+			me.Dot1RateLimiter_ParentMePointer:                     parent,
+			me.Dot1RateLimiter_TpType:                              tpType,
+			me.Dot1RateLimiter_UpstreamUnicastFloodRatePointer:     unknown,
+			me.Dot1RateLimiter_UpstreamBroadcastRatePointer:        broadcast,
+			me.Dot1RateLimiter_UpstreamMulticastPayloadRatePointer: multicast,
+		},
 	}
 }
 

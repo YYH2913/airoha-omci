@@ -42,12 +42,12 @@ an OLT may retransmit a request.
 
 The apply helper receives a complete, resolved candidate service graph and its
 corresponding MIB state on stdin and must commit them transactionally. ABI
-version 5 has this top-level
+version 6 has this top-level
 shape:
 
 ```json
 {
-  "version": 5,
+  "version": 6,
   "operation": "set-table",
   "mib_data_sync": 17,
   "mib_state": {
@@ -85,6 +85,14 @@ shape:
       "egress_colour_marking": 0,
       "meter_type": 0
     }],
+    "dot1_rate_limiters": [{
+      "entity_id": 35072,
+      "parent_me": 256,
+      "tp_type": 1,
+      "upstream_unicast_flood_traffic_descriptor": 34816,
+      "upstream_broadcast_traffic_descriptor": 65535,
+      "upstream_multicast_payload_traffic_descriptor": 65535
+    }],
     "gem_ports": [],
     "gem_interworking": [],
     "multicast_gem_interworking": [],
@@ -104,9 +112,10 @@ must not interpret it as hardware configuration. Attribute values carry an
 explicit scalar, octet, integer-array or table type so JSON cannot erase their
 G.988 representation. Extended VLAN tables are emitted in `service_graph` as
 named filter and treatment fields, including enhanced row keys and directions;
-no encoded table rows cross the hardware boundary. ABI 5 retains the class 309
-ACLs and class 310 service-package/allowed-preview rows introduced by ABI 4 as
-normalized logical entries. Set
+no encoded table rows cross the hardware boundary. ABI 6 adds the normalized
+class-298 parent and class-280 traffic-descriptor pointers. It retains the class
+309 ACLs and class 310 service-package/allowed-preview rows introduced by ABI 4
+as normalized logical entries. Set
 control, row-part, test and reserved bits never cross the boundary. Unknown ABI
 versions must be rejected before any platform state is changed.
 
@@ -171,6 +180,7 @@ the OMCI mutation:
 | GEM CTP (class 268) | GPON GEM table and channel direction | enable GEM, encryption and GEM/mark mapping |
 | Priority queue (class 277) | QDMA WAN channel queue 0-7 | set SP/WRR mode and weight |
 | Traffic descriptor (class 280) | QDMA TRTCM meter | set CIR/PIR/CBS/PBS and enable/disable |
+| Dot1 rate limiter (class 298) | Linux bridge ANI egress flower/police rules | police unknown-unicast flood, broadcast and multicast payload independently |
 
 The SDK names these capabilities `qdmamgr_lib_set_channel_qos`,
 `qdmamgr_lib_set_ratectl_trtcm_mode_*` and `gpon_flow_public` flow records.
@@ -190,6 +200,26 @@ per T-CONT channel, so all GEMs sharing a T-CONT must use the same upstream
 traffic descriptor. Downstream per-GEM metering, colour-aware marking or
 remarking, and RFC 4115 coupling are rejected explicitly because the current
 hardware adapter cannot represent them faithfully.
+
+Class 298 is resolved against either a MAC bridge service profile or an IEEE
+802.1p mapper. At most one limiter may reference a given parent, and every
+non-null category pointer must resolve to class 280. For an active XG2010G MAC
+bridge, the limiter runs on the profile-specific `omaXXXX` egress endpoint after
+the Linux bridge has made its FDB/MDB decision. Unknown unicast matches
+`l2_miss=1` with a unicast destination, broadcast matches the exact all-ones MAC
+with `l2_miss=0`, and multicast payload matches `l2_miss=1` with a group
+destination. These matches are disjoint. The target kernel enables
+`CONFIG_NET_TC_SKB_EXT`, and the package requires the flower and police actions.
+
+The current policer preserves the class-280 G.988 byte units until apply, then
+uses `PIR * 8` bit/s and PBS bytes as the red-drop bucket. It accepts only
+colour-blind descriptors without ingress or egress remarking and rejects RFC
+4115 coupling. CIR/CBS remain available to the native QDMA TRTCM path but Linux
+does not preserve a green/yellow colour for later queues. A direct mapper has no
+FDB decision and is therefore rejected when a non-null class-298 pointer is
+present; an implementation must not reinterpret all direct unicast as unknown
+unicast or let broadcast consume a second multicast meter. Non-zero PIR and PBS
+are required because Linux cannot infer the ONU's G.988 factory meter policy.
 
 The standalone OMCI daemon still owns the corresponding G.988 entities,
 attribute validation, MIB data-sync and response status. Therefore migrating

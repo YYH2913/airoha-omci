@@ -30,6 +30,7 @@ type ServiceGraph struct {
 	UNIs                  []EthernetUNI                   `json:"unis"`
 	TCONTs                []TCONT                         `json:"tconts"`
 	TrafficDescs          []TrafficDescriptor             `json:"traffic_descriptors"`
+	Dot1RateLimiters      []Dot1RateLimiter               `json:"dot1_rate_limiters"`
 	GEMPorts              []GEMPort                       `json:"gem_ports"`
 	Interworking          []GEMInterworking               `json:"gem_interworking"`
 	MulticastInterworking []MulticastGEMInterworking      `json:"multicast_gem_interworking"`
@@ -85,6 +86,17 @@ type TrafficDescriptor struct {
 	IngressColourMarking uint8  `json:"ingress_colour_marking"`
 	EgressColourMarking  uint8  `json:"egress_colour_marking"`
 	MeterType            uint8  `json:"meter_type"`
+}
+
+// Dot1RateLimiter is the normalized class-298 association. Traffic descriptor
+// pointers retain 0xffff for an administratively unlimited traffic category.
+type Dot1RateLimiter struct {
+	EntityID                   uint16 `json:"entity_id"`
+	ParentME                   uint16 `json:"parent_me"`
+	TPType                     uint8  `json:"tp_type"`
+	UpstreamUnicastFloodTD     uint16 `json:"upstream_unicast_flood_traffic_descriptor"`
+	UpstreamBroadcastTD        uint16 `json:"upstream_broadcast_traffic_descriptor"`
+	UpstreamMulticastPayloadTD uint16 `json:"upstream_multicast_payload_traffic_descriptor"`
 }
 
 type GEMInterworking struct {
@@ -545,6 +557,23 @@ func BuildServiceGraph(snapshot []mib.Instance) (ServiceGraph, error) {
 			return ServiceGraph{}, err
 		}
 		graph.TrafficDescs = append(graph.TrafficDescs, descriptor)
+	}
+
+	rateLimiterParents := make(map[mib.Key]uint16)
+	for _, instance := range snapshot {
+		if instance.ClassID != me.Dot1RateLimiterClassID {
+			continue
+		}
+		limiter, parent, err := buildDot1RateLimiter(instance, instances)
+		if err != nil {
+			return ServiceGraph{}, err
+		}
+		if previous, duplicate := rateLimiterParents[parent]; duplicate {
+			return ServiceGraph{}, fmt.Errorf("dot1 rate limiters %#x and %#x share parent %d/%#x",
+				previous, instance.EntityID, parent.ClassID, parent.EntityID)
+		}
+		rateLimiterParents[parent] = instance.EntityID
+		graph.Dot1RateLimiters = append(graph.Dot1RateLimiters, limiter)
 	}
 
 	gemPortIDs := make(map[uint16]uint16)
@@ -2024,10 +2053,64 @@ func buildTrafficDescriptor(instance mib.Instance) (TrafficDescriptor, error) {
 	return descriptor, nil
 }
 
+func buildDot1RateLimiter(instance mib.Instance,
+	instances map[mib.Key]mib.Instance) (Dot1RateLimiter, mib.Key, error) {
+	limiter := Dot1RateLimiter{EntityID: instance.EntityID}
+	var err error
+	if limiter.ParentME, err = uint16Attribute(instance,
+		me.Dot1RateLimiter_ParentMePointer); err != nil {
+		return Dot1RateLimiter{}, mib.Key{}, err
+	}
+	if limiter.TPType, err = uint8Attribute(instance, me.Dot1RateLimiter_TpType); err != nil {
+		return Dot1RateLimiter{}, mib.Key{}, err
+	}
+	parent := mib.Key{EntityID: limiter.ParentME}
+	switch limiter.TPType {
+	case 1:
+		parent.ClassID = me.MacBridgeServiceProfileClassID
+	case 2:
+		parent.ClassID = me.Ieee8021PMapperServiceProfileClassID
+	default:
+		return Dot1RateLimiter{}, mib.Key{}, fmt.Errorf("dot1 rate limiter %#x has invalid TP type %d",
+			instance.EntityID, limiter.TPType)
+	}
+	if _, exists := instances[parent]; !exists {
+		return Dot1RateLimiter{}, mib.Key{}, fmt.Errorf("dot1 rate limiter %#x references missing parent %d/%#x",
+			instance.EntityID, parent.ClassID, parent.EntityID)
+	}
+	pointers := []struct {
+		name   string
+		field  string
+		target *uint16
+	}{
+		{"upstream unknown-unicast flood", me.Dot1RateLimiter_UpstreamUnicastFloodRatePointer,
+			&limiter.UpstreamUnicastFloodTD},
+		{"upstream broadcast", me.Dot1RateLimiter_UpstreamBroadcastRatePointer,
+			&limiter.UpstreamBroadcastTD},
+		{"upstream multicast payload", me.Dot1RateLimiter_UpstreamMulticastPayloadRatePointer,
+			&limiter.UpstreamMulticastPayloadTD},
+	}
+	for _, pointer := range pointers {
+		*pointer.target, err = uint16AttributeDefault(instance, pointer.field, nullPointer)
+		if err != nil {
+			return Dot1RateLimiter{}, mib.Key{}, err
+		}
+		if *pointer.target != nullPointer &&
+			!hasInstance(instances, me.TrafficDescriptorClassID, *pointer.target) {
+			return Dot1RateLimiter{}, mib.Key{}, fmt.Errorf("dot1 rate limiter %#x references missing %s traffic descriptor %#x",
+				instance.EntityID, pointer.name, *pointer.target)
+		}
+	}
+	return limiter, parent, nil
+}
+
 func sortServiceGraph(graph *ServiceGraph) {
 	sort.Slice(graph.UNIs, func(i, j int) bool { return graph.UNIs[i].EntityID < graph.UNIs[j].EntityID })
 	sort.Slice(graph.TCONTs, func(i, j int) bool { return graph.TCONTs[i].EntityID < graph.TCONTs[j].EntityID })
 	sort.Slice(graph.TrafficDescs, func(i, j int) bool { return graph.TrafficDescs[i].EntityID < graph.TrafficDescs[j].EntityID })
+	sort.Slice(graph.Dot1RateLimiters, func(i, j int) bool {
+		return graph.Dot1RateLimiters[i].EntityID < graph.Dot1RateLimiters[j].EntityID
+	})
 	sort.Slice(graph.GEMPorts, func(i, j int) bool { return graph.GEMPorts[i].EntityID < graph.GEMPorts[j].EntityID })
 	sort.Slice(graph.Interworking, func(i, j int) bool { return graph.Interworking[i].EntityID < graph.Interworking[j].EntityID })
 	sort.Slice(graph.MulticastInterworking, func(i, j int) bool {

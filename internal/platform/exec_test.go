@@ -15,13 +15,13 @@ import (
 )
 
 func TestDecodeApplyRequestIsStrict(t *testing.T) {
-	valid := `{"version":5,"operation":"reset","mib_data_sync":0,"mib_state":{"version":1,"mib_data_sync":0,"instances":[{"class_id":2,"entity_id":0,"origin":0,"attributes":[{"name":"MibDataSync","kind":"uint8"}]}]},"service_graph":{"unis":[],"tconts":[],"traffic_descriptors":[],"gem_ports":[],"gem_interworking":[],"multicast_gem_interworking":[],"multicast_operations_profiles":[],"multicast_subscribers":[],"pbit_mappers":[],"bridges":[],"vlan_filters":[],"vlan_operations":[],"extended_vlans":[]}}`
+	valid := `{"version":6,"operation":"reset","mib_data_sync":0,"mib_state":{"version":1,"mib_data_sync":0,"instances":[{"class_id":2,"entity_id":0,"origin":0,"attributes":[{"name":"MibDataSync","kind":"uint8"}]}]},"service_graph":{"unis":[],"tconts":[],"traffic_descriptors":[],"dot1_rate_limiters":[],"gem_ports":[],"gem_interworking":[],"multicast_gem_interworking":[],"multicast_operations_profiles":[],"multicast_subscribers":[],"pbit_mappers":[],"bridges":[],"vlan_filters":[],"vlan_operations":[],"extended_vlans":[]}}`
 	request, err := DecodeApplyRequest(bytes.NewBufferString(valid))
 	if err != nil || request.Operation != mib.OperationReset {
 		t.Fatalf("DecodeApplyRequest(valid) = %#v, %v", request, err)
 	}
 	for _, document := range []string{
-		strings.Replace(valid, `"version":5`, `"version":4`, 1),
+		strings.Replace(valid, `"version":6`, `"version":5`, 1),
 		strings.Replace(valid, `"operation":"reset"`, `"operation":"other"`, 1),
 		strings.Replace(valid, `"mib_data_sync":0`, `"mib_data_sync":0,"unknown":1`, 1),
 		strings.Replace(valid, `"mib_data_sync":0,"mib_state"`, `"mib_data_sync":1,"mib_state"`, 1),
@@ -35,7 +35,7 @@ func TestDecodeApplyRequestIsStrict(t *testing.T) {
 }
 
 func TestDecodeApplyRequestAcceptsAutonomousOperation(t *testing.T) {
-	document := `{"version":5,"operation":"autonomous","mib_data_sync":9,"mib_state":{"version":1,"mib_data_sync":9,"instances":[{"class_id":2,"entity_id":0,"origin":0,"attributes":[{"name":"MibDataSync","kind":"uint8","unsigned":9}]}]},"service_graph":{"unis":[],"tconts":[],"traffic_descriptors":[],"gem_ports":[],"gem_interworking":[],"multicast_gem_interworking":[],"multicast_operations_profiles":[],"multicast_subscribers":[],"pbit_mappers":[],"bridges":[],"vlan_filters":[],"vlan_operations":[],"extended_vlans":[]}}`
+	document := `{"version":6,"operation":"autonomous","mib_data_sync":9,"mib_state":{"version":1,"mib_data_sync":9,"instances":[{"class_id":2,"entity_id":0,"origin":0,"attributes":[{"name":"MibDataSync","kind":"uint8","unsigned":9}]}]},"service_graph":{"unis":[],"tconts":[],"traffic_descriptors":[],"dot1_rate_limiters":[],"gem_ports":[],"gem_interworking":[],"multicast_gem_interworking":[],"multicast_operations_profiles":[],"multicast_subscribers":[],"pbit_mappers":[],"bridges":[],"vlan_filters":[],"vlan_operations":[],"extended_vlans":[]}}`
 	request, err := DecodeApplyRequest(bytes.NewBufferString(document))
 	if err != nil || request.Operation != mib.OperationAutonomous || request.MIBDataSync != 9 {
 		t.Fatalf("DecodeApplyRequest(autonomous) = %#v, %v", request, err)
