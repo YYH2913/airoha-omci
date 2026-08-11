@@ -106,9 +106,26 @@ func NewFromState(factory []Instance, state State, options Options) (*Store, err
 			return nil, fmt.Errorf("invalid restored ME %v/%#x: %w",
 				instance.ClassID, instance.EntityID, err)
 		}
+		if !store.supportsClass(instance.ClassID) {
+			return nil, fmt.Errorf("restored ME %v/%#x is not supported by this ONU",
+				instance.ClassID, instance.EntityID)
+		}
+		entity, result := loadDefinition(normalized.ClassID, normalized.EntityID, normalized.Attributes)
+		if result != nil {
+			return nil, result
+		}
+		if err := store.validateSupportedAttributes(entity, normalized.Attributes); err != nil {
+			return nil, fmt.Errorf("restored ME %v/%#x has unsupported attributes: %w",
+				instance.ClassID, instance.EntityID, err)
+		}
 		if instance.Origin == OriginONU {
-			if _, exists := store.factory[instance.Key]; !exists {
+			factoryInstance, exists := store.factory[instance.Key]
+			if !exists {
 				return nil, fmt.Errorf("restored ONU-created ME %v/%#x is not in the factory MIB",
+					instance.ClassID, instance.EntityID)
+			}
+			if !sameAttributeNames(factoryInstance.Attributes, normalized.Attributes) {
+				return nil, fmt.Errorf("restored ONU-created ME %v/%#x attribute set does not match the factory MIB",
 					instance.ClassID, instance.EntityID)
 			}
 		} else if instance.Origin == OriginOLT {
@@ -146,6 +163,18 @@ func NewFromState(factory []Instance, state State, options Options) (*Store, err
 	store.current = current
 	store.dataSync = dataSync
 	return store, nil
+}
+
+func sameAttributeNames(left, right me.AttributeValueMap) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for name := range left {
+		if _, present := right[name]; !present {
+			return false
+		}
+	}
+	return true
 }
 
 func normalizedEntityDefinition(instance Instance) *me.ManagedEntityDefinition {

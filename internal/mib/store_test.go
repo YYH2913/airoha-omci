@@ -207,6 +207,65 @@ func TestPlatformApplyFailureDoesNotCommitCandidate(t *testing.T) {
 	}
 }
 
+func TestSupportedClassPolicyRejectsKnownUnimplementedClass(t *testing.T) {
+	store, err := NewWithOptions([]Instance{{
+		Key:        Key{ClassID: me.OnuDataClassID, EntityID: 0},
+		Attributes: me.AttributeValueMap{me.OnuData_MibDataSync: uint8(0)},
+	}}, Options{SupportedClasses: []me.ClassID{me.OnuDataClassID, me.GalEthernetProfileClassID}})
+	if err != nil {
+		t.Fatalf("NewWithOptions() error = %v", err)
+	}
+
+	err = store.Create(me.IpHostConfigDataClassID, 1, me.AttributeValueMap{})
+	var result *ResultError
+	if !errors.As(err, &result) || result.Result != me.UnknownEntity {
+		t.Fatalf("Create(unsupported known class) error = %#v, want UnknownEntity", err)
+	}
+	if _, err = store.Get(Key{ClassID: me.IpHostConfigDataClassID, EntityID: 1}, 0x8000); !errors.As(err, &result) || result.Result != me.UnknownEntity {
+		t.Fatalf("Get(unsupported known class) error = %#v, want UnknownEntity", err)
+	}
+	if err = store.Create(me.GalEthernetProfileClassID, 1, me.AttributeValueMap{
+		me.GalEthernetProfile_MaximumGemPayloadSize: uint16(48),
+	}); err != nil {
+		t.Fatalf("Create(supported class) error = %v", err)
+	}
+	if !store.SupportsClass(me.GalEthernetProfileClassID) || store.SupportsClass(me.IpHostConfigDataClassID) {
+		t.Fatal("SupportsClass does not match configured policy")
+	}
+}
+
+func TestSupportedAttributePolicyRejectsUnadvertisedFactoryAttribute(t *testing.T) {
+	store, err := NewWithOptions([]Instance{{
+		Key: Key{ClassID: me.OnuGClassID, EntityID: 0},
+		Attributes: me.AttributeValueMap{
+			me.OnuG_VendorId:            []byte("TEST"),
+			me.OnuG_AdministrativeState: uint8(0),
+		},
+	}}, Options{SupportedClasses: []me.ClassID{me.OnuGClassID}})
+	if err != nil {
+		t.Fatalf("NewWithOptions() error = %v", err)
+	}
+
+	mask, explicit := store.SupportedAttributeMask(me.OnuGClassID)
+	if !explicit || mask != 0x8200 {
+		t.Fatalf("ONU-G supported attribute mask = %#x/%t, want 0x8200/true", mask, explicit)
+	}
+	_, err = store.Get(Key{ClassID: me.OnuGClassID, EntityID: 0}, 0x0040)
+	var result *ResultError
+	if !errors.As(err, &result) || result.Result != me.AttributeFailure || result.UnsupportedMask != 0x0040 {
+		t.Fatalf("Get(unadvertised Logical ONU ID) error = %#v", err)
+	}
+	err = store.Set(Key{ClassID: me.OnuGClassID, EntityID: 0}, me.AttributeValueMap{
+		me.OnuG_CredentialsStatus: uint8(1),
+	})
+	if !errors.As(err, &result) || result.Result != me.AttributeFailure || result.UnsupportedMask != 0x0010 {
+		t.Fatalf("Set(unadvertised credentials status) error = %#v", err)
+	}
+	if _, err = store.Get(Key{ClassID: me.OnuGClassID, EntityID: 0}, 0x8200); err != nil {
+		t.Fatalf("Get(advertised attributes) error = %v", err)
+	}
+}
+
 func TestPlatformChangeDoesNotAliasCommittedStore(t *testing.T) {
 	store, err := NewWithApplier([]Instance{{
 		Key: Key{ClassID: me.OnuDataClassID, EntityID: 0},

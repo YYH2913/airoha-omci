@@ -420,7 +420,10 @@ func (e *Engine) dispatch(packet gopacket.Packet, header *omci.OMCI) ([]byte, er
 			ClassID:  request.EntityClass,
 			EntityID: request.EntityInstance,
 		}
-		instance, operationError := e.mib.Get(key, request.AttributeMask)
+		instance, operationError, capability := e.getCapabilityLocked(key, request.AttributeMask)
+		if !capability {
+			instance, operationError = e.mib.Get(key, request.AttributeMask)
+		}
 		if instance.Attributes != nil && request.EntityClass == me.MulticastSubscriberConfigInfoClassID &&
 			request.AttributeMask&multicastSubscriberAllowedPreviewMask != 0 {
 			var previewError error
@@ -1155,14 +1158,18 @@ func (e *Engine) decodeFailureResponse(header *omci.OMCI, frame []byte, decodeEr
 	classID := me.ClassID(binary.BigEndian.Uint16(frame[4:6]))
 	entityID := binary.BigEndian.Uint16(frame[6:8])
 	definition, definitionError := me.LoadManagedEntityDefinition(classID, me.ParamData{EntityID: entityID})
-	classSupport := definition.GetManagedEntityDefinition().GetClassSupport()
-	if definitionError.StatusCode() != me.Success ||
-		classSupport == me.UnsupportedManagedEntity ||
-		classSupport == me.UnsupportedVendorSpecificManagedEntity {
+	if definitionError.StatusCode() != me.Success || definition == nil || !e.mib.SupportsClass(classID) {
 		result = me.UnknownEntity
-	} else if header.MessageType != omci.CreateRequestType &&
-		!e.mib.Exists(mib.Key{ClassID: classID, EntityID: entityID}) {
-		result = me.UnknownInstance
+	} else {
+		classSupport := definition.GetManagedEntityDefinition().GetClassSupport()
+		if classSupport == me.UnsupportedManagedEntity ||
+			classSupport == me.UnsupportedVendorSpecificManagedEntity {
+			result = me.UnknownEntity
+		} else if header.MessageType != omci.CreateRequestType &&
+			!e.mib.Exists(mib.Key{ClassID: classID, EntityID: entityID}) &&
+			!e.capabilityInstanceExistsLocked(mib.Key{ClassID: classID, EntityID: entityID}) {
+			result = me.UnknownInstance
+		}
 	}
 	response, err := serializeRawResult(header, classID, entityID, result)
 	return response, true, err

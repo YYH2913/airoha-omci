@@ -9,12 +9,13 @@ and extended messages.  A successful build or reaching GPON O5 is not enough.
 | Transactions | per-priority scheduling, stop-and-wait replay and TCI validation | implemented; physical saturation verification pending |
 | MIB | ONU defaults, platform-gated create/delete/set, reset, data sync | implemented; physical OLT verification pending |
 | MIB upload | baseline fragmentation and extended multi-ME packing | implemented; physical OLT verification pending |
+| Capability | OMCI, managed-entity and attribute declaration MEs with live instance tables | implemented from explicit XG2010G class/attribute policy; OLT verification pending |
 | Tables | stable Get/Get Next cache and baseline/enhanced extended Set Table | implemented; OLT verification pending |
 | Notifications | alarm audit/sequence, event-driven Alarm/AVC, requested optical tests and ARC | implemented; physical OLT verification pending |
 | Equipment | ONU-G, ONU2-G, ANI-G, four speed-specific Ethernet UNIs, software images | implemented; physical OLT verification pending |
 | Traffic | 8 advertised T-CONTs, scheduler/queue graph, GEM CTP/IW validation and hardware apply | upstream SP/WRR/TRTCM implemented; physical verification pending |
 | Performance | common 15-minute engine, GEM CTP and Ethernet UNI/frame PM | class 341, 24, 296, 321 and 322 counters, threshold data 1/2 and TCA implemented; physical verification pending |
-| Ethernet service | resolved bridge, mapper, VLAN and extended VLAN graph | UNI, bridge-port, mapper, GEM-IW, same-tag copy, structural multi-tag inverse and DSCP-derived PCP implemented; cross-tag packet-dependent copies pending |
+| Ethernet service | resolved bridge, mapper, VLAN and extended VLAN graph | UNI, bridge-port, mapper, GEM-IW, packet-dependent cross-tag copy, structural multi-tag inverse and DSCP-derived PCP implemented; physical verification pending |
 | Multicast | multicast GEM-IW, IGMP/MLD policy, subscriber limits and live groups | class 281 and class 309/310 tables, ACL/preview enforcement, native report/query interception, proxy querier and sampled class 311 monitoring implemented; physical OLT verification pending |
 | Lifecycle | reboot, time sync, software download/activate/commit | implemented; OLT verification pending |
 | Platform | multi-T-CONT/GEM Airoha ABI and transactional Linux backend | GEM and 16-channel GPON QDMA QoS, UNI VLAN, bridge FDB limit and multi-profile MAC bridge implemented; Ethernet offload pending |
@@ -30,6 +31,20 @@ MIB advertises the two 10G, one 2.5G and one 1G Ethernet UNIs independently.
 Its 96 priority queues and eight traffic schedulers are assigned to their
 Ethernet and ANI circuit packs, while ONU2-G reports zero unassigned global
 resources to avoid counting the same hardware twice.
+
+The OMCI ME type table is generated from an explicit XG2010G support policy,
+not from every class definition compiled into `omci-lib-go`. Managed entity ME
+actions are intersected with the daemon's implemented command paths, and its
+alarm and AVC tables contain only hardware-backed sources. Attribute ME
+instances are generated only for the factory attributes actually exposed by
+ONU-created classes or for the declared attributes of supported OLT-created
+classes. Managed entity instance tables are captured from the live MIB when a
+Get starts, so the following Get Next transfer remains stable while OLT-created
+instances change. Capability MEs are synthesized and excluded from persisted
+state and MIB upload. A known G.988 class outside this policy returns `unknown
+entity`; an unadvertised optional factory attribute returns attribute failure.
+Persisted state containing a removed class or a stale ONU factory attribute
+shape is discarded transactionally.
 
 Acknowledged commands follow the G.988 stop-and-wait rules: baseline low and
 high priority retain independent last-command TCI/response state, while the

@@ -49,6 +49,10 @@ const defaultExtendedVLANTableSize = 64
 type Options struct {
 	Applier               Applier
 	ExtendedVLANTableSize uint16
+	// SupportedClasses constrains the device-specific ME surface. A nil or
+	// empty list preserves the unrestricted behavior used by small unit-test
+	// stores; production callers must provide an explicit platform list.
+	SupportedClasses []me.ClassID
 }
 
 // Change is the immutable candidate state passed to the platform backend.
@@ -96,6 +100,8 @@ type Store struct {
 	dataSync              uint8
 	applier               Applier
 	extendedVLANTableSize uint16
+	supportedClasses      map[me.ClassID]struct{}
+	supportedAttributes   map[me.ClassID]uint16
 }
 
 func New(factory []Instance) (*Store, error) {
@@ -120,8 +126,30 @@ func NewWithOptions(factory []Instance, options Options) (*Store, error) {
 		applier:               options.Applier,
 		extendedVLANTableSize: tableSize,
 	}
+	if len(options.SupportedClasses) != 0 {
+		s.supportedClasses = make(map[me.ClassID]struct{}, len(options.SupportedClasses))
+		s.supportedAttributes = make(map[me.ClassID]uint16, len(options.SupportedClasses))
+		for _, classID := range options.SupportedClasses {
+			if _, duplicate := s.supportedClasses[classID]; duplicate {
+				return nil, fmt.Errorf("duplicate supported managed-entity class %v", classID)
+			}
+			entity, result := loadDefinition(classID, 0, nil)
+			if result != nil {
+				return nil, fmt.Errorf("invalid supported managed-entity class %v: %w", classID, result)
+			}
+			s.supportedClasses[classID] = struct{}{}
+			definition := entity.GetManagedEntityDefinition()
+			if definition.Access != me.CreatedByOnu || isCapabilityClass(classID) {
+				s.supportedAttributes[classID] = definition.AllowedAttributeMask
+			}
+		}
+	}
 
 	for _, instance := range factory {
+		if !s.supportsClass(instance.ClassID) {
+			return nil, fmt.Errorf("factory ME %v/%#x is not in the supported class list",
+				instance.ClassID, instance.EntityID)
+		}
 		instance.Origin = OriginONU
 		normalized, err := normalize(instance)
 		if err != nil {
@@ -132,6 +160,23 @@ func NewWithOptions(factory []Instance, options Options) (*Store, error) {
 		}
 		s.factory[normalized.Key] = normalized
 		s.current[normalized.Key] = cloneInstance(normalized)
+		if s.supportedAttributes != nil {
+			entity, result := loadDefinition(normalized.ClassID, normalized.EntityID, normalized.Attributes)
+			if result != nil {
+				return nil, result
+			}
+			for name := range normalized.Attributes {
+				if name == me.ManagedEntityID {
+					continue
+				}
+				attribute, err := me.GetAttributeDefinitionByName(entity.GetAttributeDefinitions(), name)
+				if err != nil {
+					return nil, fmt.Errorf("factory ME %v/%#x has unknown attribute %s",
+						normalized.ClassID, normalized.EntityID, name)
+				}
+				s.supportedAttributes[normalized.ClassID] |= attribute.Mask
+			}
+		}
 	}
 	s.setDataSyncLocked(0)
 	return s, nil
@@ -150,13 +195,55 @@ func (s *Store) Exists(key Key) bool {
 	return exists
 }
 
+// SupportsClass reports whether the platform advertises and accepts a managed
+// entity class. Stores without an explicit policy remain unrestricted.
+func (s *Store) SupportsClass(classID me.ClassID) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.supportsClass(classID)
+}
+
+// SupportedClasses returns the explicit device capability list. A nil result
+// means that the store has no device-specific policy and must not be used to
+// synthesize capability MEs.
+func (s *Store) SupportedClasses() []me.ClassID {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.supportedClasses == nil {
+		return nil
+	}
+	classes := make([]me.ClassID, 0, len(s.supportedClasses))
+	for classID := range s.supportedClasses {
+		classes = append(classes, classID)
+	}
+	sort.Slice(classes, func(i, j int) bool { return classes[i] < classes[j] })
+	return classes
+}
+
+// SupportedAttributeMask returns the attribute surface for an explicitly
+// supported class. The boolean is false for unrestricted stores or classes
+// outside the device policy.
+func (s *Store) SupportedAttributeMask(classID me.ClassID) (uint16, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.supportedAttributeMask(classID)
+}
+
+func (s *Store) supportsClass(classID me.ClassID) bool {
+	if s.supportedClasses == nil {
+		return true
+	}
+	_, supported := s.supportedClasses[classID]
+	return supported
+}
+
 func (s *Store) Get(key Key, mask uint16) (Instance, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	instance, exists := s.current[key]
 	if !exists {
-		return Instance{}, unknownKeyError(key)
+		return Instance{}, s.unknownKeyError(key)
 	}
 
 	entity, result := loadDefinition(key.ClassID, key.EntityID, instance.Attributes)
@@ -164,6 +251,9 @@ func (s *Store) Get(key Key, mask uint16) (Instance, error) {
 		return Instance{}, result
 	}
 	allowed := entity.GetAllowedAttributeMask()
+	if supported, explicit := s.supportedAttributeMask(key.ClassID); explicit {
+		allowed &= supported
+	}
 	unsupported := mask &^ allowed
 	selectedMask := mask & allowed
 
@@ -187,6 +277,10 @@ func (s *Store) Create(classID me.ClassID, entityID uint16, attributes me.Attrib
 	defer s.mu.Unlock()
 
 	key := Key{ClassID: classID, EntityID: entityID}
+	if !s.supportsClass(classID) {
+		return &ResultError{Result: me.UnknownEntity,
+			Cause: fmt.Errorf("managed entity class %#x is not supported by this ONU", classID)}
+	}
 	if _, exists := s.current[key]; exists {
 		return &ResultError{Result: me.InstanceExists}
 	}
@@ -199,6 +293,9 @@ func (s *Store) Create(classID me.ClassID, entityID uint16, attributes me.Attrib
 	if !me.SupportsMsgType(entity, me.Create) ||
 		(definition.Access != me.CreatedByOlt && definition.Access != me.CreatedByBoth) {
 		return &ResultError{Result: me.NotSupported}
+	}
+	if err := s.validateSupportedAttributes(entity, attributes); err != nil {
+		return err
 	}
 	if err := validateAccess(entity, attributes, me.SetByCreate); err != nil {
 		return err
@@ -228,7 +325,7 @@ func (s *Store) Set(key Key, attributes me.AttributeValueMap) error {
 
 	current, exists := s.current[key]
 	if !exists {
-		return unknownKeyError(key)
+		return s.unknownKeyError(key)
 	}
 	entity, result := loadDefinition(key.ClassID, key.EntityID, current.Attributes)
 	if result != nil {
@@ -236,6 +333,9 @@ func (s *Store) Set(key Key, attributes me.AttributeValueMap) error {
 	}
 	if !me.SupportsMsgType(entity, me.Set) {
 		return &ResultError{Result: me.NotSupported}
+	}
+	if err := s.validateSupportedAttributes(entity, attributes); err != nil {
+		return err
 	}
 	if err := validateAccess(entity, attributes, me.Write); err != nil {
 		return err
@@ -282,11 +382,14 @@ func (s *Store) UpdateAutonomous(key Key, attributes me.AttributeValueMap) (me.A
 
 	current, exists := s.current[key]
 	if !exists {
-		return nil, unknownKeyError(key)
+		return nil, s.unknownKeyError(key)
 	}
 	entity, result := loadDefinition(key.ClassID, key.EntityID, current.Attributes)
 	if result != nil {
 		return nil, result
+	}
+	if err := s.validateSupportedAttributes(entity, attributes); err != nil {
+		return nil, err
 	}
 
 	definitions := entity.GetAttributeDefinitions()
@@ -349,11 +452,14 @@ func (s *Store) UpdateAutonomousBatch(updates map[Key]me.AttributeValueMap) erro
 	for key, attributes := range updates {
 		current, exists := proposed[key]
 		if !exists {
-			return unknownKeyError(key)
+			return s.unknownKeyError(key)
 		}
 		entity, result := loadDefinition(key.ClassID, key.EntityID, current.Attributes)
 		if result != nil {
 			return result
+		}
+		if err := s.validateSupportedAttributes(entity, attributes); err != nil {
+			return err
 		}
 
 		definitions := entity.GetAttributeDefinitions()
@@ -408,11 +514,14 @@ func (s *Store) UpdateByCommand(updates map[Key]me.AttributeValueMap) error {
 	for key, attributes := range updates {
 		current, exists := s.current[key]
 		if !exists {
-			return unknownKeyError(key)
+			return s.unknownKeyError(key)
 		}
 		entity, result := loadDefinition(key.ClassID, key.EntityID, current.Attributes)
 		if result != nil {
 			return result
+		}
+		if err := s.validateSupportedAttributes(entity, attributes); err != nil {
+			return err
 		}
 		definitions := entity.GetAttributeDefinitions()
 		var failed uint16
@@ -468,7 +577,7 @@ func (s *Store) Delete(key Key) error {
 
 	instance, exists := s.current[key]
 	if !exists {
-		return unknownKeyError(key)
+		return s.unknownKeyError(key)
 	}
 	entity, result := loadDefinition(key.ClassID, key.EntityID, instance.Attributes)
 	if result != nil {
@@ -693,6 +802,57 @@ func unknownKeyError(key Key) error {
 		return result
 	}
 	return &ResultError{Result: me.UnknownInstance}
+}
+
+func (s *Store) unknownKeyError(key Key) error {
+	if !s.supportsClass(key.ClassID) {
+		return &ResultError{Result: me.UnknownEntity,
+			Cause: fmt.Errorf("managed entity class %#x is not supported by this ONU", key.ClassID)}
+	}
+	return unknownKeyError(key)
+}
+
+func (s *Store) supportedAttributeMask(classID me.ClassID) (uint16, bool) {
+	if s.supportedAttributes == nil {
+		return 0, false
+	}
+	mask, supported := s.supportedAttributes[classID]
+	return mask, supported
+}
+
+func (s *Store) validateSupportedAttributes(entity *me.ManagedEntity, attributes me.AttributeValueMap) error {
+	supported, explicit := s.supportedAttributeMask(entity.GetClassID())
+	if !explicit {
+		return nil
+	}
+	definitions := entity.GetAttributeDefinitions()
+	var unsupported uint16
+	for name := range attributes {
+		if name == me.ManagedEntityID {
+			continue
+		}
+		definition, err := me.GetAttributeDefinitionByName(definitions, name)
+		if err != nil {
+			unsupported = 0xffff
+			continue
+		}
+		if definition.Mask&supported == 0 {
+			unsupported |= definition.Mask
+		}
+	}
+	if unsupported != 0 {
+		return &ResultError{Result: me.AttributeFailure, UnsupportedMask: unsupported}
+	}
+	return nil
+}
+
+func isCapabilityClass(classID me.ClassID) bool {
+	switch classID {
+	case me.OmciClassID, me.ManagedEntityMeClassID, me.AttributeMeClassID:
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *Store) nextDataSyncLocked() uint8 {

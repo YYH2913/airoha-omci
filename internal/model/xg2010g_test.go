@@ -3,6 +3,7 @@
 package model
 
 import (
+	"slices"
 	"testing"
 
 	me "github.com/opencord/omci-lib-go/v2/generated"
@@ -101,5 +102,30 @@ func TestXG2010GFactoryMIB(t *testing.T) {
 func TestXG2010GRejectsMalformedSerial(t *testing.T) {
 	if _, err := XG2010G(Identity{SerialNumber: "bad"}); err == nil {
 		t.Fatal("XG2010G() error = nil, want malformed serial error")
+	}
+}
+
+func TestXG2010GSupportedClassesAreExplicitAndSorted(t *testing.T) {
+	classes := XG2010GSupportedClasses()
+	if !slices.IsSorted(classes) {
+		t.Fatalf("supported classes are not sorted: %v", classes)
+	}
+	seen := make(map[me.ClassID]struct{}, len(classes))
+	for _, classID := range classes {
+		if _, duplicate := seen[classID]; duplicate {
+			t.Fatalf("duplicate supported class %v", classID)
+		}
+		seen[classID] = struct{}{}
+	}
+	for _, required := range []me.ClassID{
+		me.OmciClassID, me.ManagedEntityMeClassID, me.AttributeMeClassID,
+		me.GemPortNetworkCtpClassID, me.ExtendedVlanTaggingOperationConfigurationDataClassID,
+	} {
+		if _, present := seen[required]; !present {
+			t.Fatalf("supported classes omit %v", required)
+		}
+	}
+	if _, present := seen[me.IpHostConfigDataClassID]; present {
+		t.Fatalf("unsupported IP host class is advertised")
 	}
 }

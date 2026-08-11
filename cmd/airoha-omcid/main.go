@@ -373,7 +373,10 @@ func run(opts options) error {
 }
 
 func initializeMIB(factory []mib.Instance, applier mib.Applier, statePath string) (*mib.Store, error) {
-	options := mib.Options{Applier: applier}
+	options := mib.Options{
+		Applier:          applier,
+		SupportedClasses: model.XG2010GSupportedClasses(),
+	}
 	if statePath == "" {
 		return mib.NewWithOptions(factory, options)
 	}

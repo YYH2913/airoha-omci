@@ -91,6 +91,59 @@ func TestNewFromStateRejectsIdentityMismatch(t *testing.T) {
 	}
 }
 
+func TestNewFromStateRejectsUnsupportedPersistedClass(t *testing.T) {
+	factory := stateTestFactory("ABCD")
+	store, err := New(factory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Create(me.GalEthernetProfileClassID, 1, me.AttributeValueMap{
+		me.GalEthernetProfile_MaximumGemPayloadSize: uint16(48),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	state, err := ExportState(store.Snapshot(), store.DataSync())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = NewFromState(factory, state, Options{SupportedClasses: []me.ClassID{
+		me.OnuDataClassID, me.OnuGClassID,
+	}})
+	if err == nil || !strings.Contains(err.Error(), "not supported by this ONU") {
+		t.Fatalf("NewFromState(unsupported class) error = %v", err)
+	}
+}
+
+func TestNewFromStateRejectsStaleFactoryAttributeSet(t *testing.T) {
+	factory := stateTestFactory("ABCD")
+	store, err := New(factory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := ExportState(store.Snapshot(), store.DataSync())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := range state.Instances {
+		if state.Instances[index].ClassID == me.OnuGClassID {
+			attributes := state.Instances[index].Attributes[:0]
+			for _, attribute := range state.Instances[index].Attributes {
+				if attribute.Name != me.OnuG_TrafficManagementOption {
+					attributes = append(attributes, attribute)
+				}
+			}
+			state.Instances[index].Attributes = attributes
+			break
+		}
+	}
+	_, err = NewFromState(factory, state, Options{SupportedClasses: []me.ClassID{
+		me.OnuDataClassID, me.OnuGClassID,
+	}})
+	if err == nil || !strings.Contains(err.Error(), "attribute set does not match") {
+		t.Fatalf("NewFromState(stale factory attributes) error = %v", err)
+	}
+}
+
 func TestStateValidationRejectsStructuralCorruption(t *testing.T) {
 	valid := State{Version: StateVersion, Instances: []StateInstance{{
 		ClassID: me.OnuDataClassID, Origin: OriginONU,

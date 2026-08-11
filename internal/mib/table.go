@@ -77,7 +77,7 @@ func (s *Store) SetTable(key Key, mask uint16, attributes me.AttributeValueMap) 
 
 	current, exists := s.current[key]
 	if !exists {
-		return unknownKeyError(key)
+		return s.unknownKeyError(key)
 	}
 	entity, result := loadDefinition(key.ClassID, key.EntityID, current.Attributes)
 	if result != nil {
@@ -85,6 +85,9 @@ func (s *Store) SetTable(key Key, mask uint16, attributes me.AttributeValueMap) 
 	}
 	if !me.SupportsMsgType(entity, me.SetTable) {
 		return &ResultError{Result: me.NotSupported}
+	}
+	if supported, explicit := s.supportedAttributeMask(key.ClassID); explicit && mask&^supported != 0 {
+		return &ResultError{Result: me.AttributeFailure, UnsupportedMask: mask &^ supported}
 	}
 	if bits.OnesCount16(mask) != 1 {
 		return &ResultError{Result: me.ParameterError, Cause: fmt.Errorf("SetTable mask %#x does not select one attribute", mask)}
