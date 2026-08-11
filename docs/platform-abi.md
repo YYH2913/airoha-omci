@@ -231,6 +231,14 @@ outside the per-profile Linux bridges. A UNI may belong to only one active
 profile, and the backend never removes an interface from a non-OMCI Linux
 bridge implicitly.
 
+On XG2010G, a profile's non-zero learning depth is programmed as the Linux
+bridge-wide dynamic FDB limit. Each bridge port's non-zero learning depth is
+programmed as an additional per-port dynamic FDB limit; zero means unlimited.
+Creation, aging, MAC roaming, userspace takeover and hardware external learning
+all participate in the same accounting. Logical unicast and multicast ANI
+ports that share one profile-specific endpoint must specify the same per-port
+depth, otherwise the graph is rejected before apply.
+
 Extended VLAN associations to a MAC bridge ANI port, 802.1p mapper or GEM
 interworking termination are resolved onto that profile-specific ANI endpoint.
 Upstream rules run on ANI egress and downstream rules run on ANI ingress.

@@ -154,9 +154,9 @@ keeps the profile's FDB and flooding policy independent, while the PON-facing
 end redirects upstream traffic to the physical `pon` and receives only the
 GEM-marked downstream traffic resolved to that profile. Multiple profiles can
 therefore share one physical PON without merging learning domains. FDB
-learning, unknown-unicast flooding, UNI isolation and the G.988 VLAN filter
-`j` action are enforced. Candidate failure restores GEM, TC, VLAN and bridge
-state from the last committed graph.
+learning, bridge-wide and per-port learning depth, unknown-unicast flooding,
+UNI isolation and the G.988 VLAN filter `j` action are enforced. Candidate
+failure restores GEM, TC, VLAN and bridge state from the last committed graph.
 
 The service graph exports an Ethernet UNI's effective administrative state. A
 port is unlocked only when ONU-G, its circuit pack, its Ethernet PPTP and the
@@ -257,7 +257,6 @@ mode so their MIB changes are durable without reconfiguring an unchanged data
 path.
 
 The remaining Ethernet blockers are wildcard copies into a newly added tag,
-double-tag and non-replacement partial inverse, per-port learning-depth, and
-native Airoha offload. These unsupported forms are rejected before platform
-state changes. Physical baseline/extended OLT interoperability remains a
-completion gate.
+double-tag and non-replacement partial inverse, and native Airoha offload.
+These unsupported forms are rejected before platform state changes. Physical
+baseline/extended OLT interoperability remains a completion gate.
