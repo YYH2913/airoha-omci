@@ -253,6 +253,144 @@ func TestSetTableEnhancedVLANRejectsReservedControlAndDirection(t *testing.T) {
 	}
 }
 
+func TestMulticastGEMCreateInitializesAddressTables(t *testing.T) {
+	store, err := New(nil)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	const entityID = 0x300
+	if err := store.Create(me.MulticastGemInterworkingTerminationPointClassID, entityID,
+		me.AttributeValueMap{
+			me.MulticastGemInterworkingTerminationPoint_GemPortNetworkCtpConnectivityPointer: uint16(0x400),
+			me.MulticastGemInterworkingTerminationPoint_InterworkingOption:                   uint8(1),
+			me.MulticastGemInterworkingTerminationPoint_ServiceProfilePointer:                uint16(0x100),
+			me.MulticastGemInterworkingTerminationPoint_NotUsed1:                             uint16(0),
+			me.MulticastGemInterworkingTerminationPoint_GalProfilePointer:                    uint16(0),
+			me.MulticastGemInterworkingTerminationPoint_NotUsed2:                             uint8(0),
+		}); err != nil {
+		t.Fatalf("Create(multicast GEM IW) error = %v", err)
+	}
+	instance := snapshotInstance(t, store, Key{
+		ClassID: me.MulticastGemInterworkingTerminationPointClassID, EntityID: entityID})
+	for _, name := range []string{
+		me.MulticastGemInterworkingTerminationPoint_Ipv4MulticastAddressTable,
+		me.MulticastGemInterworkingTerminationPoint_Ipv6MulticastAddressTable,
+	} {
+		if got := instance.Attributes[name]; !tableRowsEqual(got, me.TableRows{}) {
+			t.Fatalf("%s = %#v, want empty TableRows", name, got)
+		}
+	}
+}
+
+func TestSetTableMulticastAddressesReplaceDeleteAndSort(t *testing.T) {
+	store := newMulticastTableStore(t)
+	key := Key{ClassID: me.MulticastGemInterworkingTerminationPointClassID, EntityID: 0x300}
+
+	row20 := multicastIPv4Row(200, 0x20, 0xe1000000, 0xe10000ff)
+	row10 := multicastIPv4Row(200, 0x10, 0xe2000000, 0xe20000ff)
+	setTable(t, store, key, 0x0080,
+		me.MulticastGemInterworkingTerminationPoint_Ipv4MulticastAddressTable,
+		append(append([]byte(nil), row20...), row10...))
+	rows := getTable(t, store, key, 0x0080,
+		me.MulticastGemInterworkingTerminationPoint_Ipv4MulticastAddressTable)
+	if rows.NumRows != 2 || !bytes.Equal(rows.Rows[:multicastIPv4RowSize], row10) {
+		t.Fatalf("stored IPv4 multicast rows = %x", rows.Rows)
+	}
+
+	replacement := multicastIPv4Row(200, 0x10, 0xef000000, 0xefffffff)
+	setTable(t, store, key, 0x0080,
+		me.MulticastGemInterworkingTerminationPoint_Ipv4MulticastAddressTable, replacement)
+	rows = getTable(t, store, key, 0x0080,
+		me.MulticastGemInterworkingTerminationPoint_Ipv4MulticastAddressTable)
+	if rows.NumRows != 2 || !bytes.Equal(rows.Rows[:multicastIPv4RowSize], replacement) {
+		t.Fatalf("replaced IPv4 multicast rows = %x", rows.Rows)
+	}
+
+	deletion := append([]byte(nil), replacement...)
+	clear(deletion[4:])
+	setTable(t, store, key, 0x0080,
+		me.MulticastGemInterworkingTerminationPoint_Ipv4MulticastAddressTable, deletion)
+	rows = getTable(t, store, key, 0x0080,
+		me.MulticastGemInterworkingTerminationPoint_Ipv4MulticastAddressTable)
+	if rows.NumRows != 1 || !bytes.Equal(rows.Rows, row20) {
+		t.Fatalf("IPv4 multicast rows after delete = %x", rows.Rows)
+	}
+
+	ipv6 := multicastIPv6Row(201, 1, 0x100, 0x1ff)
+	setTable(t, store, key, 0x0040,
+		me.MulticastGemInterworkingTerminationPoint_Ipv6MulticastAddressTable, ipv6)
+	rows = getTable(t, store, key, 0x0040,
+		me.MulticastGemInterworkingTerminationPoint_Ipv6MulticastAddressTable)
+	if rows.NumRows != 1 || !bytes.Equal(rows.Rows, ipv6) {
+		t.Fatalf("stored IPv6 multicast rows = %x", rows.Rows)
+	}
+}
+
+func TestSetTableMulticastAddressesRejectInvalidRowsAtomically(t *testing.T) {
+	tests := []struct {
+		name string
+		mask uint16
+		attr string
+		row  []byte
+	}{
+		{name: "GEM", mask: 0x0080,
+			attr: me.MulticastGemInterworkingTerminationPoint_Ipv4MulticastAddressTable,
+			row:  multicastIPv4Row(4096, 1, 0xe0000000, 0xefffffff)},
+		{name: "IPv4 unicast", mask: 0x0080,
+			attr: me.MulticastGemInterworkingTerminationPoint_Ipv4MulticastAddressTable,
+			row:  multicastIPv4Row(200, 1, 0x0a000001, 0x0a000002)},
+		{name: "IPv4 reversed", mask: 0x0080,
+			attr: me.MulticastGemInterworkingTerminationPoint_Ipv4MulticastAddressTable,
+			row:  multicastIPv4Row(200, 1, 0xe1000002, 0xe1000001)},
+		{name: "IPv6 unicast", mask: 0x0040,
+			attr: me.MulticastGemInterworkingTerminationPoint_Ipv6MulticastAddressTable,
+			row: func() []byte {
+				row := multicastIPv6Row(200, 1, 1, 2)
+				row[12] = 0x20
+				return row
+			}()},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := newMulticastTableStore(t)
+			err := store.SetTable(Key{ClassID: me.MulticastGemInterworkingTerminationPointClassID,
+				EntityID: 0x300}, test.mask, me.AttributeValueMap{test.attr: me.TableRows{
+				NumRows: 1, Rows: test.row,
+			}})
+			var result *ResultError
+			if !errors.As(err, &result) || result.Result != me.ParameterError {
+				t.Fatalf("SetTable() error = %#v, want ParameterError", err)
+			}
+			if store.DataSync() != 1 {
+				t.Fatalf("DataSync() = %d after rejected row, want 1", store.DataSync())
+			}
+		})
+	}
+}
+
+func newMulticastTableStore(t *testing.T) *Store {
+	t.Helper()
+	store, err := New([]Instance{{
+		Key:        Key{ClassID: me.OnuDataClassID, EntityID: 0},
+		Attributes: me.AttributeValueMap{me.OnuData_MibDataSync: uint8(0)},
+	}})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	if err := store.Create(me.MulticastGemInterworkingTerminationPointClassID, 0x300,
+		me.AttributeValueMap{
+			me.MulticastGemInterworkingTerminationPoint_GemPortNetworkCtpConnectivityPointer: uint16(0x400),
+			me.MulticastGemInterworkingTerminationPoint_InterworkingOption:                   uint8(1),
+			me.MulticastGemInterworkingTerminationPoint_ServiceProfilePointer:                uint16(0x100),
+			me.MulticastGemInterworkingTerminationPoint_NotUsed1:                             uint16(0),
+			me.MulticastGemInterworkingTerminationPoint_GalProfilePointer:                    uint16(0),
+			me.MulticastGemInterworkingTerminationPoint_NotUsed2:                             uint8(0),
+		}); err != nil {
+		t.Fatalf("Create(multicast GEM IW) error = %v", err)
+	}
+	return store
+}
+
 func newExtendedVLANStore(t *testing.T, options Options) *Store {
 	t.Helper()
 	factory := []Instance{{
@@ -328,6 +466,25 @@ func enhancedVLANRow(control, direction byte, key uint16, treatment byte) []byte
 	row[0] = control<<6 | direction<<4
 	binary.BigEndian.PutUint16(row[2:4], key)
 	row[19] = treatment
+	return row
+}
+
+func multicastIPv4Row(gem, secondary uint16, start, stop uint32) []byte {
+	row := make([]byte, multicastIPv4RowSize)
+	binary.BigEndian.PutUint16(row[0:2], gem)
+	binary.BigEndian.PutUint16(row[2:4], secondary)
+	binary.BigEndian.PutUint32(row[4:8], start)
+	binary.BigEndian.PutUint32(row[8:12], stop)
+	return row
+}
+
+func multicastIPv6Row(gem, secondary uint16, start, stop uint32) []byte {
+	row := make([]byte, multicastIPv6RowSize)
+	binary.BigEndian.PutUint16(row[0:2], gem)
+	binary.BigEndian.PutUint16(row[2:4], secondary)
+	binary.BigEndian.PutUint32(row[4:8], start)
+	binary.BigEndian.PutUint32(row[8:12], stop)
+	row[12] = 0xff
 	return row
 }
 

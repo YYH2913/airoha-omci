@@ -3,7 +3,9 @@
 package platform
 
 import (
+	"encoding/binary"
 	"fmt"
+	"net/netip"
 	"sort"
 
 	me "github.com/opencord/omci-lib-go/v2/generated"
@@ -25,16 +27,19 @@ var mapperPBitAttributes = [...]string{
 }
 
 type ServiceGraph struct {
-	UNIs           []EthernetUNI       `json:"unis"`
-	TCONTs         []TCONT             `json:"tconts"`
-	TrafficDescs   []TrafficDescriptor `json:"traffic_descriptors"`
-	GEMPorts       []GEMPort           `json:"gem_ports"`
-	Interworking   []GEMInterworking   `json:"gem_interworking"`
-	Mappers        []PBitMapper        `json:"pbit_mappers"`
-	Bridges        []MACBridge         `json:"bridges"`
-	VLANFilters    []VLANFilter        `json:"vlan_filters"`
-	VLANOperations []VLANOperation     `json:"vlan_operations"`
-	ExtendedVLANs  []ExtendedVLAN      `json:"extended_vlans"`
+	UNIs                  []EthernetUNI                   `json:"unis"`
+	TCONTs                []TCONT                         `json:"tconts"`
+	TrafficDescs          []TrafficDescriptor             `json:"traffic_descriptors"`
+	GEMPorts              []GEMPort                       `json:"gem_ports"`
+	Interworking          []GEMInterworking               `json:"gem_interworking"`
+	MulticastInterworking []MulticastGEMInterworking      `json:"multicast_gem_interworking"`
+	MulticastProfiles     []MulticastOperationsProfile    `json:"multicast_operations_profiles"`
+	MulticastSubscribers  []MulticastSubscriberConfigInfo `json:"multicast_subscribers"`
+	Mappers               []PBitMapper                    `json:"pbit_mappers"`
+	Bridges               []MACBridge                     `json:"bridges"`
+	VLANFilters           []VLANFilter                    `json:"vlan_filters"`
+	VLANOperations        []VLANOperation                 `json:"vlan_operations"`
+	ExtendedVLANs         []ExtendedVLAN                  `json:"extended_vlans"`
 }
 
 type EthernetUNI struct {
@@ -89,6 +94,60 @@ type GEMInterworking struct {
 	ServiceProfile          uint16 `json:"service_profile"`
 	InterworkingTermination uint16 `json:"interworking_termination"`
 	GALProfile              uint16 `json:"gal_profile"`
+}
+
+type MulticastGEMInterworking struct {
+	EntityID       uint16               `json:"entity_id"`
+	GEMPort        uint16               `json:"gem_port"`
+	PortID         uint16               `json:"port_id"`
+	TCONT          uint16               `json:"tcont"`
+	AllocID        uint16               `json:"alloc_id"`
+	Option         uint8                `json:"option"`
+	ServiceProfile uint16               `json:"service_profile"`
+	GALProfile     uint16               `json:"gal_profile"`
+	IPv4Ranges     []MulticastIPv4Range `json:"ipv4_ranges"`
+	IPv6Ranges     []MulticastIPv6Range `json:"ipv6_ranges"`
+}
+
+type MulticastIPv4Range struct {
+	GEMPortID    uint16 `json:"gem_port_id"`
+	SecondaryKey uint16 `json:"secondary_key"`
+	Start        string `json:"start"`
+	Stop         string `json:"stop"`
+}
+
+type MulticastIPv6Range struct {
+	GEMPortID    uint16 `json:"gem_port_id"`
+	SecondaryKey uint16 `json:"secondary_key"`
+	Start        string `json:"start"`
+	Stop         string `json:"stop"`
+}
+
+type MulticastOperationsProfile struct {
+	EntityID                  uint16 `json:"entity_id"`
+	IGMPVersion               uint8  `json:"igmp_version"`
+	IGMPFunction              uint8  `json:"igmp_function"`
+	ImmediateLeave            uint8  `json:"immediate_leave"`
+	UpstreamTCI               uint16 `json:"upstream_tci"`
+	UpstreamTagControl        uint8  `json:"upstream_tag_control"`
+	UpstreamRate              uint32 `json:"upstream_rate"`
+	Robustness                uint8  `json:"robustness"`
+	QuerierIPAddress          uint32 `json:"querier_ip_address"`
+	QueryInterval             uint32 `json:"query_interval"`
+	QueryMaxResponseTime      uint32 `json:"query_max_response_time"`
+	LastMemberQueryInterval   uint32 `json:"last_member_query_interval"`
+	UnauthorizedJoinBehaviour uint8  `json:"unauthorized_join_behaviour"`
+	DownstreamTagControl      uint8  `json:"downstream_tag_control"`
+	DownstreamTCI             uint16 `json:"downstream_tci"`
+}
+
+type MulticastSubscriberConfigInfo struct {
+	EntityID              uint16 `json:"entity_id"`
+	METype                uint8  `json:"me_type"`
+	Profile               uint16 `json:"profile"`
+	MaxSimultaneousGroups uint16 `json:"max_simultaneous_groups"`
+	MaxMulticastBandwidth uint32 `json:"max_multicast_bandwidth"`
+	BandwidthEnforcement  uint8  `json:"bandwidth_enforcement"`
 }
 
 type PBitMapper struct {
@@ -208,6 +267,8 @@ func BuildServiceGraph(snapshot []mib.Instance) (ServiceGraph, error) {
 	mappers := make(map[uint16]PBitMapper)
 	gemPorts := make(map[uint16]GEMPort)
 	gemInterworking := make(map[uint16]GEMInterworking)
+	multicastInterworking := make(map[uint16]MulticastGEMInterworking)
+	multicastProfiles := make(map[uint16]MulticastOperationsProfile)
 	tcontIndexes := make(map[uint16]int)
 
 	trafficManagementOption := uint8(0)
@@ -292,6 +353,14 @@ func BuildServiceGraph(snapshot []mib.Instance) (ServiceGraph, error) {
 			}
 			mappers[instance.EntityID] = mapper
 			graph.Mappers = append(graph.Mappers, mapper)
+
+		case me.MulticastOperationsProfileClassID:
+			profile, err := buildMulticastOperationsProfile(instance)
+			if err != nil {
+				return ServiceGraph{}, err
+			}
+			multicastProfiles[instance.EntityID] = profile
+			graph.MulticastProfiles = append(graph.MulticastProfiles, profile)
 		}
 	}
 
@@ -506,6 +575,19 @@ func BuildServiceGraph(snapshot []mib.Instance) (ServiceGraph, error) {
 		graph.Interworking = append(graph.Interworking, interworking)
 	}
 
+	for _, instance := range snapshot {
+		if instance.ClassID != me.MulticastGemInterworkingTerminationPointClassID {
+			continue
+		}
+		interworking, err := buildMulticastGEMInterworking(instance, instances,
+			gemPorts, bridges, mappers)
+		if err != nil {
+			return ServiceGraph{}, err
+		}
+		multicastInterworking[instance.EntityID] = interworking
+		graph.MulticastInterworking = append(graph.MulticastInterworking, interworking)
+	}
+
 	for _, mapper := range graph.Mappers {
 		if err := validateMapper(mapper, instances, gemInterworking); err != nil {
 			return ServiceGraph{}, err
@@ -546,7 +628,8 @@ func BuildServiceGraph(snapshot []mib.Instance) (ServiceGraph, error) {
 		if err != nil {
 			return ServiceGraph{}, err
 		}
-		if err := validateBridgePortTP(instance.EntityID, bridgeID, tpType, tp, instances, gemInterworking); err != nil {
+		if err := validateBridgePortTP(instance.EntityID, bridgeID, tpType, tp, instances,
+			gemInterworking, multicastInterworking); err != nil {
 			return ServiceGraph{}, err
 		}
 		port, err := buildMACBridgePort(instance, portNumber, tpType, tp)
@@ -555,6 +638,18 @@ func BuildServiceGraph(snapshot []mib.Instance) (ServiceGraph, error) {
 		}
 		bridge.Ports = append(bridge.Ports, port)
 		bridgePorts[instance.EntityID] = port
+	}
+
+	for _, instance := range snapshot {
+		if instance.ClassID != me.MulticastSubscriberConfigInfoClassID {
+			continue
+		}
+		subscriber, err := buildMulticastSubscriber(instance, bridgePorts, mappers,
+			multicastProfiles)
+		if err != nil {
+			return ServiceGraph{}, err
+		}
+		graph.MulticastSubscribers = append(graph.MulticastSubscribers, subscriber)
 	}
 
 	associations := make(map[mib.Key]uint16)
@@ -943,8 +1038,340 @@ func buildGEMInterworking(instance mib.Instance, instances map[mib.Key]mib.Insta
 		ServiceProfile: service, InterworkingTermination: interworkingTP, GALProfile: gal}, nil
 }
 
+func buildMulticastGEMInterworking(instance mib.Instance, instances map[mib.Key]mib.Instance,
+	gemPorts map[uint16]GEMPort, bridges map[uint16]*MACBridge,
+	mappers map[uint16]PBitMapper) (MulticastGEMInterworking, error) {
+	pointer, err := uint16Attribute(instance,
+		me.MulticastGemInterworkingTerminationPoint_GemPortNetworkCtpConnectivityPointer)
+	if err != nil {
+		return MulticastGEMInterworking{}, err
+	}
+	gem, exists := gemPorts[pointer]
+	if !exists {
+		return MulticastGEMInterworking{}, fmt.Errorf("multicast GEM IW TP %#x references missing GEM CTP %#x",
+			instance.EntityID, pointer)
+	}
+	if gem.Direction&1 == 0 {
+		return MulticastGEMInterworking{}, fmt.Errorf("multicast GEM IW TP %#x references GEM CTP %#x without downstream direction",
+			instance.EntityID, pointer)
+	}
+
+	option, err := uint8Attribute(instance,
+		me.MulticastGemInterworkingTerminationPoint_InterworkingOption)
+	if err != nil {
+		return MulticastGEMInterworking{}, err
+	}
+	service, err := uint16Attribute(instance,
+		me.MulticastGemInterworkingTerminationPoint_ServiceProfilePointer)
+	if err != nil {
+		return MulticastGEMInterworking{}, err
+	}
+	switch option {
+	case 0:
+	case 1:
+		if service != 0 {
+			if _, exists := bridges[service]; !exists {
+				return MulticastGEMInterworking{}, fmt.Errorf("multicast GEM IW TP %#x option 1 references missing bridge profile %#x",
+					instance.EntityID, service)
+			}
+		}
+	case 5:
+		if service != 0 {
+			if _, exists := mappers[service]; !exists {
+				return MulticastGEMInterworking{}, fmt.Errorf("multicast GEM IW TP %#x option 5 references missing 802.1p mapper %#x",
+					instance.EntityID, service)
+			}
+		}
+	default:
+		return MulticastGEMInterworking{}, fmt.Errorf("multicast GEM IW TP %#x uses unsupported interworking option %d",
+			instance.EntityID, option)
+	}
+
+	notUsed1, err := uint16AttributeDefault(instance,
+		me.MulticastGemInterworkingTerminationPoint_NotUsed1, 0)
+	if err != nil {
+		return MulticastGEMInterworking{}, err
+	}
+	notUsed2, err := uint8AttributeDefault(instance,
+		me.MulticastGemInterworkingTerminationPoint_NotUsed2, 0)
+	if err != nil {
+		return MulticastGEMInterworking{}, err
+	}
+	if notUsed1 != 0 || notUsed2 != 0 {
+		return MulticastGEMInterworking{}, fmt.Errorf("multicast GEM IW TP %#x has non-zero reserved attributes",
+			instance.EntityID)
+	}
+	gal, err := uint16AttributeDefault(instance,
+		me.MulticastGemInterworkingTerminationPoint_GalProfilePointer, 0)
+	if err != nil {
+		return MulticastGEMInterworking{}, err
+	}
+	if gal != 0 && !hasInstance(instances, me.GalEthernetProfileClassID, gal) {
+		return MulticastGEMInterworking{}, fmt.Errorf("multicast GEM IW TP %#x references missing GAL Ethernet profile %#x",
+			instance.EntityID, gal)
+	}
+
+	ipv4, err := multicastIPv4Ranges(instance)
+	if err != nil {
+		return MulticastGEMInterworking{}, err
+	}
+	ipv6, err := multicastIPv6Ranges(instance)
+	if err != nil {
+		return MulticastGEMInterworking{}, err
+	}
+	return MulticastGEMInterworking{
+		EntityID: instance.EntityID, GEMPort: pointer, PortID: gem.PortID,
+		TCONT: gem.TCONT, AllocID: gem.AllocID, Option: option,
+		ServiceProfile: service, GALProfile: gal, IPv4Ranges: ipv4, IPv6Ranges: ipv6,
+	}, nil
+}
+
+func multicastIPv4Ranges(instance mib.Instance) ([]MulticastIPv4Range, error) {
+	rows, err := tableAttributeDefault(instance,
+		me.MulticastGemInterworkingTerminationPoint_Ipv4MulticastAddressTable, 12)
+	if err != nil {
+		return nil, err
+	}
+	ranges := make([]MulticastIPv4Range, 0, rows.NumRows)
+	keys := make(map[uint32]struct{}, rows.NumRows)
+	for offset := 0; offset < len(rows.Rows); offset += 12 {
+		row := rows.Rows[offset : offset+12]
+		portID := binary.BigEndian.Uint16(row[0:2])
+		secondary := binary.BigEndian.Uint16(row[2:4])
+		start := binary.BigEndian.Uint32(row[4:8])
+		stop := binary.BigEndian.Uint32(row[8:12])
+		if portID > 0x0fff || start>>28 != 0xe || stop>>28 != 0xe || start > stop {
+			return nil, fmt.Errorf("multicast GEM IW TP %#x has invalid IPv4 address row %x",
+				instance.EntityID, row)
+		}
+		key := uint32(portID)<<16 | uint32(secondary)
+		if _, duplicate := keys[key]; duplicate {
+			return nil, fmt.Errorf("multicast GEM IW TP %#x repeats IPv4 address row key %d/%d",
+				instance.EntityID, portID, secondary)
+		}
+		keys[key] = struct{}{}
+		var startBytes, stopBytes [4]byte
+		binary.BigEndian.PutUint32(startBytes[:], start)
+		binary.BigEndian.PutUint32(stopBytes[:], stop)
+		ranges = append(ranges, MulticastIPv4Range{
+			GEMPortID: portID, SecondaryKey: secondary,
+			Start: netip.AddrFrom4(startBytes).String(), Stop: netip.AddrFrom4(stopBytes).String(),
+		})
+	}
+	sort.Slice(ranges, func(i, j int) bool {
+		if ranges[i].GEMPortID != ranges[j].GEMPortID {
+			return ranges[i].GEMPortID < ranges[j].GEMPortID
+		}
+		return ranges[i].SecondaryKey < ranges[j].SecondaryKey
+	})
+	return ranges, nil
+}
+
+func multicastIPv6Ranges(instance mib.Instance) ([]MulticastIPv6Range, error) {
+	rows, err := tableAttributeDefault(instance,
+		me.MulticastGemInterworkingTerminationPoint_Ipv6MulticastAddressTable, 24)
+	if err != nil {
+		return nil, err
+	}
+	ranges := make([]MulticastIPv6Range, 0, rows.NumRows)
+	keys := make(map[uint32]struct{}, rows.NumRows)
+	for offset := 0; offset < len(rows.Rows); offset += 24 {
+		row := rows.Rows[offset : offset+24]
+		portID := binary.BigEndian.Uint16(row[0:2])
+		secondary := binary.BigEndian.Uint16(row[2:4])
+		startLow := binary.BigEndian.Uint32(row[4:8])
+		stopLow := binary.BigEndian.Uint32(row[8:12])
+		if portID > 0x0fff || row[12] != 0xff || startLow > stopLow {
+			return nil, fmt.Errorf("multicast GEM IW TP %#x has invalid IPv6 address row %x",
+				instance.EntityID, row)
+		}
+		key := uint32(portID)<<16 | uint32(secondary)
+		if _, duplicate := keys[key]; duplicate {
+			return nil, fmt.Errorf("multicast GEM IW TP %#x repeats IPv6 address row key %d/%d",
+				instance.EntityID, portID, secondary)
+		}
+		keys[key] = struct{}{}
+		var start, stop [16]byte
+		copy(start[:12], row[12:24])
+		copy(stop[:12], row[12:24])
+		copy(start[12:], row[4:8])
+		copy(stop[12:], row[8:12])
+		ranges = append(ranges, MulticastIPv6Range{
+			GEMPortID: portID, SecondaryKey: secondary,
+			Start: netip.AddrFrom16(start).String(), Stop: netip.AddrFrom16(stop).String(),
+		})
+	}
+	sort.Slice(ranges, func(i, j int) bool {
+		if ranges[i].GEMPortID != ranges[j].GEMPortID {
+			return ranges[i].GEMPortID < ranges[j].GEMPortID
+		}
+		return ranges[i].SecondaryKey < ranges[j].SecondaryKey
+	})
+	return ranges, nil
+}
+
+func buildMulticastOperationsProfile(instance mib.Instance) (MulticastOperationsProfile, error) {
+	profile := MulticastOperationsProfile{EntityID: instance.EntityID}
+	var err error
+	if profile.IGMPVersion, err = uint8Attribute(instance,
+		me.MulticastOperationsProfile_IgmpVersion); err != nil {
+		return MulticastOperationsProfile{}, err
+	}
+	switch profile.IGMPVersion {
+	case 1, 2, 3, 16, 17:
+	default:
+		return MulticastOperationsProfile{}, fmt.Errorf("multicast operations profile %#x uses invalid IGMP/MLD version %d",
+			instance.EntityID, profile.IGMPVersion)
+	}
+	if profile.IGMPFunction, err = uint8Attribute(instance,
+		me.MulticastOperationsProfile_IgmpFunction); err != nil {
+		return MulticastOperationsProfile{}, err
+	}
+	if profile.IGMPFunction > 2 {
+		return MulticastOperationsProfile{}, fmt.Errorf("multicast operations profile %#x uses invalid IGMP function %d",
+			instance.EntityID, profile.IGMPFunction)
+	}
+	if profile.ImmediateLeave, err = booleanAttributeDefault(instance,
+		me.MulticastOperationsProfile_ImmediateLeave, 0); err != nil {
+		return MulticastOperationsProfile{}, err
+	}
+	if profile.UpstreamTCI, err = uint16AttributeDefault(instance,
+		me.MulticastOperationsProfile_UpstreamIgmpTci, 0); err != nil {
+		return MulticastOperationsProfile{}, err
+	}
+	if profile.UpstreamTagControl, err = uint8AttributeDefault(instance,
+		me.MulticastOperationsProfile_UpstreamIgmpTagControl, 0); err != nil {
+		return MulticastOperationsProfile{}, err
+	}
+	if profile.UpstreamTagControl > 3 ||
+		(profile.UpstreamTagControl != 0 && profile.UpstreamTCI&0x0fff == 0x0fff) {
+		return MulticastOperationsProfile{}, fmt.Errorf("multicast operations profile %#x has invalid upstream tag control/TCI %d/%#x",
+			instance.EntityID, profile.UpstreamTagControl, profile.UpstreamTCI)
+	}
+	if profile.UpstreamRate, err = uint32AttributeDefault(instance,
+		me.MulticastOperationsProfile_UpstreamIgmpRate, 0); err != nil {
+		return MulticastOperationsProfile{}, err
+	}
+
+	for name, rowSize := range map[string]int{
+		me.MulticastOperationsProfile_DynamicAccessControlListTable: 24,
+		me.MulticastOperationsProfile_StaticAccessControlListTable:  24,
+	} {
+		rows, tableErr := tableAttributeDefault(instance, name, rowSize)
+		if tableErr != nil {
+			return MulticastOperationsProfile{}, tableErr
+		}
+		if rows.NumRows != 0 {
+			return MulticastOperationsProfile{}, fmt.Errorf("multicast operations profile %#x %s requires a native ACL backend",
+				instance.EntityID, name)
+		}
+	}
+	if profile.Robustness, err = uint8AttributeDefault(instance,
+		me.MulticastOperationsProfile_Robustness, 0); err != nil {
+		return MulticastOperationsProfile{}, err
+	}
+	if profile.QuerierIPAddress, err = uint32AttributeDefault(instance,
+		me.MulticastOperationsProfile_QuerierIpAddress, 0); err != nil {
+		return MulticastOperationsProfile{}, err
+	}
+	if profile.QueryInterval, err = uint32AttributeDefault(instance,
+		me.MulticastOperationsProfile_QueryInterval, 0); err != nil {
+		return MulticastOperationsProfile{}, err
+	}
+	if profile.QueryMaxResponseTime, err = uint32AttributeDefault(instance,
+		me.MulticastOperationsProfile_QueryMaxResponseTime, 0); err != nil {
+		return MulticastOperationsProfile{}, err
+	}
+	if profile.LastMemberQueryInterval, err = uint32AttributeDefault(instance,
+		me.MulticastOperationsProfile_LastMemberQueryInterval, 0); err != nil {
+		return MulticastOperationsProfile{}, err
+	}
+	if profile.UnauthorizedJoinBehaviour, err = uint8AttributeDefault(instance,
+		me.MulticastOperationsProfile_UnauthorizedJoinRequestBehaviour, 0); err != nil {
+		return MulticastOperationsProfile{}, err
+	}
+	if profile.UnauthorizedJoinBehaviour > 1 {
+		return MulticastOperationsProfile{}, fmt.Errorf("multicast operations profile %#x has invalid unauthorized-join behaviour %d",
+			instance.EntityID, profile.UnauthorizedJoinBehaviour)
+	}
+	downstream, err := bytesAttributeDefault(instance,
+		me.MulticastOperationsProfile_DownstreamIgmpAndMulticastTci, 3, []byte{0, 0, 0})
+	if err != nil {
+		return MulticastOperationsProfile{}, err
+	}
+	profile.DownstreamTagControl = downstream[0]
+	profile.DownstreamTCI = binary.BigEndian.Uint16(downstream[1:3])
+	if profile.DownstreamTagControl > 7 ||
+		(profile.DownstreamTagControl >= 2 && profile.DownstreamTCI&0x0fff == 0x0fff) {
+		return MulticastOperationsProfile{}, fmt.Errorf("multicast operations profile %#x has invalid downstream tag control/TCI %d/%#x",
+			instance.EntityID, profile.DownstreamTagControl, profile.DownstreamTCI)
+	}
+	return profile, nil
+}
+
+func buildMulticastSubscriber(instance mib.Instance, bridgePorts map[uint16]MACBridgePort,
+	mappers map[uint16]PBitMapper, profiles map[uint16]MulticastOperationsProfile) (MulticastSubscriberConfigInfo, error) {
+	subscriber := MulticastSubscriberConfigInfo{EntityID: instance.EntityID}
+	var err error
+	if subscriber.METype, err = uint8Attribute(instance,
+		me.MulticastSubscriberConfigInfo_MeType); err != nil {
+		return MulticastSubscriberConfigInfo{}, err
+	}
+	switch subscriber.METype {
+	case 0:
+		port, exists := bridgePorts[instance.EntityID]
+		if !exists || port.TPType != 1 {
+			return MulticastSubscriberConfigInfo{}, fmt.Errorf("multicast subscriber %#x does not identify an Ethernet UNI bridge port",
+				instance.EntityID)
+		}
+	case 1:
+		if _, exists := mappers[instance.EntityID]; !exists {
+			return MulticastSubscriberConfigInfo{}, fmt.Errorf("multicast subscriber %#x references missing 802.1p mapper",
+				instance.EntityID)
+		}
+	default:
+		return MulticastSubscriberConfigInfo{}, fmt.Errorf("multicast subscriber %#x uses invalid ME type %d",
+			instance.EntityID, subscriber.METype)
+	}
+	if subscriber.Profile, err = uint16Attribute(instance,
+		me.MulticastSubscriberConfigInfo_MulticastOperationsProfilePointer); err != nil {
+		return MulticastSubscriberConfigInfo{}, err
+	}
+	if _, exists := profiles[subscriber.Profile]; !exists {
+		return MulticastSubscriberConfigInfo{}, fmt.Errorf("multicast subscriber %#x references missing operations profile %#x",
+			instance.EntityID, subscriber.Profile)
+	}
+	if subscriber.MaxSimultaneousGroups, err = uint16AttributeDefault(instance,
+		me.MulticastSubscriberConfigInfo_MaxSimultaneousGroups, 0); err != nil {
+		return MulticastSubscriberConfigInfo{}, err
+	}
+	if subscriber.MaxMulticastBandwidth, err = uint32AttributeDefault(instance,
+		me.MulticastSubscriberConfigInfo_MaxMulticastBandwidth, 0); err != nil {
+		return MulticastSubscriberConfigInfo{}, err
+	}
+	if subscriber.BandwidthEnforcement, err = booleanAttributeDefault(instance,
+		me.MulticastSubscriberConfigInfo_BandwidthEnforcement, 0); err != nil {
+		return MulticastSubscriberConfigInfo{}, err
+	}
+	for name, rowSize := range map[string]int{
+		me.MulticastSubscriberConfigInfo_MulticastServicePackageTable: 20,
+		me.MulticastSubscriberConfigInfo_AllowedPreviewGroupsTable:    22,
+	} {
+		rows, tableErr := tableAttributeDefault(instance, name, rowSize)
+		if tableErr != nil {
+			return MulticastSubscriberConfigInfo{}, tableErr
+		}
+		if rows.NumRows != 0 {
+			return MulticastSubscriberConfigInfo{}, fmt.Errorf("multicast subscriber %#x %s requires a native service-package backend",
+				instance.EntityID, name)
+		}
+	}
+	return subscriber, nil
+}
+
 func validateBridgePortTP(entityID, bridgeID uint16, tpType uint8, pointer uint16,
-	instances map[mib.Key]mib.Instance, interworking map[uint16]GEMInterworking) error {
+	instances map[mib.Key]mib.Instance, interworking map[uint16]GEMInterworking,
+	multicast map[uint16]MulticastGEMInterworking) error {
 	var classID me.ClassID
 	switch tpType {
 	case 1:
@@ -953,6 +1380,8 @@ func validateBridgePortTP(entityID, bridgeID uint16, tpType uint8, pointer uint1
 		classID = me.Ieee8021PMapperServiceProfileClassID
 	case 5:
 		classID = me.GemInterworkingTerminationPointClassID
+	case 6:
+		classID = me.MulticastGemInterworkingTerminationPointClassID
 	default:
 		return fmt.Errorf("MAC bridge port %#x uses unsupported TP type %d", entityID, tpType)
 	}
@@ -965,6 +1394,12 @@ func validateBridgePortTP(entityID, bridgeID uint16, tpType uint8, pointer uint1
 		if iw.Option != 1 || iw.ServiceProfile != bridgeID {
 			return fmt.Errorf("MAC bridge port %#x references GEM IW TP %#x option/profile %d/%#x, want 1/%#x",
 				entityID, pointer, iw.Option, iw.ServiceProfile, bridgeID)
+		}
+	} else if tpType == 6 {
+		iw := multicast[pointer]
+		if iw.Option == 1 && iw.ServiceProfile != 0 && iw.ServiceProfile != bridgeID {
+			return fmt.Errorf("MAC bridge port %#x references multicast GEM IW TP %#x bridge profile %#x, want %#x",
+				entityID, pointer, iw.ServiceProfile, bridgeID)
 		}
 	} else if tpType == 3 {
 		mapper := instances[mib.Key{ClassID: me.Ieee8021PMapperServiceProfileClassID, EntityID: pointer}]
@@ -1240,6 +1675,15 @@ func sortServiceGraph(graph *ServiceGraph) {
 	sort.Slice(graph.TrafficDescs, func(i, j int) bool { return graph.TrafficDescs[i].EntityID < graph.TrafficDescs[j].EntityID })
 	sort.Slice(graph.GEMPorts, func(i, j int) bool { return graph.GEMPorts[i].EntityID < graph.GEMPorts[j].EntityID })
 	sort.Slice(graph.Interworking, func(i, j int) bool { return graph.Interworking[i].EntityID < graph.Interworking[j].EntityID })
+	sort.Slice(graph.MulticastInterworking, func(i, j int) bool {
+		return graph.MulticastInterworking[i].EntityID < graph.MulticastInterworking[j].EntityID
+	})
+	sort.Slice(graph.MulticastProfiles, func(i, j int) bool {
+		return graph.MulticastProfiles[i].EntityID < graph.MulticastProfiles[j].EntityID
+	})
+	sort.Slice(graph.MulticastSubscribers, func(i, j int) bool {
+		return graph.MulticastSubscribers[i].EntityID < graph.MulticastSubscribers[j].EntityID
+	})
 	sort.Slice(graph.Mappers, func(i, j int) bool { return graph.Mappers[i].EntityID < graph.Mappers[j].EntityID })
 	sort.Slice(graph.Bridges, func(i, j int) bool { return graph.Bridges[i].EntityID < graph.Bridges[j].EntityID })
 	sort.Slice(graph.VLANFilters, func(i, j int) bool { return graph.VLANFilters[i].EntityID < graph.VLANFilters[j].EntityID })
@@ -1323,6 +1767,16 @@ func bytesAttribute(instance mib.Instance, name string, size int) ([]byte, error
 			instance.ClassID, instance.EntityID, name, value, len(typed), size)
 	}
 	return append([]byte(nil), typed...), nil
+}
+
+func bytesAttributeDefault(instance mib.Instance, name string, size int, fallback []byte) ([]byte, error) {
+	if _, present := instance.Attributes[name]; !present {
+		if len(fallback) != size {
+			return nil, fmt.Errorf("invalid default length %d for %s, want %d", len(fallback), name, size)
+		}
+		return append([]byte(nil), fallback...), nil
+	}
+	return bytesAttribute(instance, name, size)
 }
 
 func tableAttributeDefault(instance mib.Instance, name string, rowSize int) (me.TableRows, error) {

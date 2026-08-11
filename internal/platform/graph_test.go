@@ -3,6 +3,7 @@
 package platform
 
 import (
+	"encoding/binary"
 	"reflect"
 	"strings"
 	"testing"
@@ -135,6 +136,150 @@ func TestBuildServiceGraphAllowsMultipleBridgeProfiles(t *testing.T) {
 	if len(graph.UNIs) != 2 || graph.UNIs[1].EntityID != secondUNI ||
 		len(graph.GEMPorts) != 3 || len(graph.Interworking) != 3 {
 		t.Fatalf("multi-profile service graph = %#v", graph)
+	}
+}
+
+func TestBuildServiceGraphResolvesMulticastGEMAndSubscriber(t *testing.T) {
+	const (
+		multicastIW      = 0x0302
+		multicastPort    = 0x0503
+		multicastProfile = 0x0700
+	)
+	snapshot := validServiceSnapshot()
+	ipv4 := make([]byte, 12)
+	binary.BigEndian.PutUint16(ipv4[0:2], 202)
+	binary.BigEndian.PutUint16(ipv4[2:4], 7)
+	binary.BigEndian.PutUint32(ipv4[4:8], 0xe1000000)
+	binary.BigEndian.PutUint32(ipv4[8:12], 0xe10000ff)
+	ipv6 := make([]byte, 24)
+	binary.BigEndian.PutUint16(ipv6[0:2], 203)
+	binary.BigEndian.PutUint16(ipv6[2:4], 8)
+	binary.BigEndian.PutUint32(ipv6[4:8], 0x100)
+	binary.BigEndian.PutUint32(ipv6[8:12], 0x1ff)
+	ipv6[12] = 0xff
+	ipv6[13] = 0x3e
+	snapshot = append(snapshot,
+		mib.Instance{
+			Key: mib.Key{ClassID: me.MulticastGemInterworkingTerminationPointClassID,
+				EntityID: multicastIW},
+			Attributes: me.AttributeValueMap{
+				me.MulticastGemInterworkingTerminationPoint_GemPortNetworkCtpConnectivityPointer: uint16(testBridgeGEM),
+				me.MulticastGemInterworkingTerminationPoint_InterworkingOption:                   uint8(1),
+				me.MulticastGemInterworkingTerminationPoint_ServiceProfilePointer:                uint16(testBridge),
+				me.MulticastGemInterworkingTerminationPoint_NotUsed1:                             uint16(0),
+				me.MulticastGemInterworkingTerminationPoint_GalProfilePointer:                    uint16(testGAL),
+				me.MulticastGemInterworkingTerminationPoint_NotUsed2:                             uint8(0),
+				me.MulticastGemInterworkingTerminationPoint_Ipv4MulticastAddressTable: me.TableRows{
+					NumRows: 1, Rows: ipv4,
+				},
+				me.MulticastGemInterworkingTerminationPoint_Ipv6MulticastAddressTable: me.TableRows{
+					NumRows: 1, Rows: ipv6,
+				},
+			},
+		},
+		bridgePortInstance(multicastPort, 4, 6, multicastIW),
+		mib.Instance{
+			Key: mib.Key{ClassID: me.MulticastOperationsProfileClassID, EntityID: multicastProfile},
+			Attributes: me.AttributeValueMap{
+				me.MulticastOperationsProfile_IgmpVersion:                      uint8(3),
+				me.MulticastOperationsProfile_IgmpFunction:                     uint8(0),
+				me.MulticastOperationsProfile_ImmediateLeave:                   uint8(1),
+				me.MulticastOperationsProfile_UpstreamIgmpTci:                  uint16(0),
+				me.MulticastOperationsProfile_UpstreamIgmpTagControl:           uint8(0),
+				me.MulticastOperationsProfile_UpstreamIgmpRate:                 uint32(0),
+				me.MulticastOperationsProfile_DynamicAccessControlListTable:    me.TableRows{},
+				me.MulticastOperationsProfile_StaticAccessControlListTable:     me.TableRows{},
+				me.MulticastOperationsProfile_DownstreamIgmpAndMulticastTci:    []byte{0, 0, 0},
+				me.MulticastOperationsProfile_UnauthorizedJoinRequestBehaviour: uint8(0),
+			},
+		},
+		mib.Instance{
+			Key: mib.Key{ClassID: me.MulticastSubscriberConfigInfoClassID, EntityID: uniBridgePort},
+			Attributes: me.AttributeValueMap{
+				me.MulticastSubscriberConfigInfo_MeType:                            uint8(0),
+				me.MulticastSubscriberConfigInfo_MulticastOperationsProfilePointer: uint16(multicastProfile),
+				me.MulticastSubscriberConfigInfo_MaxSimultaneousGroups:             uint16(64),
+				me.MulticastSubscriberConfigInfo_MaxMulticastBandwidth:             uint32(0),
+				me.MulticastSubscriberConfigInfo_BandwidthEnforcement:              uint8(0),
+				me.MulticastSubscriberConfigInfo_MulticastServicePackageTable:      me.TableRows{},
+				me.MulticastSubscriberConfigInfo_AllowedPreviewGroupsTable:         me.TableRows{},
+			},
+		},
+	)
+
+	graph, err := BuildServiceGraph(snapshot)
+	if err != nil {
+		t.Fatalf("BuildServiceGraph() error = %v", err)
+	}
+	if len(graph.MulticastInterworking) != 1 || len(graph.MulticastProfiles) != 1 ||
+		len(graph.MulticastSubscribers) != 1 || len(graph.Bridges[0].Ports) != 4 {
+		t.Fatalf("multicast service graph = %#v", graph)
+	}
+	iw := graph.MulticastInterworking[0]
+	if iw.EntityID != multicastIW || iw.GEMPort != testBridgeGEM || iw.PortID != 201 ||
+		iw.AllocID != 100 || len(iw.IPv4Ranges) != 1 || len(iw.IPv6Ranges) != 1 ||
+		iw.IPv4Ranges[0].GEMPortID != 202 || iw.IPv4Ranges[0].Start != "225.0.0.0" ||
+		iw.IPv4Ranges[0].Stop != "225.0.0.255" || iw.IPv6Ranges[0].GEMPortID != 203 ||
+		iw.IPv6Ranges[0].Start != "ff3e::100" || iw.IPv6Ranges[0].Stop != "ff3e::1ff" {
+		t.Fatalf("multicast GEM IW = %#v", iw)
+	}
+	if graph.MulticastProfiles[0].IGMPVersion != 3 ||
+		graph.MulticastProfiles[0].ImmediateLeave != 1 ||
+		graph.MulticastSubscribers[0].EntityID != uniBridgePort ||
+		graph.MulticastSubscribers[0].MaxSimultaneousGroups != 64 {
+		t.Fatalf("multicast policy = %#v/%#v", graph.MulticastProfiles, graph.MulticastSubscribers)
+	}
+}
+
+func TestBuildServiceGraphRejectsUnrepresentableMulticastReferences(t *testing.T) {
+	const multicastIW = 0x0302
+	base := func() []mib.Instance {
+		snapshot := validServiceSnapshot()
+		snapshot = append(snapshot, mib.Instance{
+			Key: mib.Key{ClassID: me.MulticastGemInterworkingTerminationPointClassID,
+				EntityID: multicastIW},
+			Attributes: me.AttributeValueMap{
+				me.MulticastGemInterworkingTerminationPoint_GemPortNetworkCtpConnectivityPointer: uint16(testBridgeGEM),
+				me.MulticastGemInterworkingTerminationPoint_InterworkingOption:                   uint8(1),
+				me.MulticastGemInterworkingTerminationPoint_ServiceProfilePointer:                uint16(testBridge),
+				me.MulticastGemInterworkingTerminationPoint_NotUsed1:                             uint16(0),
+				me.MulticastGemInterworkingTerminationPoint_GalProfilePointer:                    uint16(0),
+				me.MulticastGemInterworkingTerminationPoint_NotUsed2:                             uint8(0),
+			},
+		})
+		return snapshot
+	}
+	tests := []struct {
+		name string
+		edit func([]mib.Instance) []mib.Instance
+		want string
+	}{
+		{
+			name: "upstream-only connectivity",
+			edit: func(snapshot []mib.Instance) []mib.Instance {
+				findInstance(snapshot, me.GemPortNetworkCtpClassID, testBridgeGEM).
+					Attributes[me.GemPortNetworkCtp_Direction] = uint8(2)
+				return snapshot
+			},
+			want: "without downstream direction",
+		},
+		{
+			name: "type 6 bridge mismatch",
+			edit: func(snapshot []mib.Instance) []mib.Instance {
+				findInstance(snapshot, me.MulticastGemInterworkingTerminationPointClassID, multicastIW).
+					Attributes[me.MulticastGemInterworkingTerminationPoint_ServiceProfilePointer] = uint16(0x7777)
+				return append(snapshot, bridgePortInstance(0x0503, 4, 6, multicastIW))
+			},
+			want: "missing bridge profile",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := BuildServiceGraph(test.edit(base()))
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("BuildServiceGraph() error = %v, want %q", err, test.want)
+			}
+		})
 	}
 }
 

@@ -17,6 +17,8 @@ import (
 const (
 	extendedVLANRowSize         = 16
 	enhancedExtendedVLANRowSize = 28
+	multicastIPv4RowSize        = 12
+	multicastIPv6RowSize        = 24
 )
 
 var extendedVLANDefaultRows = []byte{
@@ -26,15 +28,28 @@ var extendedVLANDefaultRows = []byte{
 }
 
 func initializeCreatedInstance(instance *Instance, extendedVLANTableSize uint16) {
-	if instance.ClassID != me.ExtendedVlanTaggingOperationConfigurationDataClassID {
-		return
+	switch instance.ClassID {
+	case me.ExtendedVlanTaggingOperationConfigurationDataClassID:
+		instance.Attributes[me.ExtendedVlanTaggingOperationConfigurationData_ReceivedFrameVlanTaggingOperationTableMaxSize] = extendedVLANTableSize
+		instance.Attributes[me.ExtendedVlanTaggingOperationConfigurationData_ReceivedFrameVlanTaggingOperationTable] = me.TableRows{
+			NumRows: 3,
+			Rows:    append([]byte(nil), extendedVLANDefaultRows...),
+		}
+		instance.Attributes[me.ExtendedVlanTaggingOperationConfigurationData_EnhancedReceivedFrameClassificationAndProcessingTable] = me.TableRows{}
+	case me.MulticastGemInterworkingTerminationPointClassID:
+		instance.Attributes[me.MulticastGemInterworkingTerminationPoint_Ipv4MulticastAddressTable] = me.TableRows{}
+		instance.Attributes[me.MulticastGemInterworkingTerminationPoint_Ipv6MulticastAddressTable] = me.TableRows{}
+	case me.MulticastOperationsProfileClassID:
+		instance.Attributes[me.MulticastOperationsProfile_DynamicAccessControlListTable] = me.TableRows{}
+		instance.Attributes[me.MulticastOperationsProfile_StaticAccessControlListTable] = me.TableRows{}
+		instance.Attributes[me.MulticastOperationsProfile_LostGroupsListTable] = me.TableRows{}
+	case me.MulticastSubscriberConfigInfoClassID:
+		instance.Attributes[me.MulticastSubscriberConfigInfo_MulticastServicePackageTable] = me.TableRows{}
+		instance.Attributes[me.MulticastSubscriberConfigInfo_AllowedPreviewGroupsTable] = me.TableRows{}
+	case me.MulticastSubscriberMonitorClassID:
+		instance.Attributes[me.MulticastSubscriberMonitor_Ipv4ActiveGroupListTable] = me.TableRows{}
+		instance.Attributes[me.MulticastSubscriberMonitor_Ipv6ActiveGroupListTable] = me.TableRows{}
 	}
-	instance.Attributes[me.ExtendedVlanTaggingOperationConfigurationData_ReceivedFrameVlanTaggingOperationTableMaxSize] = extendedVLANTableSize
-	instance.Attributes[me.ExtendedVlanTaggingOperationConfigurationData_ReceivedFrameVlanTaggingOperationTable] = me.TableRows{
-		NumRows: 3,
-		Rows:    append([]byte(nil), extendedVLANDefaultRows...),
-	}
-	instance.Attributes[me.ExtendedVlanTaggingOperationConfigurationData_EnhancedReceivedFrameClassificationAndProcessingTable] = me.TableRows{}
 }
 
 // SetTable applies one complete extended-message SetTable request. The
@@ -107,6 +122,9 @@ func (s *Store) SetTable(key Key, mask uint16, attributes me.AttributeValueMap) 
 }
 
 func (s *Store) applyTableRows(classID me.ClassID, name string, existing, updates me.TableRows) (me.TableRows, error) {
+	if classID == me.MulticastGemInterworkingTerminationPointClassID {
+		return applyMulticastAddressRows(name, existing, updates)
+	}
 	if classID != me.ExtendedVlanTaggingOperationConfigurationDataClassID {
 		return me.TableRows{}, &ResultError{Result: me.NotSupported,
 			Cause: fmt.Errorf("SetTable policy for class %#x attribute %s is not implemented", classID, name)}
@@ -143,6 +161,51 @@ func (s *Store) applyTableRows(classID me.ClassID, name string, existing, update
 		return me.TableRows{}, &ResultError{Result: me.NotSupported,
 			Cause: fmt.Errorf("SetTable policy for class %#x attribute %s is not implemented", classID, name)}
 	}
+}
+
+func applyMulticastAddressRows(name string, existing, updates me.TableRows) (me.TableRows, error) {
+	rowSize := 0
+	switch name {
+	case me.MulticastGemInterworkingTerminationPoint_Ipv4MulticastAddressTable:
+		rowSize = multicastIPv4RowSize
+	case me.MulticastGemInterworkingTerminationPoint_Ipv6MulticastAddressTable:
+		rowSize = multicastIPv6RowSize
+	default:
+		return me.TableRows{}, &ResultError{Result: me.NotSupported,
+			Cause: fmt.Errorf("SetTable policy for class %#x attribute %s is not implemented",
+				me.MulticastGemInterworkingTerminationPointClassID, name)}
+	}
+
+	for offset := 0; offset < len(updates.Rows); offset += rowSize {
+		row := updates.Rows[offset : offset+rowSize]
+		if allBytes(row[4:], 0) {
+			continue
+		}
+		portID := binary.BigEndian.Uint16(row[0:2])
+		if portID > 0x0fff {
+			return me.TableRows{}, &ResultError{Result: me.ParameterError,
+				Cause: fmt.Errorf("multicast address row has out-of-range GEM Port-ID %d", portID)}
+		}
+		if rowSize == multicastIPv4RowSize {
+			start := binary.BigEndian.Uint32(row[4:8])
+			stop := binary.BigEndian.Uint32(row[8:12])
+			if start>>28 != 0xe || stop>>28 != 0xe || start > stop {
+				return me.TableRows{}, &ResultError{Result: me.ParameterError,
+					Cause: fmt.Errorf("invalid IPv4 multicast range %08x..%08x", start, stop)}
+			}
+		} else {
+			start := binary.BigEndian.Uint32(row[4:8])
+			stop := binary.BigEndian.Uint32(row[8:12])
+			if row[12] != 0xff || start > stop {
+				return me.TableRows{}, &ResultError{Result: me.ParameterError,
+					Cause: fmt.Errorf("invalid IPv6 multicast range in row %x", row)}
+			}
+		}
+	}
+
+	rows := applyKeyedRows(existing.Rows, updates.Rows, rowSize, 4,
+		func(row []byte) bool { return allBytes(row[4:], 0) })
+	return me.TableRows{NumRows: len(rows) / rowSize, Rows: rows}, nil
 }
 
 func tableRows(value interface{}, rowSize int) (me.TableRows, error) {

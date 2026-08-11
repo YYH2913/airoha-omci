@@ -15,6 +15,7 @@ and extended messages.  A successful build or reaching GPON O5 is not enough.
 | Traffic | 8 advertised T-CONTs, scheduler/queue graph, GEM CTP/IW validation and hardware apply | upstream SP/WRR/TRTCM implemented; physical verification pending |
 | Performance | common 15-minute engine, GEM CTP and Ethernet UNI/frame PM | class 341, 24, 296, 321 and 322 counters, threshold data 1/2 and TCA implemented; physical verification pending |
 | Ethernet service | resolved bridge, mapper, VLAN and extended VLAN graph | UNI, bridge-port, mapper and GEM-IW associations implemented; advanced treatment pending |
+| Multicast | multicast GEM-IW, IGMP/MLD policy, subscriber limits and live groups | class 281 address tables, type 6 bridge ports and transparent snooping implemented; ACL, proxy, policing and class 311 monitoring pending |
 | Lifecycle | reboot, time sync, software download/activate/commit | implemented; OLT verification pending |
 | Platform | multi-T-CONT/GEM Airoha ABI and transactional Linux backend | GEM and 16-channel GPON QDMA QoS, UNI VLAN, bridge FDB limit and multi-profile MAC bridge implemented; Ethernet offload pending |
 | OpenWrt | package, procd, UCI, rpcd/ubus and LuCI | optical configuration, live service status and automatic/manual service handover implemented |
@@ -136,6 +137,23 @@ therefore share one physical PON without merging learning domains. FDB
 learning, unknown-unicast flooding, UNI isolation and the G.988 VLAN filter
 `j` action are enforced. Candidate failure restores GEM, TC, VLAN and bridge
 state from the last committed graph.
+
+Multicast GEM interworking termination points support the class 281 IPv4 and
+IPv6 address tables, including keyed replacement and deletion. MAC bridge port
+TP type 6 joins a multicast GEM-IW to the same profile-specific ANI endpoint
+used by unicast service. Address-table GEM Port-IDs that have no explicit GEM
+CTP are programmed as downstream-only flows, and their receive marks are
+dispatched to that ANI endpoint. The OpenWrt backend enables Linux bridge
+multicast snooping and maps class 309 immediate leave plus the class 310
+per-subscriber group limit to bridge-port controls.
+
+This is transparent snooping, not a complete multicast OMCI implementation.
+Class 309 dynamic/static ACL tables, IGMP/MLD SPR or proxy operation,
+multicast VLAN tag control and bandwidth policing are rejected when requested
+because no equivalent backend exists yet. Class 310 service-package and
+preview tables and class 311 live active-group monitoring also remain to be
+implemented. Real baseline and extended OLT multicast traces are required
+before this path is deployable.
 
 XG2010G defaults keep `lan1` through `lan4` in the user's `br-lan` and expose
 `pon` as a routed WAN. Transparent PPTP-UNI service therefore requires the

@@ -41,12 +41,12 @@ an OLT may retransmit a request.
 ## Other helpers
 
 The apply helper receives a complete, resolved candidate service graph on
-stdin and must apply it transactionally. ABI version 2 has this top-level
+stdin and must apply it transactionally. ABI version 3 has this top-level
 shape:
 
 ```json
 {
-  "version": 2,
+  "version": 3,
   "operation": "set-table",
   "mib_data_sync": 17,
   "service_graph": {
@@ -72,6 +72,9 @@ shape:
     }],
     "gem_ports": [],
     "gem_interworking": [],
+    "multicast_gem_interworking": [],
+    "multicast_operations_profiles": [],
+    "multicast_subscribers": [],
     "pbit_mappers": [],
     "bridges": [],
     "vlan_filters": [],
