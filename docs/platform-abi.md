@@ -169,6 +169,17 @@ for diagnostics, while `tagged_action` contains the G.988 action letter
 `tci`, and `untagged_action` is `a` or `c`. Reserved forward-operation values
 are rejected before the platform helper is called.
 
+Extended VLAN entries retain the G.988 treatment selectors in this JSON ABI.
+The XG2010G platform compiler resolves copies from exact filter values and
+represents a same-tag copy with an omitted field in `tc vlan modify`. Its
+kernel/iproute2 extension treats omitted VID, protocol, priority and DEI fields
+as preserve operations, while PUSH retains the upstream required-VID and
+default-value behavior. Single-tag downstream modes 3/6 and 4/7 use this
+partial MODIFY path to pass PCP or VID and DEI through unchanged. A wildcard
+copy into a newly added tag, a non-constant DSCP-to-P-bit treatment, or a
+double-tag/non-replacement partial inverse is rejected before the transaction
+starts because the current Linux backend cannot reproduce it packet by packet.
+
 MAC bridge profiles carry their learning, spanning-tree, port-bridging,
 unknown-MAC, timer and learning-depth policy. Each bridge port carries its
 termination type and pointer, priority, path cost, spanning-tree state,

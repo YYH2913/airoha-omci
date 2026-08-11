@@ -14,7 +14,7 @@ and extended messages.  A successful build or reaching GPON O5 is not enough.
 | Equipment | ONU-G, ONU2-G, ANI-G, four speed-specific Ethernet UNIs, software images | in progress |
 | Traffic | 8 advertised T-CONTs, scheduler/queue graph, GEM CTP/IW validation and hardware apply | upstream SP/WRR/TRTCM implemented; physical verification pending |
 | Performance | common 15-minute engine, GEM CTP and Ethernet UNI/frame PM | class 341, 24, 296, 321 and 322 counters, threshold data 1/2 and TCA implemented; physical verification pending |
-| Ethernet service | resolved bridge, mapper, VLAN and extended VLAN graph | UNI, bridge-port, mapper and GEM-IW associations implemented; advanced treatment pending |
+| Ethernet service | resolved bridge, mapper, VLAN and extended VLAN graph | UNI, bridge-port, mapper, GEM-IW and static/copy tag treatment implemented; packet-dependent treatment pending |
 | Multicast | multicast GEM-IW, IGMP/MLD policy, subscriber limits and live groups | class 281 and class 309/310 tables, ACL/preview enforcement, native report/query interception, proxy querier and sampled class 311 monitoring implemented; physical OLT verification pending |
 | Lifecycle | reboot, time sync, software download/activate/commit | implemented; OLT verification pending |
 | Platform | multi-T-CONT/GEM Airoha ABI and transactional Linux backend | GEM and 16-channel GPON QDMA QoS, UNI VLAN, bridge FDB limit and multi-profile MAC bridge implemented; Ethernet offload pending |
@@ -206,9 +206,16 @@ backend and are rejected. Colour-aware marking/remarking and RFC 4115 meter
 coupling are also rejected rather than silently approximated. These limits and
 real OLT/optical-module testing remain explicit deployment blockers.
 
-The remaining Ethernet blockers are generic extended-VLAN copy and some inverse
-behavior, per-port learning-depth, and native Airoha offload. DEI matching is
-implemented through a classic-BPF gate before the existing VLAN action chain;
-multicast downstream DEI treatment is handled by the native VLAN action
-extension above. Transactional crash recovery and physical baseline/extended
-OLT interoperability also remain completion gates.
+Extended-VLAN treatment now supports fixed PCP/VID, exact-filter copies,
+same-tag PCP/VID/TPID/DEI preservation, constant DSCP mappings and explicit
+DEI 0/1. Single-tag downstream modes 3/6 and 4/7 invert only VID or PCP and
+preserve the other TCI fields. The Airoha kernel/iproute2 VLAN action extension
+allows each MODIFY field to be omitted; partial MODIFY is deliberately kept in
+software because the flow-offload ABI has no field mask. DEI matching uses a
+classic-BPF gate before the existing VLAN action chain.
+
+The remaining Ethernet blockers are packet-dependent DSCP mapping, wildcard
+copies into a newly added tag, double-tag and non-replacement partial inverse,
+per-port learning-depth, and native Airoha offload. These unsupported forms are
+rejected before platform state changes. Transactional crash recovery and
+physical baseline/extended OLT interoperability also remain completion gates.
