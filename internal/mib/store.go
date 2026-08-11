@@ -3,6 +3,7 @@
 package mib
 
 import (
+	"errors"
 	"fmt"
 	"reflect"
 	"sort"
@@ -74,6 +75,14 @@ type ApplyFunc func(Change) error
 
 func (f ApplyFunc) Apply(change Change) error {
 	return f(change)
+}
+
+// CommandTransaction gates a command-driven MIB update on a second platform
+// resource. Commit runs only after the candidate MIB has been persisted;
+// Abort must restore any state created while preparing the transaction.
+type CommandTransaction interface {
+	Commit() error
+	Abort() error
 }
 
 type ResultError struct {
@@ -507,6 +516,24 @@ func (s *Store) UpdateAutonomousBatch(updates map[Key]me.AttributeValueMap) erro
 // for the command. OperationCommand lets a transactional applier persist the
 // MIB without reapplying an unchanged service graph.
 func (s *Store) UpdateByCommand(updates map[Key]me.AttributeValueMap) error {
+	return s.updateByCommand(updates, nil)
+}
+
+// UpdateByCommandTransactional couples a command-driven MIB mutation to a
+// prepared platform transaction. If either side fails, the store retains its
+// original state and best-effort restores both the external transaction and
+// the previously persisted MIB snapshot.
+func (s *Store) UpdateByCommandTransactional(updates map[Key]me.AttributeValueMap,
+	transaction CommandTransaction) error {
+	if transaction == nil {
+		return &ResultError{Result: me.ProcessingError,
+			Cause: fmt.Errorf("command transaction is nil")}
+	}
+	return s.updateByCommand(updates, transaction)
+}
+
+func (s *Store) updateByCommand(updates map[Key]me.AttributeValueMap,
+	transaction CommandTransaction) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -515,14 +542,14 @@ func (s *Store) UpdateByCommand(updates map[Key]me.AttributeValueMap) error {
 	for key, attributes := range updates {
 		current, exists := s.current[key]
 		if !exists {
-			return s.unknownKeyError(key)
+			return abortCommandTransaction(transaction, s.unknownKeyError(key))
 		}
 		entity, result := loadDefinition(key.ClassID, key.EntityID, current.Attributes)
 		if result != nil {
-			return result
+			return abortCommandTransaction(transaction, result)
 		}
 		if err := s.validateSupportedAttributes(entity, attributes); err != nil {
-			return err
+			return abortCommandTransaction(transaction, err)
 		}
 		definitions := entity.GetAttributeDefinitions()
 		var failed uint16
@@ -543,11 +570,11 @@ func (s *Store) UpdateByCommand(updates map[Key]me.AttributeValueMap) error {
 			}
 		}
 		if failed != 0 || unsupported != 0 {
-			return &ResultError{
+			return abortCommandTransaction(transaction, &ResultError{
 				Result:          me.AttributeFailure,
 				FailedMask:      failed,
 				UnsupportedMask: unsupported,
-			}
+			})
 		}
 
 		next := cloneInstance(current)
@@ -556,7 +583,7 @@ func (s *Store) UpdateByCommand(updates map[Key]me.AttributeValueMap) error {
 		}
 		normalized, err := normalize(next)
 		if err != nil {
-			return err
+			return abortCommandTransaction(transaction, err)
 		}
 		if !reflect.DeepEqual(current.Attributes, normalized.Attributes) {
 			proposed[key] = normalized
@@ -564,12 +591,72 @@ func (s *Store) UpdateByCommand(updates map[Key]me.AttributeValueMap) error {
 		}
 	}
 	if !changed {
+		if transaction != nil {
+			if err := transaction.Commit(); err != nil {
+				return commandTransactionFailure(transaction, nil,
+					fmt.Errorf("commit platform transaction: %w", err))
+			}
+		}
 		return nil
 	}
 
 	dataSync := s.nextDataSyncLocked()
 	setDataSync(proposed, dataSync)
-	return s.commitLocked(OperationCommand, nil, nil, proposed, dataSync)
+	if transaction == nil {
+		return s.commitLocked(OperationCommand, nil, nil, proposed, dataSync)
+	}
+	change := Change{
+		Operation: OperationCommand, Snapshot: snapshotInstances(proposed), MIBDataSync: dataSync,
+	}
+	if s.applier != nil {
+		if err := s.applier.Apply(change); err != nil {
+			return commandTransactionFailure(transaction, nil,
+				fmt.Errorf("apply platform state: %w", err))
+		}
+	}
+	if err := transaction.Commit(); err != nil {
+		abortErr := transaction.Abort()
+		var rollbackErr error
+		if s.applier != nil {
+			rollback := Change{
+				Operation: OperationCommand, Snapshot: snapshotInstances(s.current),
+				MIBDataSync: s.dataSync,
+			}
+			if err := s.applier.Apply(rollback); err != nil {
+				rollbackErr = fmt.Errorf("restore persisted MIB state: %w", err)
+			}
+		}
+		return commandTransactionError(fmt.Errorf("commit platform transaction: %w", err),
+			abortErr, rollbackErr)
+	}
+	s.current = proposed
+	s.dataSync = dataSync
+	return nil
+}
+
+func abortCommandTransaction(transaction CommandTransaction, cause error) error {
+	if transaction == nil {
+		return cause
+	}
+	if err := transaction.Abort(); err != nil {
+		return errors.Join(cause, fmt.Errorf("abort platform transaction: %w", err))
+	}
+	return cause
+}
+
+func commandTransactionFailure(transaction CommandTransaction, rollbackErr, cause error) error {
+	return commandTransactionError(cause, transaction.Abort(), rollbackErr)
+}
+
+func commandTransactionError(cause, abortErr, rollbackErr error) error {
+	errorsToJoin := []error{cause}
+	if abortErr != nil {
+		errorsToJoin = append(errorsToJoin, fmt.Errorf("abort platform transaction: %w", abortErr))
+	}
+	if rollbackErr != nil {
+		errorsToJoin = append(errorsToJoin, rollbackErr)
+	}
+	return &ResultError{Result: me.ProcessingError, Cause: errors.Join(errorsToJoin...)}
 }
 
 func (s *Store) Delete(key Key) error {

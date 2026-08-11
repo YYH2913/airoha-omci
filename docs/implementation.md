@@ -178,6 +178,11 @@ active image still performs the required soft restart, and Commit accepts any
 valid target, including an inactive image selected for the next boot. Start,
 successful End, Activate and Commit update all affected software image MEs
 atomically and advance MIB data sync once per command when their state changes.
+Activate and Commit use prepared platform transactions: a candidate MIB is
+persisted before the slot mutation is committed, while any apply/commit failure
+aborts the slot operation, restores the prior persisted MIB and leaves data sync
+unchanged. The backend also rolls back an activation prepare abandoned by a
+daemon restart before reporting software state.
 The XG2010G backend stages an OpenWrt FIT in an inactive UBI volume and uses a
 boot guard to roll back an activated but uncommitted image or restartably select
 a committed inactive image at the next boot. Physical OLT software download and

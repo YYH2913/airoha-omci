@@ -17,15 +17,24 @@ volume is removed.
 
 ## Activate and rollback
 
-Activation atomically renames `fit` to `omci_fit_old` and the staged image to
-`fit`, records a pending boot, and reboots. On the first candidate boot U-Boot
-arms the guard. A second boot before Commit restores `omci_fit_old` to `fit`.
-The rollback sequence is restartable at each UBI rename boundary, so another
-power loss cannot turn an intermediate volume name into a committed state.
+Activation is a three-stage transaction. Prepare atomically renames `fit` to
+`omci_fit_old` and the staged image to `fit`, but leaves the active slot ID
+unchanged and does not reboot. The daemon persists the candidate Software Image
+MEs, then commit records a pending boot and schedules the restart. An apply or
+commit failure aborts the slot transaction and writes the previous MIB snapshot
+back without advancing MIB data sync. A daemon restart that finds
+`omci_pending=prepare` also restores the old volume names before reporting slot
+state.
 
-Commit records the candidate as committed, clears the guard, and renames the
-old image into the inactive slot. The helper completes an interrupted cleanup
-the next time its state is read.
+On the first candidate boot U-Boot arms the guard. A second boot before Commit
+restores `omci_fit_old` to `fit`. The rollback sequence is restartable at each
+UBI rename boundary, so another power loss cannot turn an intermediate volume
+name into a committed state.
+
+Commit also uses prepare/commit/abort. Prepare validates the current volume and
+boot-guard state without mutation. Commit records the candidate as committed,
+clears the guard, and renames the old image into the inactive slot. The helper
+completes an interrupted cleanup the next time its state is read.
 
 G.988 also permits Commit on a valid inactive image. In that case the helper
 records the new committed slot without changing the running image. On the next

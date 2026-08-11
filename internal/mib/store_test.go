@@ -5,6 +5,7 @@ package mib
 import (
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 
 	me "github.com/opencord/omci-lib-go/v2/generated"
@@ -513,6 +514,97 @@ func TestCommandUpdateChangesMultipleMEsAndAdvancesDataSyncOnce(t *testing.T) {
 	}
 	if applyCalls != 1 {
 		t.Fatalf("unchanged command update caused %d apply calls, want 1 total", applyCalls)
+	}
+}
+
+type recordingCommandTransaction struct {
+	commitErr error
+	abortErr  error
+	commits   int
+	aborts    int
+}
+
+func (t *recordingCommandTransaction) Commit() error {
+	t.commits++
+	return t.commitErr
+}
+
+func (t *recordingCommandTransaction) Abort() error {
+	t.aborts++
+	return t.abortErr
+}
+
+func TestTransactionalCommandCommitFailureRestoresPersistedCandidate(t *testing.T) {
+	var changes []Change
+	store, err := NewWithApplier([]Instance{
+		{
+			Key:        Key{ClassID: me.OnuDataClassID, EntityID: 0},
+			Attributes: me.AttributeValueMap{me.OnuData_MibDataSync: uint8(0)},
+		},
+		{
+			Key:        Key{ClassID: me.SoftwareImageClassID, EntityID: 0},
+			Attributes: me.AttributeValueMap{me.SoftwareImage_IsActive: uint8(1)},
+		},
+	}, ApplyFunc(func(change Change) error {
+		changes = append(changes, change)
+		return nil
+	}))
+	if err != nil {
+		t.Fatalf("NewWithApplier() error = %v", err)
+	}
+	transaction := &recordingCommandTransaction{commitErr: errors.New("slot commit failed")}
+	err = store.UpdateByCommandTransactional(map[Key]me.AttributeValueMap{
+		{ClassID: me.SoftwareImageClassID, EntityID: 0}: {
+			me.SoftwareImage_IsActive: uint8(0),
+		},
+	}, transaction)
+	var result *ResultError
+	if !errors.As(err, &result) || result.Result != me.ProcessingError ||
+		!strings.Contains(err.Error(), "slot commit failed") {
+		t.Fatalf("UpdateByCommandTransactional() error = %#v", err)
+	}
+	if transaction.commits != 1 || transaction.aborts != 1 || len(changes) != 2 {
+		t.Fatalf("transaction/apply calls = %d/%d/%d, want 1/1/2",
+			transaction.commits, transaction.aborts, len(changes))
+	}
+	if changes[0].MIBDataSync != 1 || changes[1].MIBDataSync != 0 ||
+		changes[0].Snapshot[0].Attributes[me.OnuData_MibDataSync] ==
+			changes[1].Snapshot[0].Attributes[me.OnuData_MibDataSync] {
+		t.Fatalf("candidate/rollback changes = %#v", changes)
+	}
+	instance, getErr := store.Get(Key{ClassID: me.SoftwareImageClassID, EntityID: 0}, 0x2000)
+	if getErr != nil || store.DataSync() != 0 ||
+		instance.Attributes[me.SoftwareImage_IsActive] != uint8(1) {
+		t.Fatalf("failed transaction committed state: sync=%d image=%#v error=%v",
+			store.DataSync(), instance, getErr)
+	}
+}
+
+func TestTransactionalUnchangedCommandStillCommitsPlatformAction(t *testing.T) {
+	store, err := New([]Instance{
+		{
+			Key:        Key{ClassID: me.OnuDataClassID, EntityID: 0},
+			Attributes: me.AttributeValueMap{me.OnuData_MibDataSync: uint8(0)},
+		},
+		{
+			Key:        Key{ClassID: me.SoftwareImageClassID, EntityID: 0},
+			Attributes: me.AttributeValueMap{me.SoftwareImage_IsActive: uint8(1)},
+		},
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	transaction := &recordingCommandTransaction{}
+	if err := store.UpdateByCommandTransactional(map[Key]me.AttributeValueMap{
+		{ClassID: me.SoftwareImageClassID, EntityID: 0}: {
+			me.SoftwareImage_IsActive: uint8(1),
+		},
+	}, transaction); err != nil {
+		t.Fatalf("UpdateByCommandTransactional() error = %v", err)
+	}
+	if transaction.commits != 1 || transaction.aborts != 0 || store.DataSync() != 0 {
+		t.Fatalf("unchanged transaction calls/sync = %d/%d/%d, want 1/0/0",
+			transaction.commits, transaction.aborts, store.DataSync())
 	}
 }
 

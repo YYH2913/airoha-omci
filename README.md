@@ -22,7 +22,8 @@ known but unimplemented G.988 classes are rejected as unknown entities rather
 than inherited from the protocol library. Driver-originated alarm/AVC events
 have a validated upstream notification path. Software download, CRC-32A and
 ImageHash validation, activation and commit are implemented through a fixed
-platform helper ABI.
+platform helper ABI. Software slot changes use prepare/commit/abort transactions
+so a rejected OMCI action cannot leave the boot slot ahead of the committed MIB.
 ANI-G optical alarms and ARC, extended SetTable handling, the resolved
 Ethernet service graph, and the common multi-profile Linux bridge/VLAN/TC
 data path are implemented. Class 312 FEC, per-GEM and Ethernet UNI performance

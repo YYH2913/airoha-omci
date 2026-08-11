@@ -306,13 +306,13 @@ func (e *Engine) activateSoftware(request *omci.ActivateSoftwareRequest) me.Resu
 	if !image.valid {
 		return me.ParameterError
 	}
-	if err := e.software.Activate(request.EntityInstance, request.ActivateFlags); err != nil {
+	transaction, err := e.software.PrepareActivate(request.EntityInstance, request.ActivateFlags)
+	if err != nil {
 		return me.ProcessingError
 	}
-	if !image.active {
-		if err := e.setExclusiveSoftwareFlag(request.EntityInstance, me.SoftwareImage_IsActive); err != nil {
-			return me.ProcessingError
-		}
+	if err := e.setExclusiveSoftwareFlag(request.EntityInstance,
+		me.SoftwareImage_IsActive, transaction); err != nil {
+		return me.ProcessingError
 	}
 	e.softwareState.Phase = "activating"
 	e.softwareState.ImageID = request.EntityInstance
@@ -342,10 +342,12 @@ func (e *Engine) commitSoftware(request *omci.CommitSoftwareRequest) me.Results 
 	if image.committed {
 		return me.Success
 	}
-	if err := e.software.Commit(request.EntityInstance); err != nil {
+	transaction, err := e.software.PrepareCommit(request.EntityInstance)
+	if err != nil {
 		return me.ProcessingError
 	}
-	if err := e.setExclusiveSoftwareFlag(request.EntityInstance, me.SoftwareImage_IsCommitted); err != nil {
+	if err := e.setExclusiveSoftwareFlag(request.EntityInstance,
+		me.SoftwareImage_IsCommitted, transaction); err != nil {
 		return me.ProcessingError
 	}
 	e.softwareState.Phase = "committed"
@@ -459,7 +461,8 @@ func (e *Engine) softwareImage(entityID uint16) (imageFlags, me.Results) {
 	return imageFlags{active: active == 1, committed: committed == 1, valid: valid == 1}, me.Success
 }
 
-func (e *Engine) setExclusiveSoftwareFlag(selected uint16, attribute string) error {
+func (e *Engine) setExclusiveSoftwareFlag(selected uint16, attribute string,
+	transaction software.Transaction) error {
 	updates := make(map[mib.Key]me.AttributeValueMap, 2)
 	for entityID := uint16(0); entityID <= 1; entityID++ {
 		value := uint8(0)
@@ -470,7 +473,7 @@ func (e *Engine) setExclusiveSoftwareFlag(selected uint16, attribute string) err
 			attribute: value,
 		}
 	}
-	return e.mib.UpdateByCommand(updates)
+	return e.mib.UpdateByCommandTransactional(updates, transaction)
 }
 
 func softwareKey(entityID uint16) mib.Key {

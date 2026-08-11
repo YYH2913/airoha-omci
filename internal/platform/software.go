@@ -117,15 +117,62 @@ func (c ExecSoftwareController) Start(entityID uint16, imageSize uint32) (softwa
 	}, nil
 }
 
-func (c ExecSoftwareController) Activate(entityID uint16, flags uint8) error {
-	_, err := c.execute("activate", strconv.FormatUint(uint64(entityID), 10),
-		strconv.FormatUint(uint64(flags), 10))
-	return err
+func (c ExecSoftwareController) PrepareActivate(entityID uint16,
+	flags uint8) (software.Transaction, error) {
+	id := strconv.FormatUint(uint64(entityID), 10)
+	if _, err := c.execute("activate-prepare", id,
+		strconv.FormatUint(uint64(flags), 10)); err != nil {
+		return nil, err
+	}
+	return &execSoftwareTransaction{
+		controller: c, commitArguments: []string{"activate-commit", id},
+		abortArguments: []string{"activate-abort", id},
+	}, nil
 }
 
-func (c ExecSoftwareController) Commit(entityID uint16) error {
-	_, err := c.execute("commit", strconv.FormatUint(uint64(entityID), 10))
-	return err
+func (c ExecSoftwareController) PrepareCommit(entityID uint16) (software.Transaction, error) {
+	id := strconv.FormatUint(uint64(entityID), 10)
+	if _, err := c.execute("commit-prepare", id); err != nil {
+		return nil, err
+	}
+	return &execSoftwareTransaction{
+		controller: c, commitArguments: []string{"commit-commit", id},
+		abortArguments: []string{"commit-abort", id},
+	}, nil
+}
+
+type execSoftwareTransaction struct {
+	mu              sync.Mutex
+	controller      ExecSoftwareController
+	commitArguments []string
+	abortArguments  []string
+	done            bool
+}
+
+func (t *execSoftwareTransaction) Commit() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.done {
+		return nil
+	}
+	if _, err := t.controller.execute(t.commitArguments...); err != nil {
+		return err
+	}
+	t.done = true
+	return nil
+}
+
+func (t *execSoftwareTransaction) Abort() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.done {
+		return nil
+	}
+	if _, err := t.controller.execute(t.abortArguments...); err != nil {
+		return err
+	}
+	t.done = true
+	return nil
 }
 
 func (c ExecSoftwareController) execute(arguments ...string) ([]byte, error) {

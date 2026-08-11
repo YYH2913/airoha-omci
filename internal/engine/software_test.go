@@ -5,6 +5,7 @@ package engine
 import (
 	"bytes"
 	"crypto/md5"
+	"errors"
 	"runtime"
 	"testing"
 	"time"
@@ -18,17 +19,21 @@ import (
 )
 
 type recordingSoftwareController struct {
-	images        []software.Image
-	download      *recordingDownload
-	startedID     uint16
-	startedSize   uint32
-	activatedID   uint16
-	activateFlags uint8
-	committedID   uint16
-	startCalls    int
-	activateCalls int
-	commitCalls   int
-	finishGate    <-chan struct{}
+	images            []software.Image
+	download          *recordingDownload
+	startedID         uint16
+	startedSize       uint32
+	activatedID       uint16
+	activateFlags     uint8
+	committedID       uint16
+	startCalls        int
+	activateCalls     int
+	commitCalls       int
+	activateAborts    int
+	commitAborts      int
+	activateCommitErr error
+	commitCommitErr   error
+	finishGate        <-chan struct{}
 }
 
 func (c *recordingSoftwareController) Images() ([]software.Image, error) {
@@ -43,18 +48,43 @@ func (c *recordingSoftwareController) Start(entityID uint16, imageSize uint32) (
 	return c.download, nil
 }
 
-func (c *recordingSoftwareController) Activate(entityID uint16, flags uint8) error {
-	c.activateCalls++
-	c.activatedID = entityID
-	c.activateFlags = flags
-	return nil
+func (c *recordingSoftwareController) PrepareActivate(entityID uint16,
+	flags uint8) (software.Transaction, error) {
+	return &recordingSoftwareTransaction{
+		commit: func() error {
+			c.activateCalls++
+			c.activatedID = entityID
+			c.activateFlags = flags
+			return c.activateCommitErr
+		},
+		abort: func() error {
+			c.activateAborts++
+			return nil
+		},
+	}, nil
 }
 
-func (c *recordingSoftwareController) Commit(entityID uint16) error {
-	c.commitCalls++
-	c.committedID = entityID
-	return nil
+func (c *recordingSoftwareController) PrepareCommit(entityID uint16) (software.Transaction, error) {
+	return &recordingSoftwareTransaction{
+		commit: func() error {
+			c.commitCalls++
+			c.committedID = entityID
+			return c.commitCommitErr
+		},
+		abort: func() error {
+			c.commitAborts++
+			return nil
+		},
+	}, nil
 }
+
+type recordingSoftwareTransaction struct {
+	commit func() error
+	abort  func() error
+}
+
+func (t *recordingSoftwareTransaction) Commit() error { return t.commit() }
+func (t *recordingSoftwareTransaction) Abort() error  { return t.abort() }
 
 type recordingDownload struct {
 	bytes.Buffer
@@ -199,6 +229,66 @@ func TestSoftwareDownloadLifecycleAndNoResponseReplay(t *testing.T) {
 	assertSoftwareFlag(t, store, 1, me.SoftwareImage_IsActive, 1)
 	assertSoftwareFlag(t, store, 0, me.SoftwareImage_IsCommitted, 0)
 	assertSoftwareFlag(t, store, 1, me.SoftwareImage_IsCommitted, 1)
+}
+
+func TestActivateSoftwareCommitFailureAbortsAndRestoresMIB(t *testing.T) {
+	protocol, store, controller, changes := newTransactionalSoftwareTestEngine(t)
+	if _, err := store.UpdateAutonomous(softwareKey(1), me.AttributeValueMap{
+		me.SoftwareImage_IsValid: uint8(1),
+	}); err != nil {
+		t.Fatalf("mark standby image valid: %v", err)
+	}
+	controller.activateCommitErr = errors.New("activation commit failed")
+	request := encodeRequest(t, 27, omci.ActivateSoftwareRequestType,
+		&omci.ActivateSoftwareRequest{
+			MeBasePacket: omci.MeBasePacket{
+				EntityClass: me.SoftwareImageClassID, EntityInstance: 1,
+			},
+		})
+	encoded, err := protocol.Handle(request)
+	if err != nil {
+		t.Fatalf("Handle(ActivateSoftware) error = %v", err)
+	}
+	response := decodeResponse(t, encoded).Layer(omci.LayerTypeActivateSoftwareResponse).(*omci.ActivateSoftwareResponse)
+	if response.Result != me.ProcessingError || controller.activateCalls != 1 ||
+		controller.activateAborts != 1 || len(*changes) != 2 {
+		t.Fatalf("failed activation response/controller/changes = %#v/%#v/%d",
+			response, controller, len(*changes))
+	}
+	if store.DataSync() != 0 {
+		t.Fatalf("failed activation advanced MIB data sync to %d", store.DataSync())
+	}
+	assertSoftwareFlag(t, store, 0, me.SoftwareImage_IsActive, 1)
+	assertSoftwareFlag(t, store, 1, me.SoftwareImage_IsActive, 0)
+}
+
+func TestCommitSoftwarePlatformFailureAbortsAndRestoresMIB(t *testing.T) {
+	protocol, store, controller, changes := newTransactionalSoftwareTestEngine(t)
+	if _, err := store.UpdateAutonomous(softwareKey(1), me.AttributeValueMap{
+		me.SoftwareImage_IsValid: uint8(1),
+	}); err != nil {
+		t.Fatalf("mark standby image valid: %v", err)
+	}
+	controller.commitCommitErr = errors.New("software commit failed")
+	request := encodeRequest(t, 28, omci.CommitSoftwareRequestType,
+		&omci.CommitSoftwareRequest{MeBasePacket: omci.MeBasePacket{
+			EntityClass: me.SoftwareImageClassID, EntityInstance: 1,
+		}})
+	encoded, err := protocol.Handle(request)
+	if err != nil {
+		t.Fatalf("Handle(CommitSoftware) error = %v", err)
+	}
+	response := decodeResponse(t, encoded).Layer(omci.LayerTypeCommitSoftwareResponse).(*omci.CommitSoftwareResponse)
+	if response.Result != me.ProcessingError || controller.commitCalls != 1 ||
+		controller.commitAborts != 1 || len(*changes) != 2 {
+		t.Fatalf("failed commit response/controller/changes = %#v/%#v/%d",
+			response, controller, len(*changes))
+	}
+	if store.DataSync() != 0 {
+		t.Fatalf("failed commit advanced MIB data sync to %d", store.DataSync())
+	}
+	assertSoftwareFlag(t, store, 0, me.SoftwareImage_IsCommitted, 1)
+	assertSoftwareFlag(t, store, 1, me.SoftwareImage_IsCommitted, 0)
 }
 
 func TestSoftwareDownloadRetriesOutOfOrderWindowWithoutAborting(t *testing.T) {
@@ -484,6 +574,25 @@ func newSoftwareTestEngine(t *testing.T) (*Engine, *mib.Store, *recordingSoftwar
 	}
 	controller := &recordingSoftwareController{}
 	return NewWithControllers(store, nil, controller), store, controller
+}
+
+func newTransactionalSoftwareTestEngine(t *testing.T) (*Engine, *mib.Store,
+	*recordingSoftwareController, *[]mib.Change) {
+	t.Helper()
+	factory, err := model.XG2010G(model.Identity{SerialNumber: "TEST01020304", Version: "old"})
+	if err != nil {
+		t.Fatalf("model.XG2010G() error = %v", err)
+	}
+	changes := make([]mib.Change, 0, 2)
+	store, err := mib.NewWithApplier(factory, mib.ApplyFunc(func(change mib.Change) error {
+		changes = append(changes, change)
+		return nil
+	}))
+	if err != nil {
+		t.Fatalf("mib.NewWithApplier() error = %v", err)
+	}
+	controller := &recordingSoftwareController{}
+	return NewWithControllers(store, nil, controller), store, controller, &changes
 }
 
 func startSoftwareTestDownload(t *testing.T, protocol *Engine, size uint32, windowSize uint8,

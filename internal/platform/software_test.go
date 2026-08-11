@@ -25,7 +25,7 @@ download)
 	cat > '` + payloadPath + `'
 	printf '%s\n' '{"version":"new","product_code":"XG2010G"}'
 	;;
-activate|commit)
+activate-*|commit-*)
 	printf '%s\n' "$*" >> '` + actionsPath + `'
 	;;
 *) exit 2 ;;
@@ -60,17 +60,28 @@ esac
 	if payload, err := os.ReadFile(payloadPath); err != nil || string(payload) != "payload" {
 		t.Fatalf("downloaded payload = %q, %v", payload, err)
 	}
-	if err := controller.Activate(1, 2); err != nil {
-		t.Fatalf("Activate() error = %v", err)
+	activation, err := controller.PrepareActivate(1, 2)
+	if err != nil {
+		t.Fatalf("PrepareActivate() error = %v", err)
 	}
-	if err := controller.Commit(1); err != nil {
-		t.Fatalf("Commit() error = %v", err)
+	if err := activation.Commit(); err != nil {
+		t.Fatalf("activation Commit() error = %v", err)
+	}
+	commit, err := controller.PrepareCommit(1)
+	if err != nil {
+		t.Fatalf("PrepareCommit() error = %v", err)
+	}
+	if err := commit.Commit(); err != nil {
+		t.Fatalf("software Commit() error = %v", err)
 	}
 	actions, err := os.ReadFile(actionsPath)
 	if err != nil {
 		t.Fatalf("ReadFile(actions) error = %v", err)
 	}
-	for _, want := range []string{"download 1 7", "activate 1 2", "commit 1"} {
+	for _, want := range []string{
+		"download 1 7", "activate-prepare 1 2", "activate-commit 1",
+		"commit-prepare 1", "commit-commit 1",
+	} {
 		if !strings.Contains(string(actions), want) {
 			t.Fatalf("actions = %q, missing %q", actions, want)
 		}
@@ -100,5 +111,45 @@ printf '%s\n' '{"images":[{"entity_id":0,"version":"old","product_code":"XG2010G
 	if _, err := (ExecSoftwareController{Path: helper}).Images(); err == nil ||
 		!strings.Contains(err.Error(), "active/committed") {
 		t.Fatalf("Images() error = %v, want active/committed state error", err)
+	}
+}
+
+func TestExecSoftwareControllerAbortsPreparedTransactions(t *testing.T) {
+	directory := t.TempDir()
+	actionsPath := filepath.Join(directory, "actions")
+	helper := filepath.Join(directory, "software")
+	script := `#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> '` + actionsPath + `'
+`
+	if err := os.WriteFile(helper, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile(helper) error = %v", err)
+	}
+	controller := ExecSoftwareController{Path: helper}
+	activation, err := controller.PrepareActivate(1, 2)
+	if err != nil {
+		t.Fatalf("PrepareActivate() error = %v", err)
+	}
+	if err := activation.Abort(); err != nil {
+		t.Fatalf("activation Abort() error = %v", err)
+	}
+	commit, err := controller.PrepareCommit(1)
+	if err != nil {
+		t.Fatalf("PrepareCommit() error = %v", err)
+	}
+	if err := commit.Abort(); err != nil {
+		t.Fatalf("commit Abort() error = %v", err)
+	}
+	actions, err := os.ReadFile(actionsPath)
+	if err != nil {
+		t.Fatalf("ReadFile(actions) error = %v", err)
+	}
+	for _, want := range []string{
+		"activate-prepare 1 2", "activate-abort 1",
+		"commit-prepare 1", "commit-abort 1",
+	} {
+		if !strings.Contains(string(actions), want) {
+			t.Fatalf("actions = %q, missing %q", actions, want)
+		}
 	}
 }

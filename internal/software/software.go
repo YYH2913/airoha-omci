@@ -31,9 +31,17 @@ type Download interface {
 	Abort() error
 }
 
+// Transaction represents a prepared software-slot mutation. Commit makes the
+// mutation durable only after the OMCI MIB candidate has been persisted;
+// Abort restores the pre-command slot state.
+type Transaction interface {
+	Commit() error
+	Abort() error
+}
+
 type Controller interface {
 	Images() ([]Image, error)
 	Start(entityID uint16, imageSize uint32) (Download, error)
-	Activate(entityID uint16, flags uint8) error
-	Commit(entityID uint16) error
+	PrepareActivate(entityID uint16, flags uint8) (Transaction, error)
+	PrepareCommit(entityID uint16) (Transaction, error)
 }

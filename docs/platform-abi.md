@@ -6,13 +6,17 @@ as a command name or shell fragment.
 
 ## Software helper
 
-The executable configured with `-software-helper` implements four commands:
+The executable configured with `-software-helper` implements eight commands:
 
 ```text
 helper state
 helper download IMAGE_ID IMAGE_SIZE
-helper activate IMAGE_ID ACTIVATE_FLAGS
-helper commit IMAGE_ID
+helper activate-prepare IMAGE_ID ACTIVATE_FLAGS
+helper activate-commit IMAGE_ID
+helper activate-abort IMAGE_ID
+helper commit-prepare IMAGE_ID
+helper commit-commit IMAGE_ID
+helper commit-abort IMAGE_ID
 ```
 
 `IMAGE_ID` is 0 or 1. `download` reads exactly `IMAGE_SIZE` octets from stdin,
@@ -33,10 +37,17 @@ active and exactly one is committed. A command reports failure with a non-zero
 exit status and may write diagnostics to stderr. JSON is decoded strictly;
 unknown fields or trailing values are rejected.
 
-`activate` must arrange for the selected valid image to become active and may
-reboot after returning. `commit` makes the active image persistent and removes
-the automatic rollback condition. These operations must be idempotent because
-an OLT may retransmit a request.
+The two operation families are platform transactions. A `*-prepare` command
+validates the request and may create reversible state, but must not schedule a
+reboot or irreversibly select a boot slot. The daemon then persists the
+candidate Software Image MEs. `*-commit` makes the prepared operation durable;
+`activate-commit` may reboot after returning. `*-abort` restores the state from
+before prepare and must be idempotent. The daemon aborts and writes the prior
+MIB snapshot back if candidate persistence or platform commit fails.
+
+An activation prepare left by daemon termination or power loss must be
+detected by `state` and rolled back before it reports image flags. All commands
+must be idempotent because an OLT may retransmit a request.
 
 ## Other helpers
 
