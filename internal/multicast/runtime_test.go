@@ -161,6 +161,72 @@ func TestRuntimeSourceSpecificMembershipTransition(t *testing.T) {
 	}
 }
 
+func TestIGMPv3AndMLDv2FilterModeTransitions(t *testing.T) {
+	a := addr("192.0.2.1")
+	b := addr("192.0.2.2")
+	c := addr("192.0.2.3")
+	state := transitionMembership(membershipState{}, MembershipRecord{
+		Type: ModeIsExclude, Sources: []netip.Addr{a, b},
+	})
+	assertMembershipState(t, state, filterModeExclude, a, b)
+	state = transitionMembership(state, MembershipRecord{Type: AllowNewSources, Sources: []netip.Addr{a}})
+	assertMembershipState(t, state, filterModeExclude, b)
+	state = transitionMembership(state, MembershipRecord{Type: BlockOldSources, Sources: []netip.Addr{c}})
+	assertMembershipState(t, state, filterModeExclude, b, c)
+	state = transitionMembership(state, MembershipRecord{Type: ChangeToIncludeMode, Sources: []netip.Addr{a}})
+	assertMembershipState(t, state, filterModeInclude, a)
+	state = transitionMembership(state, MembershipRecord{Type: AllowNewSources, Sources: []netip.Addr{b}})
+	assertMembershipState(t, state, filterModeInclude, a, b)
+	state = transitionMembership(state, MembershipRecord{Type: BlockOldSources, Sources: []netip.Addr{a}})
+	assertMembershipState(t, state, filterModeInclude, b)
+	state = transitionMembership(state, MembershipRecord{Type: ChangeToExcludeMode, Sources: []netip.Addr{c}})
+	assertMembershipState(t, state, filterModeExclude, c)
+}
+
+func TestEffectiveUpstreamGroupAggregatesIncludeAndExcludeClients(t *testing.T) {
+	runtime := &Runtime{streams: make(map[runtimeStreamKey]*runtimeStream)}
+	base := runtimeStreamKey{subscriberID: 10, interfaceName: "lan1", group: addr("239.1.0.1")}
+	excludeKey := base
+	excludeKey.source = netip.IPv4Unspecified()
+	runtime.streams[excludeKey] = &runtimeStream{clients: map[clientIdentity]runtimeClient{
+		{address: addr("192.0.2.10")}: {group: ActiveGroup{Source: netip.IPv4Unspecified(),
+			Group: base.group, ExcludedSources: []netip.Addr{addr("192.0.2.1"), addr("192.0.2.2")}}},
+		{address: addr("192.0.2.11")}: {group: ActiveGroup{Source: netip.IPv4Unspecified(),
+			Group: base.group, ExcludedSources: []netip.Addr{addr("192.0.2.2"), addr("192.0.2.3")}}},
+	}}
+	includeKey := base
+	includeKey.source = addr("192.0.2.2")
+	runtime.streams[includeKey] = &runtimeStream{clients: map[clientIdentity]runtimeClient{
+		{address: addr("192.0.2.12")}: {group: ActiveGroup{Source: includeKey.source, Group: base.group}},
+	}}
+	group, exists := runtime.effectiveUpstreamGroup(base)
+	if !exists || !group.Source.IsUnspecified() || len(group.ExcludedSources) != 0 {
+		t.Fatalf("mixed INCLUDE/EXCLUDE aggregate = %+v, exists=%v", group, exists)
+	}
+	delete(runtime.streams, excludeKey)
+	group, exists = runtime.effectiveUpstreamGroup(base)
+	if !exists || group.Source != includeKey.source || len(group.IncludedSources) != 1 ||
+		group.IncludedSources[0] != includeKey.source {
+		t.Fatalf("INCLUDE-only aggregate = %+v, exists=%v", group, exists)
+	}
+}
+
+func assertMembershipState(t *testing.T, state membershipState, mode filterMode, sources ...netip.Addr) {
+	t.Helper()
+	if state.mode != mode {
+		t.Fatalf("filter mode = %d, want %d", state.mode, mode)
+	}
+	got := sortedSources(state.sources)
+	if len(got) != len(sources) {
+		t.Fatalf("sources = %v, want %v", got, sources)
+	}
+	for index := range sources {
+		if got[index] != sources[index] {
+			t.Fatalf("sources = %v, want %v", got, sources)
+		}
+	}
+}
+
 func TestRuntimeForwardsConfiguredUnauthorizedJoin(t *testing.T) {
 	backend := &recordingRuntimeBackend{}
 	configured := profile(1, acl(1, "239.1.0.1", "239.1.0.1", 100))

@@ -92,6 +92,7 @@ type Engine struct {
 	alarmSequence          uint8
 	arcFreeSince           map[mib.Key]time.Time
 	opticalSample          map[mib.Key]optical.Sample
+	berSample              map[mib.Key]BERSample
 	now                    func() time.Time
 	controller             Controller
 	software               software.Controller
@@ -130,6 +131,7 @@ func NewWithControllers(store *mib.Store, controller Controller, softwareControl
 		alarmUpload:      make(map[omci.DeviceIdent]alarmUploadSession),
 		arcFreeSince:     make(map[mib.Key]time.Time),
 		opticalSample:    make(map[mib.Key]optical.Sample),
+		berSample:        make(map[mib.Key]BERSample),
 		now:              time.Now,
 		controller:       controller,
 		software:         softwareController,
@@ -206,6 +208,7 @@ func (e *Engine) ResetCommunicationSession() {
 	e.tables = make(map[tableKey][]byte)
 	e.alarmUpload = make(map[omci.DeviceIdent]alarmUploadSession)
 	e.alarmSequence = 0
+	e.berSample = make(map[mib.Key]BERSample)
 	e.pending = nil
 	e.pendingError = nil
 	e.extendedSeen = false
@@ -501,6 +504,7 @@ func (e *Engine) dispatch(packet gopacket.Packet, header *omci.OMCI) ([]byte, er
 			e.upload = make(map[omci.DeviceIdent]uploadSession)
 			e.tables = make(map[tableKey][]byte)
 			e.arcFreeSince = make(map[mib.Key]time.Time)
+			e.berSample = make(map[mib.Key]BERSample)
 			e.performanceState = make(map[mib.Key]performanceState)
 			e.fecPMState = make(map[mib.Key]fecPerformanceState)
 			e.ethernetPMState = make(map[mib.Key]ethernetPerformanceState)

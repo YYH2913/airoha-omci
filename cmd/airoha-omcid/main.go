@@ -3,13 +3,17 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"reflect"
 	"syscall"
 	"time"
@@ -31,17 +35,18 @@ var version = "devel"
 const transactionQueueCapacity = 1024
 
 type options struct {
-	interfaceName  string
-	serialNumber   string
-	equipmentID    string
-	statusPath     string
-	statePath      string
-	applyHelper    string
-	controlHelper  string
-	eventHelper    string
-	softwareHelper string
-	onu3StatePath  string
-	restartReason  uint
+	interfaceName    string
+	serialNumber     string
+	equipmentID      string
+	statusPath       string
+	statePath        string
+	applyHelper      string
+	controlHelper    string
+	eventHelper      string
+	softwareHelper   string
+	onu3StatePath    string
+	runtimeStatePath string
+	restartReason    uint
 }
 
 func main() {
@@ -56,6 +61,7 @@ func main() {
 	flag.StringVar(&opts.eventHelper, "event-helper", "", "fixed executable streaming platform events as JSON lines")
 	flag.StringVar(&opts.softwareHelper, "software-helper", "", "fixed executable handling software image lifecycle")
 	flag.StringVar(&opts.onu3StatePath, "onu3-state", "", "persistent platform document used to restore ONU3-G snapshots")
+	flag.StringVar(&opts.runtimeStatePath, "runtime-state", "", "persistent alarm, ARC and performance runtime state")
 	flag.UintVar(&opts.restartReason, "restart-reason", 0, "G.988 ONU3-G latest restart reason (0..255)")
 	flag.Parse()
 
@@ -107,6 +113,12 @@ func run(opts options) error {
 		softwareBackend = opts.softwareHelper
 	}
 	protocol := engine.NewWithControllers(store, controller, softwareController)
+	if opts.runtimeStatePath != "" {
+		if restoreErr := restoreRuntimeState(protocol, opts.runtimeStatePath); restoreErr != nil {
+			log.Printf("discard persistent OMCI runtime state %s: %v",
+				opts.runtimeStatePath, restoreErr)
+		}
+	}
 	if err := protocol.RefreshSoftwareImages(); err != nil {
 		return fmt.Errorf("load software image state: %w", err)
 	}
@@ -209,10 +221,22 @@ func run(opts options) error {
 	defer performanceTicker.Stop()
 	multicastTicker := time.NewTicker(time.Second)
 	defer multicastTicker.Stop()
+	runtimeTicker := time.NewTicker(time.Second)
+	defer runtimeTicker.Stop()
+	runtimeWriter := newRuntimeStateWriter(opts.runtimeStatePath)
+	persistRuntimeState := func() {
+		if _, err := runtimeWriter.Write(protocol); err != nil {
+			state.EventErrors++
+			state.LastError = err.Error()
+			_ = statusWriter.Write(state)
+			log.Printf("persist OMCI runtime state: %v", err)
+		}
+	}
 
 	for {
 		select {
 		case <-ctx.Done():
+			persistRuntimeState()
 			state.State = "stopped"
 			_ = statusWriter.Write(state)
 			return nil
@@ -318,6 +342,9 @@ func run(opts options) error {
 				continue
 			}
 
+		case <-runtimeTicker.C:
+			persistRuntimeState()
+
 		case queueErr := <-dispatcher.Errors():
 			state.TransportErrors++
 			state.LastError = queueErr.Error()
@@ -386,6 +413,104 @@ func run(opts options) error {
 			}
 		}
 	}
+}
+
+type runtimeStateWriter struct {
+	path string
+	last []byte
+}
+
+func newRuntimeStateWriter(path string) *runtimeStateWriter {
+	return &runtimeStateWriter{path: path}
+}
+
+func (w *runtimeStateWriter) Write(protocol *engine.Engine) (bool, error) {
+	if w.path == "" {
+		return false, nil
+	}
+	state, err := protocol.ExportRuntimeState()
+	if err != nil {
+		return false, fmt.Errorf("export runtime state: %w", err)
+	}
+	document, err := json.Marshal(state)
+	if err != nil {
+		return false, fmt.Errorf("encode runtime state: %w", err)
+	}
+	document = append(document, '\n')
+	if bytes.Equal(document, w.last) {
+		return false, nil
+	}
+	if err := writeRuntimeStateAtomic(w.path, document); err != nil {
+		return false, err
+	}
+	w.last = append(w.last[:0], document...)
+	return true, nil
+}
+
+func restoreRuntimeState(protocol *engine.Engine, path string) error {
+	document, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer document.Close()
+
+	decoder := json.NewDecoder(document)
+	decoder.DisallowUnknownFields()
+	var state engine.RuntimeState
+	if err := decoder.Decode(&state); err != nil {
+		return fmt.Errorf("decode runtime state: %w", err)
+	}
+	var trailing interface{}
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("decode runtime state: trailing JSON value")
+		}
+		return fmt.Errorf("decode runtime state: %w", err)
+	}
+	return protocol.RestoreRuntimeState(state)
+}
+
+func writeRuntimeStateAtomic(path string, document []byte) error {
+	directory := filepath.Dir(path)
+	if err := os.MkdirAll(directory, 0o755); err != nil {
+		return fmt.Errorf("create runtime state directory: %w", err)
+	}
+	temporary, err := os.CreateTemp(directory, ".omci-runtime-*")
+	if err != nil {
+		return fmt.Errorf("create runtime state temporary file: %w", err)
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if err := temporary.Chmod(0o600); err != nil {
+		_ = temporary.Close()
+		return fmt.Errorf("protect runtime state temporary file: %w", err)
+	}
+	if _, err := temporary.Write(document); err != nil {
+		_ = temporary.Close()
+		return fmt.Errorf("write runtime state: %w", err)
+	}
+	if err := temporary.Sync(); err != nil {
+		_ = temporary.Close()
+		return fmt.Errorf("sync runtime state: %w", err)
+	}
+	if err := temporary.Close(); err != nil {
+		return fmt.Errorf("close runtime state: %w", err)
+	}
+	if err := os.Rename(temporaryPath, path); err != nil {
+		return fmt.Errorf("publish runtime state: %w", err)
+	}
+	directoryHandle, err := os.Open(directory)
+	if err != nil {
+		return fmt.Errorf("open runtime state directory: %w", err)
+	}
+	defer directoryHandle.Close()
+	if err := directoryHandle.Sync(); err != nil {
+		return fmt.Errorf("sync runtime state directory: %w", err)
+	}
+	return nil
 }
 
 func restoreONU3Factory(factory []mib.Instance, path string) ([]mib.Instance, error) {

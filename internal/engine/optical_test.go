@@ -12,6 +12,8 @@ import (
 	"github.com/xg2010g/airoha-omci/internal/optical"
 )
 
+const testBootID = "01234567-89ab-cdef-0123-456789abcdef"
+
 const opticalANI = uint16(0x8001)
 
 func TestOpticalSampleUpdatesANIGAndAppliesHysteresis(t *testing.T) {
@@ -305,11 +307,144 @@ func TestARCZeroExpiresImmediatelyAnd255NeverExpires(t *testing.T) {
 	}
 }
 
+func TestBERSampleUsesANIGThresholdsAndSequence(t *testing.T) {
+	protocol, _ := newOpticalEngine(t, 0, 0, 0xff, 0xff)
+	key := mib.Key{ClassID: me.AniGClassID, EntityID: opticalANI}
+
+	frames, err := protocol.NotifyBERSample(key, BERSample{
+		Sequence: 1, BIPCount: 25000, IntervalMS: 1000, BootID: testBootID,
+	}, omci.BaselineIdent)
+	if err != nil || len(frames) != 1 {
+		t.Fatalf("NotifyBERSample(SF) frames=%d error=%v", len(frames), err)
+	}
+	alarm := decodeResponse(t, frames[0]).Layer(omci.LayerTypeAlarmNotification).(*omci.AlarmNotificationMsg)
+	if alarm.AlarmBitmap[0] != 0x30 {
+		t.Fatalf("SF/SD bitmap = %x, want bits 2 and 3", alarm.AlarmBitmap)
+	}
+
+	frames, err = protocol.NotifyBERSample(key, BERSample{
+		Sequence: 2, BIPCount: 3, IntervalMS: 1000, BootID: testBootID,
+	}, omci.BaselineIdent)
+	if err != nil || len(frames) != 1 {
+		t.Fatalf("NotifyBERSample(SD) frames=%d error=%v", len(frames), err)
+	}
+	alarm = decodeResponse(t, frames[0]).Layer(omci.LayerTypeAlarmNotification).(*omci.AlarmNotificationMsg)
+	if alarm.AlarmBitmap[0] != 0x10 {
+		t.Fatalf("SD bitmap = %x, want bit 3", alarm.AlarmBitmap)
+	}
+
+	if _, err = protocol.NotifyBERSample(key, BERSample{
+		Sequence: 2, BIPCount: 0, IntervalMS: 1000, BootID: testBootID,
+	}, omci.BaselineIdent); err == nil {
+		t.Fatal("duplicate BER sequence error = nil")
+	}
+
+	request := encodeRequest(t, 110, omci.SetRequestType, &omci.SetRequest{
+		MeBasePacket: omci.MeBasePacket{
+			EntityClass: me.AniGClassID, EntityInstance: opticalANI,
+		},
+		AttributeMask: 0x0200,
+		Attributes: me.AttributeValueMap{
+			me.AniG_SignalDegradeThreshold: uint8(8),
+		},
+	})
+	response, err := protocol.Handle(request)
+	if err != nil {
+		t.Fatalf("Handle(Set SD threshold) error = %v", err)
+	}
+	if result := decodeResponse(t, response).Layer(omci.LayerTypeSetResponse).(*omci.SetResponse).Result; result != me.Success {
+		t.Fatalf("Set SD threshold result = %v", result)
+	}
+	frames = protocol.DrainNotifications()
+	if len(frames) != 1 {
+		t.Fatalf("Set SD threshold notifications = %d, want one clear", len(frames))
+	}
+	alarm = decodeResponse(t, frames[0]).Layer(omci.LayerTypeAlarmNotification).(*omci.AlarmNotificationMsg)
+	if alarm.AlarmBitmap != ([28]byte{}) {
+		t.Fatalf("threshold re-evaluation bitmap = %x, want clear", alarm.AlarmBitmap)
+	}
+}
+
+func TestBERThresholdTenDoesNotTruncateToZero(t *testing.T) {
+	if berThresholdExceeded(BERSample{BIPCount: 0, IntervalMS: 1000}, 10) {
+		t.Fatal("zero BIP count exceeded 10^-10 threshold")
+	}
+	if !berThresholdExceeded(BERSample{BIPCount: 1, IntervalMS: 1000}, 10) {
+		t.Fatal("one BIP count did not exceed 10^-10 threshold")
+	}
+}
+
+func TestBERSampleRejectsZeroSequence(t *testing.T) {
+	protocol, _ := newOpticalEngine(t, 0, 0, 0xff, 0xff)
+	key := mib.Key{ClassID: me.AniGClassID, EntityID: opticalANI}
+	if _, err := protocol.NotifyBERSample(key, BERSample{IntervalMS: 1000},
+		omci.BaselineIdent); err == nil {
+		t.Fatal("NotifyBERSample(zero sequence) error = nil")
+	}
+}
+
+func TestOMCCSessionResetClearsBERSampleSequence(t *testing.T) {
+	protocol, _ := newOpticalEngine(t, 0, 0, 0xff, 0xff)
+	key := mib.Key{ClassID: me.AniGClassID, EntityID: opticalANI}
+	if _, err := protocol.NotifyBERSample(key, BERSample{
+		Sequence: 8, BIPCount: 3, IntervalMS: 1000, BootID: testBootID,
+	}, omci.BaselineIdent); err != nil {
+		t.Fatal(err)
+	}
+	protocol.ResetCommunicationSession()
+	frames, err := protocol.NotifyBERSample(key, BERSample{
+		Sequence: 1, BIPCount: 0, IntervalMS: 1000, BootID: testBootID,
+	}, omci.BaselineIdent)
+	if err != nil || len(frames) != 1 {
+		t.Fatalf("post-reset BER sample frames=%d error=%v", len(frames), err)
+	}
+	if _, err := protocol.NotifyBERSample(key, BERSample{
+		Sequence: 1, BIPCount: 0, IntervalMS: 1000, BootID: testBootID,
+	}, omci.BaselineIdent); err == nil {
+		t.Fatal("post-reset duplicate BER sample error = nil")
+	}
+}
+
+func TestRejectedBERSampleDoesNotAdvanceSequence(t *testing.T) {
+	key := mib.Key{ClassID: me.AniGClassID, EntityID: opticalANI}
+	store, err := mib.New([]mib.Instance{{Key: key, Attributes: me.AttributeValueMap{}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	protocol := New(store)
+	sample := BERSample{Sequence: 1, BIPCount: 0, IntervalMS: 1000, BootID: testBootID}
+	if _, err = protocol.NotifyBERSample(key, sample, omci.BaselineIdent); err == nil {
+		t.Fatal("NotifyBERSample(missing ANI-G) error = nil")
+	}
+	if len(protocol.berSample) != 0 {
+		t.Fatalf("rejected BER sample was retained: %#v", protocol.berSample)
+	}
+}
+
+func TestBERSampleAcceptsNewSystemBoot(t *testing.T) {
+	protocol, _ := newOpticalEngine(t, 0, 0, 0xff, 0xff)
+	key := mib.Key{ClassID: me.AniGClassID, EntityID: opticalANI}
+	if _, err := protocol.NotifyBERSample(key, BERSample{
+		Sequence: 8, BIPCount: 3, IntervalMS: 1000, BootID: testBootID,
+	}, omci.BaselineIdent); err != nil {
+		t.Fatal(err)
+	}
+	frames, err := protocol.NotifyBERSample(key, BERSample{
+		Sequence: 1, BIPCount: 0, IntervalMS: 1000,
+		BootID: "fedcba98-7654-3210-fedc-ba9876543210",
+	}, omci.BaselineIdent)
+	if err != nil || len(frames) != 1 {
+		t.Fatalf("new-system BER sample frames=%d error=%v", len(frames), err)
+	}
+}
+
 func newOpticalEngine(t *testing.T, arc, interval, lowerReceive, upperReceive uint8) (*Engine, *mib.Store) {
 	t.Helper()
 	store, err := mib.New([]mib.Instance{{
 		Key: mib.Key{ClassID: me.AniGClassID, EntityID: opticalANI},
 		Attributes: me.AttributeValueMap{
+			me.AniG_SignalFailThreshold:         uint8(5),
+			me.AniG_SignalDegradeThreshold:      uint8(9),
 			me.AniG_Arc:                         arc,
 			me.AniG_ArcInterval:                 interval,
 			me.AniG_OpticalSignalLevel:          uint16(0),

@@ -145,6 +145,8 @@ type Decision struct {
 type ActiveGroup struct {
 	Interface        string
 	Source           netip.Addr
+	IncludedSources  []netip.Addr
+	ExcludedSources  []netip.Addr
 	Group            netip.Addr
 	Client           netip.Addr
 	UNIVLAN          VLAN

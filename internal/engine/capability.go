@@ -292,7 +292,7 @@ func capabilityActionImplemented(classID me.ClassID, access me.ClassAccess, mess
 func capabilityAlarmCodes(classID me.ClassID) []byte {
 	switch classID {
 	case me.AniGClassID:
-		return []byte{0, 1, 2, 4, 5, 6}
+		return []byte{0, 1, 2, 3, 4, 5, 6}
 	case me.PhysicalPathTerminationPointEthernetUniClassID:
 		return []byte{0}
 	}

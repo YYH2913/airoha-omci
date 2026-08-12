@@ -12,11 +12,13 @@ import (
 )
 
 const (
-	aniLowReceiveAlarm   = uint8(0)
-	aniHighReceiveAlarm  = uint8(1)
-	aniLowTransmitAlarm  = uint8(4)
-	aniHighTransmitAlarm = uint8(5)
-	aniLaserBiasAlarm    = uint8(6)
+	aniLowReceiveAlarm    = uint8(0)
+	aniHighReceiveAlarm   = uint8(1)
+	aniSignalFailAlarm    = uint8(2)
+	aniSignalDegradeAlarm = uint8(3)
+	aniLowTransmitAlarm   = uint8(4)
+	aniHighTransmitAlarm  = uint8(5)
+	aniLaserBiasAlarm     = uint8(6)
 
 	// The G.988 thresholds have 0.5 dB granularity. Use one code point as
 	// hysteresis when the OLT supplies a threshold.
@@ -34,7 +36,15 @@ const (
 	internalTXHighClear   = uint16(0xffff)
 	internalBiasHighAlarm = uint16(0xa605)
 	internalBiasHighClear = uint16(0x9c40)
+	gponDownstreamBitRate = uint64(2488320000)
 )
+
+type BERSample struct {
+	Sequence   uint64 `json:"sequence"`
+	BIPCount   uint32 `json:"bip_count"`
+	IntervalMS uint32 `json:"interval_ms"`
+	BootID     string `json:"boot_id"`
+}
 
 type aniOpticalConfiguration struct {
 	lowerReceive  uint8
@@ -97,6 +107,102 @@ func (e *Engine) evaluateOpticalSampleLocked(key mib.Key, sample optical.Sample,
 		frames = append(frames, frame)
 	}
 	return frames, nil
+}
+
+// NotifyBERSample evaluates the ANI-G SF and SD alarms from one OLT-defined
+// BER interval. LOS and LOF are intentionally not accepted as substitutes.
+func (e *Engine) NotifyBERSample(key mib.Key, sample BERSample,
+	device omci.DeviceIdent) ([][]byte, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if err := validateDeviceIdentifier(device); err != nil {
+		return nil, err
+	}
+	device = e.notificationDeviceLocked(device)
+	if key.ClassID != me.AniGClassID {
+		return nil, fmt.Errorf("BER sample target %v/%#x is not ANI-G", key.ClassID, key.EntityID)
+	}
+	if err := validateBERSample(sample); err != nil {
+		return nil, err
+	}
+	if previous, present := e.berSample[key]; present && sample.BootID == previous.BootID &&
+		sample.Sequence <= previous.Sequence {
+		return nil, fmt.Errorf("BER sample sequence %d is not newer than %d",
+			sample.Sequence, previous.Sequence)
+	}
+	frames, err := e.evaluateBERSampleLocked(key, sample, device)
+	if err != nil {
+		return nil, err
+	}
+	e.berSample[key] = sample
+	return frames, nil
+}
+
+func validateBERSample(sample BERSample) error {
+	if sample.Sequence == 0 {
+		return fmt.Errorf("BER sample sequence is zero")
+	}
+	if sample.IntervalMS == 0 {
+		return fmt.Errorf("BER sample interval is zero")
+	}
+	if !validBootID(sample.BootID) {
+		return fmt.Errorf("BER sample boot ID is invalid")
+	}
+	return nil
+}
+
+func validBootID(value string) bool {
+	if len(value) != 36 || value[8] != '-' || value[13] != '-' ||
+		value[18] != '-' || value[23] != '-' {
+		return false
+	}
+	for index := range value {
+		if index == 8 || index == 13 || index == 18 || index == 23 {
+			continue
+		}
+		if !((value[index] >= '0' && value[index] <= '9') ||
+			(value[index] >= 'a' && value[index] <= 'f') ||
+			(value[index] >= 'A' && value[index] <= 'F')) {
+			return false
+		}
+	}
+	return true
+}
+
+func (e *Engine) evaluateBERSampleLocked(key mib.Key, sample BERSample,
+	device omci.DeviceIdent) ([][]byte, error) {
+	instance, err := e.mib.Get(key, 0x0600)
+	if err != nil {
+		return nil, err
+	}
+	sf, sfPresent := instance.Attributes[me.AniG_SignalFailThreshold].(uint8)
+	sd, sdPresent := instance.Attributes[me.AniG_SignalDegradeThreshold].(uint8)
+	if !sfPresent || !sdPresent {
+		return nil, fmt.Errorf("ANI-G BER thresholds are missing")
+	}
+
+	bitmap := e.alarms[key]
+	setAlarmCondition(&bitmap, aniSignalFailAlarm, berThresholdExceeded(sample, sf))
+	setAlarmCondition(&bitmap, aniSignalDegradeAlarm, berThresholdExceeded(sample, sd))
+	frame, emitted, err := e.notifyAlarmLocked(key, bitmap, device)
+	if err != nil || !emitted {
+		return nil, err
+	}
+	return [][]byte{frame}, nil
+}
+
+func berThresholdExceeded(sample BERSample, exponent uint8) bool {
+	scale := uint64(1000)
+	for i := uint8(0); i < exponent; i++ {
+		scale *= 10
+	}
+	windowBits := gponDownstreamBitRate * uint64(sample.IntervalMS)
+	minimumBIP := windowBits / scale
+	if windowBits%scale != 0 {
+		minimumBIP++
+	}
+	return uint64(sample.BIPCount) >= minimumBIP
 }
 
 func (e *Engine) aniOpticalConfigurationLocked(key mib.Key) (aniOpticalConfiguration, error) {

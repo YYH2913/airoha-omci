@@ -32,6 +32,7 @@ func TestXG2010GFactoryMIB(t *testing.T) {
 	var onu mib.Instance
 	var onu2 mib.Instance
 	var onu3Instance mib.Instance
+	cardholders := make(map[uint16]mib.Instance)
 	circuitPacks := make(map[uint16]mib.Instance)
 	for _, item := range store.Snapshot() {
 		switch item.ClassID {
@@ -43,6 +44,8 @@ func TestXG2010GFactoryMIB(t *testing.T) {
 			onu2 = item
 		case me.Onu3GClassID:
 			onu3Instance = item
+		case me.CardholderClassID:
+			cardholders[item.EntityID] = item
 		case me.CircuitPackClassID:
 			circuitPacks[item.EntityID] = item
 		case me.PhysicalPathTerminationPointEthernetUniClassID:
@@ -86,6 +89,11 @@ func TestXG2010GFactoryMIB(t *testing.T) {
 		onu2.Attributes[me.Onu2G_TotalTrafficSchedulerNumber] != uint8(0) {
 		t.Fatalf("ONU2-G global QoS resources = %#v, want no resources outside circuit packs", onu2.Attributes)
 	}
+	if onu2.Attributes[me.Onu2G_ConnectivityCapability] != uint16(0) ||
+		onu2.Attributes[me.Onu2G_CurrentConnectivityMode] != uint8(0) ||
+		onu2.Attributes[me.Onu2G_QualityOfServiceQosConfigurationFlexibility] != uint16(0x0008) {
+		t.Fatalf("ONU2-G connectivity/QoS declarations = %#v", onu2.Attributes)
+	}
 	if onu3Instance.Attributes[me.Onu3G_TotalNumberOfStatusSnapshots] != uint16(16) ||
 		onu3Instance.Attributes[me.Onu3G_NumberOfValidStatusSnapshots] != uint16(0) ||
 		onu3Instance.Attributes[me.Onu3G_NextStatusSnapshotIndex] != uint16(0) ||
@@ -98,6 +106,25 @@ func TestXG2010GFactoryMIB(t *testing.T) {
 	if got := circuitPacks[ethernetCardID].Attributes[me.CircuitPack_TotalPriorityQueueNumber]; got != uint8(len(ethernetConfiguration)*queuesPerPort) {
 		t.Fatalf("Ethernet circuit-pack queues = %#v, want %d", got,
 			len(ethernetConfiguration)*queuesPerPort)
+	}
+	for holderID, cardID := range map[uint16]uint16{
+		ethernetHolderID: ethernetCardID,
+		aniHolderID:      aniCardID,
+	} {
+		holder, holderPresent := cardholders[holderID]
+		card, cardPresent := circuitPacks[cardID]
+		if !holderPresent || !cardPresent || holderID != cardID ||
+			holder.Attributes[me.Cardholder_ActualPlugInUnitType] != card.Attributes[me.CircuitPack_Type] ||
+			holder.Attributes[me.Cardholder_ExpectedPlugInUnitType] != card.Attributes[me.CircuitPack_Type] {
+			t.Fatalf("cardholder/circuit-pack topology %#x = %#v/%#v", holderID, holder, card)
+		}
+	}
+	if uint8(ani.EntityID>>8) != uint8(aniCardID&0xff) {
+		t.Fatalf("ANI-G slot %#x does not match circuit-pack slot %#x",
+			ani.EntityID>>8, aniCardID&0xff)
+	}
+	if got := circuitPacks[ethernetCardID].Attributes[me.CircuitPack_TotalTContBufferNumber]; got != uint8(0) {
+		t.Fatalf("Ethernet circuit-pack T-CONT buffers = %#v, want 0", got)
 	}
 	if got := circuitPacks[ethernetCardID].Attributes[me.CircuitPack_Type]; got != uint8(45) {
 		t.Fatalf("Ethernet circuit-pack type = %#v, want mixed services equipment", got)
@@ -116,6 +143,14 @@ func TestXG2010GFactoryMIB(t *testing.T) {
 		if got := sensedTypes[entityID]; got != ethernetSensedType[index] {
 			t.Fatalf("Ethernet UNI %#x sensed type = %d, want %d",
 				entityID, got, ethernetSensedType[index])
+		}
+		uni, err := store.Get(mib.Key{ClassID: me.UniGClassID, EntityID: entityID}, 0xe000)
+		if err != nil {
+			t.Fatalf("Get(UNI-G %#x) error = %v", entityID, err)
+		}
+		if uni.Attributes[me.UniG_Deprecated] != uint16(0) ||
+			uni.Attributes[me.UniG_ManagementCapability] != uint8(0) {
+			t.Fatalf("UNI-G %#x attributes = %#v", entityID, uni.Attributes)
 		}
 	}
 }
@@ -140,6 +175,7 @@ func TestXG2010GSupportedClassesAreExplicitAndSorted(t *testing.T) {
 	}
 	for _, required := range []me.ClassID{
 		me.OmciClassID, me.ManagedEntityMeClassID, me.AttributeMeClassID,
+		me.CardholderClassID,
 		me.GemPortNetworkCtpClassID, me.ExtendedVlanTaggingOperationConfigurationDataClassID,
 		me.Dot1RateLimiterClassID,
 		me.Onu3GClassID,

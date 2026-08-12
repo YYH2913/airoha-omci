@@ -7,13 +7,90 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	omci "github.com/opencord/omci-lib-go/v2"
 	me "github.com/opencord/omci-lib-go/v2/generated"
+	"github.com/xg2010g/airoha-omci/internal/engine"
 	"github.com/xg2010g/airoha-omci/internal/mib"
 	"github.com/xg2010g/airoha-omci/internal/model"
 	"github.com/xg2010g/airoha-omci/internal/platform"
 )
+
+func TestRuntimeStateWriterPublishesOnlyChangesAndRestores(t *testing.T) {
+	protocol, key := daemonRuntimeEngine(t)
+	path := filepath.Join(t.TempDir(), "persistent", "runtime.json")
+	writer := newRuntimeStateWriter(path)
+	written, err := writer.Write(protocol)
+	if err != nil || !written {
+		t.Fatalf("first Write() written=%t error=%v", written, err)
+	}
+	first, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	written, err = writer.Write(protocol)
+	if err != nil || written {
+		t.Fatalf("unchanged Write() written=%t error=%v", written, err)
+	}
+	second, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !first.ModTime().Equal(second.ModTime()) {
+		t.Fatalf("unchanged runtime state rewrote the file")
+	}
+
+	var alarm [28]byte
+	alarm[0] = 0x80
+	if _, emitted, err := protocol.NotifyAlarm(key, alarm, omci.BaselineIdent); err != nil || !emitted {
+		t.Fatalf("NotifyAlarm() emitted=%t error=%v", emitted, err)
+	}
+	written, err = writer.Write(protocol)
+	if err != nil || !written {
+		t.Fatalf("changed Write() written=%t error=%v", written, err)
+	}
+	restored, _ := daemonRuntimeEngine(t)
+	if err := restoreRuntimeState(restored, path); err != nil {
+		t.Fatalf("restoreRuntimeState() error = %v", err)
+	}
+	if frame, emitted, err := restored.NotifyAlarm(key, alarm, omci.BaselineIdent); err != nil || emitted || frame != nil {
+		t.Fatalf("restored duplicate alarm frame=%x emitted=%t error=%v", frame, emitted, err)
+	}
+}
+
+func TestRestoreRuntimeStateRejectsUnknownAndTrailingJSON(t *testing.T) {
+	protocol, _ := daemonRuntimeEngine(t)
+	for name, document := range map[string]string{
+		"unknown":  `{"version":1,"unknown":true}`,
+		"trailing": `{}` + "\n{}",
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "runtime.json")
+			if err := os.WriteFile(path, []byte(document), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := restoreRuntimeState(protocol, path); err == nil ||
+				(name == "unknown" && !strings.Contains(err.Error(), "unknown field")) ||
+				(name == "trailing" && !strings.Contains(err.Error(), "trailing")) {
+				t.Fatalf("restoreRuntimeState(%s) error = %v", name, err)
+			}
+		})
+	}
+}
+
+func daemonRuntimeEngine(t *testing.T) (*engine.Engine, mib.Key) {
+	t.Helper()
+	factory := daemonTestFactory(t, "ABCD01020304")
+	key := mib.Key{ClassID: me.PhysicalPathTerminationPointEthernetUniClassID,
+		EntityID: 0x0101}
+	store, err := mib.New(factory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return engine.New(store), key
+}
 
 func TestInitializeMIBRestoresCommittedState(t *testing.T) {
 	factory := daemonTestFactory(t, "ABCD01020304")

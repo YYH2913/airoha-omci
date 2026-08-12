@@ -16,6 +16,7 @@ import (
 func XG2010GSupportedClasses() []me.ClassID {
 	classes := []me.ClassID{
 		me.OnuDataClassID,
+		me.CardholderClassID,
 		me.CircuitPackClassID,
 		me.SoftwareImageClassID,
 		me.PhysicalPathTerminationPointEthernetUniClassID,
@@ -182,6 +183,9 @@ func XG2010GAttributeCapabilities() map[mib.AttributeCapabilityKey]mib.Attribute
 	enumeration(me.AniGClassID, me.AniG_PiggybackDbaReporting, 0)
 	enumeration(me.AniGClassID, me.AniG_Arc, 0, 1)
 
+	enumeration(me.CardholderClassID, me.Cardholder_ActualPlugInUnitType, 45, 0xf5)
+	enumeration(me.CardholderClassID, me.Cardholder_ExpectedPlugInUnitType, 45, 0xf5)
+
 	enumeration(me.CircuitPackClassID, me.CircuitPack_Type, 45, 0xf5)
 	enumeration(me.CircuitPackClassID, me.CircuitPack_AdministrativeState, 0, 1)
 	enumeration(me.CircuitPackClassID, me.CircuitPack_OperationalState, 0, 1)
@@ -282,7 +286,7 @@ func XG2010GAttributeCapabilities() map[mib.AttributeCapabilityKey]mib.Attribute
 	enumeration(me.TrafficSchedulerClassID, me.TrafficScheduler_Policy, 0, 1, 2)
 	enumeration(me.TrafficDescriptorClassID, me.TrafficDescriptor_MeterType, 0, 2)
 	enumeration(me.UniGClassID, me.UniG_AdministrativeState, 0, 1)
-	enumeration(me.UniGClassID, me.UniG_ManagementCapability, 1)
+	enumeration(me.UniGClassID, me.UniG_ManagementCapability, 0)
 
 	enumeration(me.VlanTaggingFilterDataClassID,
 		me.VlanTaggingFilterData_ForwardOperation, sequence(0, 0x21)...)
@@ -304,6 +308,21 @@ func XG2010GAttributeCapabilities() map[mib.AttributeCapabilityKey]mib.Attribute
 // values exceed what the fixed EN7581 data path can faithfully implement.
 func XG2010GValidateInstance(instance mib.Instance) error {
 	switch instance.ClassID {
+	case me.CardholderClassID:
+		actual, actualPresent := instance.Attributes[me.Cardholder_ActualPlugInUnitType].(uint8)
+		expected, expectedPresent := instance.Attributes[me.Cardholder_ExpectedPlugInUnitType].(uint8)
+		if actualPresent && expectedPresent && expected != actual {
+			return xg2010gAttributeError(instance.ClassID,
+				me.Cardholder_ExpectedPlugInUnitType,
+				"expected plug-in type %d does not match fixed integrated equipment type %d",
+				expected, actual)
+		}
+	case me.Onu2GClassID:
+		if value, present := instance.Attributes[me.Onu2G_CurrentConnectivityMode].(uint8); present && value != 0 {
+			return xg2010gAttributeError(instance.ClassID,
+				me.Onu2G_CurrentConnectivityMode,
+				"connectivity mode %d is unsupported; XG2010G uses its fixed service graph", value)
+		}
 	case me.PhysicalPathTerminationPointEthernetUniClassID:
 		expected, expectedPresent := instance.Attributes[me.PhysicalPathTerminationPointEthernetUni_ExpectedType].(uint8)
 		sensed, sensedPresent := instance.Attributes[me.PhysicalPathTerminationPointEthernetUni_SensedType].(uint8)
@@ -328,6 +347,55 @@ func XG2010GValidateInstance(instance mib.Instance) error {
 		if value, present := instance.Attributes[me.TrafficDescriptor_MeterType].(uint8); present && value != 0 && value != 2 {
 			return xg2010gAttributeError(instance.ClassID, me.TrafficDescriptor_MeterType,
 				"traffic descriptor meter type %d is unsupported; use unspecified or RFC 2698", value)
+		}
+	case me.TContClassID:
+		if value, present := instance.Attributes[me.TCont_Policy].(uint8); present && value != 0 {
+			return xg2010gAttributeError(instance.ClassID, me.TCont_Policy,
+				"T-CONT policy %d is fixed; configure the associated traffic scheduler", value)
+		}
+	case me.TrafficSchedulerClassID:
+		if value, present := instance.Attributes[me.TrafficScheduler_TContPointer].(uint16); present &&
+			value != instance.EntityID {
+			return xg2010gAttributeError(instance.ClassID, me.TrafficScheduler_TContPointer,
+				"traffic scheduler %#x is fixed to T-CONT %#x", instance.EntityID, instance.EntityID)
+		}
+		if value, present := instance.Attributes[me.TrafficScheduler_TrafficSchedulerPointer].(uint16); present && value != 0 {
+			return xg2010gAttributeError(instance.ClassID,
+				me.TrafficScheduler_TrafficSchedulerPointer,
+				"traffic scheduler %#x cannot be chained to scheduler %#x", instance.EntityID, value)
+		}
+	case me.PriorityQueueClassID:
+		related, relatedPresent := instance.Attributes[me.PriorityQueue_RelatedPort].(uint32)
+		if relatedPresent {
+			upstream := instance.EntityID&0x8000 != 0
+			queueIndex := instance.EntityID & 0x7fff
+			var wantOwner uint16
+			var wantPriority uint16
+			if upstream {
+				wantOwner = uint16(0x8001 + queueIndex/queuesPerPort)
+				wantPriority = queueIndex % queuesPerPort
+			} else {
+				wantOwner = uint16(ethernetCardID + queueIndex/queuesPerPort)
+				wantPriority = queueIndex % queuesPerPort
+			}
+			want := uint32(wantOwner)<<16 | uint32(wantPriority)
+			if related != want {
+				return xg2010gAttributeError(instance.ClassID, me.PriorityQueue_RelatedPort,
+					"priority queue %#x has fixed related port %#x, not %#x",
+					instance.EntityID, want, related)
+			}
+		}
+		if scheduler, present := instance.Attributes[me.PriorityQueue_TrafficSchedulerPointer].(uint16); present {
+			want := uint16(0)
+			if instance.EntityID&0x8000 != 0 {
+				want = uint16(0x8001 + (instance.EntityID&0x7fff)/queuesPerPort)
+			}
+			if scheduler != want {
+				return xg2010gAttributeError(instance.ClassID,
+					me.PriorityQueue_TrafficSchedulerPointer,
+					"priority queue %#x has fixed scheduler %#x, not %#x",
+					instance.EntityID, want, scheduler)
+			}
 		}
 	}
 	return nil

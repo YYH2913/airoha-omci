@@ -13,8 +13,10 @@ import (
 
 const (
 	aniEntityID       = 0x8001
+	ethernetHolderID  = 0x0101
+	aniHolderID       = 0x0180
 	ethernetCardID    = 0x0101
-	aniCardID         = 0x0102
+	aniCardID         = 0x0180
 	softwareImageAID  = 0
 	softwareImageBID  = 1
 	defaultTContCount = 8
@@ -80,10 +82,14 @@ func XG2010G(identity Identity) ([]mib.Instance, error) {
 			me.Onu2G_TotalTrafficSchedulerNumber:                              uint8(0),
 			me.Onu2G_Deprecated:                                               uint8(1),
 			me.Onu2G_TotalGemPortIdNumber:                                     uint16(256),
-			me.Onu2G_ConnectivityCapability:                                   uint16(0x007f),
-			me.Onu2G_CurrentConnectivityMode:                                  uint8(0),
-			me.Onu2G_QualityOfServiceQosConfigurationFlexibility:              uint16(0x003f),
-			me.Onu2G_PriorityQueueScaleFactor:                                 uint16(1),
+			// The backend accepts the standard bridge/mapping MEs directly; it
+			// does not implement ONU-wide connectivity-mode switching.
+			me.Onu2G_ConnectivityCapability:  uint16(0),
+			me.Onu2G_CurrentConnectivityMode: uint8(0),
+			// Only traffic-scheduler policy is reconfigurable. Queue ownership,
+			// scheduler ownership and T-CONT policy are fixed by the factory MIB.
+			me.Onu2G_QualityOfServiceQosConfigurationFlexibility: uint16(0x0008),
+			me.Onu2G_PriorityQueueScaleFactor:                    uint16(1),
 		}),
 		instance(me.Onu3GClassID, 0, me.AttributeValueMap{
 			me.Onu3G_LatestRestartReason:          identity.RestartReason,
@@ -114,6 +120,14 @@ func XG2010G(identity Identity) ([]mib.Instance, error) {
 			me.AniG_LowerTransmitPowerThreshold: uint8(0x81),
 			me.AniG_UpperTransmitPowerThreshold: uint8(0x81),
 		}),
+		instance(me.CardholderClassID, ethernetHolderID, me.AttributeValueMap{
+			me.Cardholder_ActualPlugInUnitType:   uint8(45),
+			me.Cardholder_ExpectedPlugInUnitType: uint8(45),
+		}),
+		instance(me.CardholderClassID, aniHolderID, me.AttributeValueMap{
+			me.Cardholder_ActualPlugInUnitType:   uint8(0xf5),
+			me.Cardholder_ExpectedPlugInUnitType: uint8(0xf5),
+		}),
 		instance(me.CircuitPackClassID, ethernetCardID, me.AttributeValueMap{
 			me.CircuitPack_Type:                        uint8(45),
 			me.CircuitPack_NumberOfPorts:               uint8(4),
@@ -124,6 +138,7 @@ func XG2010G(identity Identity) ([]mib.Instance, error) {
 			me.CircuitPack_OperationalState:            uint8(0),
 			me.CircuitPack_BridgedOrIpInd:              uint8(0),
 			me.CircuitPack_EquipmentId:                 octets(identity.EquipmentID+" Ethernet", 20),
+			me.CircuitPack_TotalTContBufferNumber:      uint8(0),
 			me.CircuitPack_TotalPriorityQueueNumber:    uint8(32),
 			me.CircuitPack_TotalTrafficSchedulerNumber: uint8(0),
 		}),
@@ -177,9 +192,9 @@ func XG2010G(identity Identity) ([]mib.Instance, error) {
 				me.PhysicalPathTerminationPointEthernetUni_ArcInterval:                uint8(0),
 			}),
 			instance(me.UniGClassID, entityID, me.AttributeValueMap{
-				me.UniG_Deprecated:           uint8(0),
+				me.UniG_Deprecated:           uint16(0),
 				me.UniG_AdministrativeState:  uint8(0),
-				me.UniG_ManagementCapability: uint8(1),
+				me.UniG_ManagementCapability: uint8(0),
 			}),
 		)
 		for priority := 0; priority < queuesPerPort; priority++ {

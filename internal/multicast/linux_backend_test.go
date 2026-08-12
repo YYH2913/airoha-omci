@@ -99,6 +99,93 @@ func TestLinuxBackendBuildsStaticRangeAndDefaultDrop(t *testing.T) {
 	}
 }
 
+func TestLinuxBackendDispatchesEachGEMToAnIsolatedChain(t *testing.T) {
+	runner := &recordingCommandRunner{}
+	backend := NewLinuxBackend(LinuxBackendOptions{TC: "tc-test", Runner: runner})
+	first := acl(1, "239.1.0.1", "239.1.0.1", 100)
+	first.GEMPortID = 201
+	second := acl(2, "239.1.0.1", "239.1.0.1", 100)
+	second.GEMPortID = 202
+	configured := profile(1, first, second)
+	if err := backend.Configure(Config{Profiles: []Profile{configured}, Subscribers: []Subscriber{{
+		EntityID: 10, Profile: 1, Attachments: []Attachment{{Interface: "lan1", BridgeEntity: 0x100}},
+	}}}); err != nil {
+		t.Fatalf("Configure() error = %v", err)
+	}
+	joined := commandLines(runner.commands)
+	for _, expected := range []string{
+		"handle 0xa17000c9/0xffffffff fw action goto chain 20201",
+		"handle 0xa17000ca/0xffffffff fw action goto chain 20202",
+		"dev lan1 egress chain 20201",
+		"dev lan1 egress chain 20202",
+	} {
+		if !strings.Contains(joined, expected) {
+			t.Fatalf("GEM-isolated rules do not contain %q:\n%s", expected, joined)
+		}
+	}
+}
+
+func TestLinuxBackendInstallsExcludeSourceDropBeforeDynamicPass(t *testing.T) {
+	runner := &recordingCommandRunner{}
+	backend := NewLinuxBackend(LinuxBackendOptions{TC: "tc-test", Runner: runner})
+	configured := profile(1, acl(1, "239.1.0.1", "239.1.0.1", 100))
+	config := Config{Profiles: []Profile{configured}, Subscribers: []Subscriber{{
+		EntityID: 10, Profile: 1, Attachments: []Attachment{{Interface: "lan1", BridgeEntity: 0x100}},
+	}}}
+	if err := backend.Configure(config); err != nil {
+		t.Fatalf("Configure() error = %v", err)
+	}
+	runner.commands = nil
+	if err := backend.SetReplication(ReplicationChange{Enable: true, Subscriber: config.Subscribers[0],
+		Attachment: config.Subscribers[0].Attachments[0], Profile: configured,
+		Group: ActiveGroup{Source: netip.IPv4Unspecified(), ExcludedSources: []netip.Addr{addr("192.0.2.9")},
+			Group: addr("239.1.0.1"), ANIVLAN: 100, GEMPortID: 200}}); err != nil {
+		t.Fatalf("SetReplication() error = %v", err)
+	}
+	joined := commandLines(runner.commands)
+	drop := "src_ip 192.0.2.9 dst_ip 239.1.0.1/32 action drop"
+	pass := "dst_ip 239.1.0.1/32 action goto chain 2012"
+	dropIndex, passIndex := strings.Index(joined, drop), strings.Index(joined, pass)
+	if dropIndex < 0 || passIndex < 0 || dropIndex > passIndex {
+		t.Fatalf("exclude source was not dropped before pass:\n%s", joined)
+	}
+}
+
+func TestLinuxBackendIncludeSourceOverridesExcludeDropOnSameGEM(t *testing.T) {
+	runner := &recordingCommandRunner{}
+	backend := NewLinuxBackend(LinuxBackendOptions{TC: "tc-test", Runner: runner})
+	configured := profile(1, acl(1, "239.1.0.1", "239.1.0.1", 100))
+	config := Config{Profiles: []Profile{configured}, Subscribers: []Subscriber{{
+		EntityID: 10, Profile: 1, Attachments: []Attachment{{Interface: "lan1", BridgeEntity: 0x100}},
+	}}}
+	if err := backend.Configure(config); err != nil {
+		t.Fatalf("Configure() error = %v", err)
+	}
+	wildcard := ReplicationChange{Enable: true, Subscriber: config.Subscribers[0],
+		Attachment: config.Subscribers[0].Attachments[0], Profile: configured,
+		Group: ActiveGroup{Source: netip.IPv4Unspecified(), ExcludedSources: []netip.Addr{addr("192.0.2.9")},
+			Group: addr("239.1.0.1"), ANIVLAN: 100, GEMPortID: 200}}
+	if err := backend.SetReplication(wildcard); err != nil {
+		t.Fatalf("SetReplication(EXCLUDE) error = %v", err)
+	}
+	runner.commands = nil
+	include := wildcard
+	include.Group.Source = addr("192.0.2.9")
+	include.Group.ExcludedSources = nil
+	if err := backend.SetReplication(include); err != nil {
+		t.Fatalf("SetReplication(INCLUDE) error = %v", err)
+	}
+	joined := commandLines(runner.commands)
+	if strings.Contains(joined, "src_ip 192.0.2.9 dst_ip 239.1.0.1/32 action drop") {
+		t.Fatalf("INCLUDE source is still excluded:\n%s", joined)
+	}
+	specific := strings.Index(joined, "src_ip 192.0.2.9 dst_ip 239.1.0.1/32")
+	wildcardPass := strings.Index(joined, "flower skip_hw num_of_vlans 1 vlan_id 100 vlan_ethtype ip dst_ip 239.1.0.1/32")
+	if specific < 0 || wildcardPass < 0 || specific > wildcardPass {
+		t.Fatalf("source-specific pass does not precede wildcard pass:\n%s", joined)
+	}
+}
+
 func TestLinuxBackendAppliesDownstreamControlToOLTQueries(t *testing.T) {
 	runner := &recordingCommandRunner{}
 	backend := NewLinuxBackend(LinuxBackendOptions{TC: "tc-test", Runner: runner})

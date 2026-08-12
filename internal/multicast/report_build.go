@@ -5,6 +5,7 @@ package multicast
 import (
 	"encoding/binary"
 	"fmt"
+	"math"
 	"net/netip"
 )
 
@@ -118,16 +119,38 @@ func buildIGMPPacket(report UpstreamReport) ([]byte, error) {
 			destination = [4]byte{224, 0, 0, 2}
 		}
 	case 3:
+		if len(report.Group.ExcludedSources) > math.MaxUint16 {
+			return nil, fmt.Errorf("too many IGMP exclusion sources: %d", len(report.Group.ExcludedSources))
+		}
+		included := report.Group.IncludedSources
+		if len(included) == 0 && !wildcard {
+			included = []netip.Addr{source}
+		}
+		if len(included) > math.MaxUint16 {
+			return nil, fmt.Errorf("too many IGMP inclusion sources: %d", len(included))
+		}
 		igmp = make([]byte, 16)
 		igmp[0] = 0x22
 		binary.BigEndian.PutUint16(igmp[6:8], 1)
 		if report.Join {
 			if wildcard {
 				igmp[8] = byte(ChangeToExcludeMode)
+				binary.BigEndian.PutUint16(igmp[10:12], uint16(len(report.Group.ExcludedSources)))
+				for _, excluded := range report.Group.ExcludedSources {
+					if !excluded.Is4() {
+						return nil, fmt.Errorf("IGMP exclusion source %s is not IPv4", excluded)
+					}
+					igmp = append(igmp, excluded.AsSlice()...)
+				}
 			} else {
 				igmp[8] = byte(ChangeToIncludeMode)
-				binary.BigEndian.PutUint16(igmp[10:12], 1)
-				igmp = append(igmp, source.AsSlice()...)
+				binary.BigEndian.PutUint16(igmp[10:12], uint16(len(included)))
+				for _, includedSource := range included {
+					if !includedSource.Is4() {
+						return nil, fmt.Errorf("IGMP inclusion source %s is not IPv4", includedSource)
+					}
+					igmp = append(igmp, includedSource.AsSlice()...)
+				}
 			}
 		} else if wildcard {
 			igmp[8] = byte(ChangeToIncludeMode)
@@ -178,16 +201,38 @@ func buildMLDPacket(report UpstreamReport) ([]byte, error) {
 		}
 		copy(icmp[8:24], group[:])
 	case 17:
+		if len(report.Group.ExcludedSources) > math.MaxUint16 {
+			return nil, fmt.Errorf("too many MLD exclusion sources: %d", len(report.Group.ExcludedSources))
+		}
+		included := report.Group.IncludedSources
+		if len(included) == 0 && !wildcard {
+			included = []netip.Addr{sourceAddress}
+		}
+		if len(included) > math.MaxUint16 {
+			return nil, fmt.Errorf("too many MLD inclusion sources: %d", len(included))
+		}
 		icmp = make([]byte, 28)
 		icmp[0] = 143
 		binary.BigEndian.PutUint16(icmp[6:8], 1)
 		if report.Join {
 			if wildcard {
 				icmp[8] = byte(ChangeToExcludeMode)
+				binary.BigEndian.PutUint16(icmp[10:12], uint16(len(report.Group.ExcludedSources)))
+				for _, excluded := range report.Group.ExcludedSources {
+					if !excluded.Is6() || excluded.Is4In6() {
+						return nil, fmt.Errorf("MLD exclusion source %s is not IPv6", excluded)
+					}
+					icmp = append(icmp, excluded.AsSlice()...)
+				}
 			} else {
 				icmp[8] = byte(ChangeToIncludeMode)
-				binary.BigEndian.PutUint16(icmp[10:12], 1)
-				icmp = append(icmp, sourceAddress.AsSlice()...)
+				binary.BigEndian.PutUint16(icmp[10:12], uint16(len(included)))
+				for _, includedSource := range included {
+					if !includedSource.Is6() || includedSource.Is4In6() {
+						return nil, fmt.Errorf("MLD inclusion source %s is not IPv6", includedSource)
+					}
+					icmp = append(icmp, includedSource.AsSlice()...)
+				}
 			}
 		} else if wildcard {
 			icmp[8] = byte(ChangeToIncludeMode)

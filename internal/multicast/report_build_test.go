@@ -75,6 +75,66 @@ func TestBuildUpstreamMLDv2SourceSpecificLeave(t *testing.T) {
 	}
 }
 
+func TestBuildIGMPv3ExcludeReportCarriesExcludedSources(t *testing.T) {
+	report := UpstreamReport{Join: true, Profile: Profile{IGMPVersion: 3}, Group: ActiveGroup{
+		Source: netip.IPv4Unspecified(), Group: addr("239.1.2.3"), Client: addr("192.0.2.10"),
+		ExcludedSources: []netip.Addr{addr("192.0.2.8"), addr("192.0.2.9")},
+	}, SourceMAC: [6]byte{2, 0, 0, 0, 0, 1}}
+	frame, err := BuildUpstreamFrame(report)
+	if err != nil {
+		t.Fatalf("BuildUpstreamFrame() error = %v", err)
+	}
+	message, err := ParseMembershipFrame(frame)
+	if err != nil {
+		t.Fatalf("ParseMembershipFrame() error = %v", err)
+	}
+	if len(message.Records) != 1 || message.Records[0].Type != ChangeToExcludeMode ||
+		len(message.Records[0].Sources) != 2 || message.Records[0].Sources[0] != addr("192.0.2.8") ||
+		message.Records[0].Sources[1] != addr("192.0.2.9") {
+		t.Fatalf("parsed EXCLUDE record = %+v", message.Records)
+	}
+}
+
+func TestBuildMLDv2ExcludeReportCarriesExcludedSources(t *testing.T) {
+	report := UpstreamReport{Join: true, Profile: Profile{IGMPVersion: 17}, Group: ActiveGroup{
+		Source: netip.IPv6Unspecified(), Group: addr("ff3e::1234"), Client: addr("2001:db8::10"),
+		ExcludedSources: []netip.Addr{addr("2001:db8::8"), addr("2001:db8::9")},
+	}, SourceMAC: [6]byte{2, 0, 0, 0, 0, 1}}
+	frame, err := BuildUpstreamFrame(report)
+	if err != nil {
+		t.Fatalf("BuildUpstreamFrame() error = %v", err)
+	}
+	message, err := ParseMembershipFrame(frame)
+	if err != nil {
+		t.Fatalf("ParseMembershipFrame() error = %v", err)
+	}
+	if len(message.Records) != 1 || message.Records[0].Type != ChangeToExcludeMode ||
+		len(message.Records[0].Sources) != 2 || message.Records[0].Sources[0] != addr("2001:db8::8") ||
+		message.Records[0].Sources[1] != addr("2001:db8::9") {
+		t.Fatalf("parsed EXCLUDE record = %+v", message.Records)
+	}
+}
+
+func TestBuildIGMPv3IncludeReportCarriesAggregateSources(t *testing.T) {
+	report := UpstreamReport{Join: true, Profile: Profile{IGMPVersion: 3}, Group: ActiveGroup{
+		Source: addr("192.0.2.8"), Group: addr("239.1.2.3"), Client: addr("192.0.2.10"),
+		IncludedSources: []netip.Addr{addr("192.0.2.8"), addr("192.0.2.9")},
+	}, SourceMAC: [6]byte{2, 0, 0, 0, 0, 1}}
+	frame, err := BuildUpstreamFrame(report)
+	if err != nil {
+		t.Fatalf("BuildUpstreamFrame() error = %v", err)
+	}
+	message, err := ParseMembershipFrame(frame)
+	if err != nil {
+		t.Fatalf("ParseMembershipFrame() error = %v", err)
+	}
+	if len(message.Records) != 1 || message.Records[0].Type != ChangeToIncludeMode ||
+		len(message.Records[0].Sources) != 2 || message.Records[0].Sources[0] != addr("192.0.2.8") ||
+		message.Records[0].Sources[1] != addr("192.0.2.9") {
+		t.Fatalf("parsed INCLUDE record = %+v", message.Records)
+	}
+}
+
 func TestBuildUpstreamIGMPv1LeaveIsEmpty(t *testing.T) {
 	report := UpstreamReport{
 		Profile: Profile{EntityID: 1, IGMPVersion: 1},

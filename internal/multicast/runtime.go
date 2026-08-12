@@ -91,6 +91,18 @@ type clientIdentity struct {
 	mac     [6]byte
 }
 
+type filterMode uint8
+
+const (
+	filterModeInclude filterMode = iota
+	filterModeExclude
+)
+
+type membershipState struct {
+	mode    filterMode
+	sources map[netip.Addr]struct{}
+}
+
 type runtimeStream struct {
 	clients map[clientIdentity]runtimeClient
 }
@@ -150,7 +162,7 @@ type Runtime struct {
 	config      Config
 	profiles    map[uint16]Profile
 	bindings    map[string]subscriberBinding
-	memberships map[clientGroupKey]map[netip.Addr]struct{}
+	memberships map[clientGroupKey]membershipState
 	streams     map[runtimeStreamKey]*runtimeStream
 	pending     map[pendingLeaveKey]pendingLeave
 	queries     []generalQuery
@@ -235,7 +247,7 @@ func (r *Runtime) configureLocked(config Config) error {
 	r.config = config
 	r.profiles = profiles
 	r.bindings = bindings
-	r.memberships = make(map[clientGroupKey]map[netip.Addr]struct{})
+	r.memberships = make(map[clientGroupKey]membershipState)
 	r.streams = make(map[runtimeStreamKey]*runtimeStream)
 	r.pending = make(map[pendingLeaveKey]pendingLeave)
 	r.queries = queries
@@ -314,40 +326,46 @@ func (r *Runtime) applyRecordLocked(binding subscriberBinding, message Membershi
 		subscriberID: binding.subscriber.EntityID, interfaceName: binding.attachment.Interface,
 		client: message.Client, sourceMAC: message.SourceMAC, vlan: message.VLAN, group: record.Group,
 	}
-	before := cloneSourceSet(r.memberships[key])
-	wanted := transitionSources(before, record, message.Client.BitLen())
-	after := cloneSourceSet(before)
+	before := cloneMembershipState(r.memberships[key])
+	wanted := transitionMembership(before, record)
+	beforeForwarding := forwardingSources(before, message.Client.BitLen())
+	wantedForwarding := forwardingSources(wanted, message.Client.BitLen())
+	afterForwarding := cloneSourceSet(beforeForwarding)
+	excluded := sortedSources(wanted.sources)
 
-	for _, source := range sortedSourceDifference(before, wanted) {
+	for _, source := range sortedSourceDifference(beforeForwarding, wantedForwarding) {
 		if err := r.removeLocked(binding, key, source, message.Tags); err != nil {
 			return err
 		}
-		delete(after, source)
+		delete(afterForwarding, source)
 	}
-	for _, source := range sortedSourceDifference(wanted, before) {
-		accepted, err := r.addLocked(binding, key, source, message.Tags)
+	for _, source := range sortedSourceDifference(wantedForwarding, beforeForwarding) {
+		accepted, err := r.addLocked(binding, key, source, excluded, message.Tags)
 		if err != nil {
 			return err
 		}
 		if accepted {
-			after[source] = struct{}{}
+			afterForwarding[source] = struct{}{}
 		}
 	}
-	for _, source := range sortedSourceIntersection(before, wanted) {
-		if err := r.refreshLocked(binding, key, source, message.Tags); err != nil {
+	for _, source := range sortedSourceIntersection(beforeForwarding, wantedForwarding) {
+		if err := r.refreshLocked(binding, key, source, excluded, message.Tags); err != nil {
 			return err
 		}
 	}
-	if len(after) == 0 {
+	if len(afterForwarding) == 0 {
 		delete(r.memberships, key)
 	} else {
-		r.memberships[key] = after
+		if wanted.mode == filterModeInclude {
+			wanted.sources = afterForwarding
+		}
+		r.memberships[key] = wanted
 	}
 	return nil
 }
 
 func (r *Runtime) addLocked(binding subscriberBinding, client clientGroupKey,
-	source netip.Addr, tags []VLANTag) (bool, error) {
+	source netip.Addr, excluded []netip.Addr, tags []VLANTag) (bool, error) {
 	request := Join{SubscriberID: binding.subscriber.EntityID, Interface: binding.attachment.Interface,
 		UNIVLAN: client.vlan, Source: source, Group: client.group, Client: client.client}
 	streamKey := runtimeStreamKey{subscriberID: request.SubscriberID, interfaceName: request.Interface,
@@ -355,6 +373,9 @@ func (r *Runtime) addLocked(binding subscriberBinding, client clientGroupKey,
 	stream, streamExists := r.streams[streamKey]
 	decision := r.engine.Join(request)
 	group := activeGroup(request, decision)
+	if source.IsUnspecified() {
+		group.ExcludedSources = cloneAddresses(excluded)
+	}
 	profile, profileExists := r.profiles[decision.ProfileID]
 	if !decision.Accepted {
 		if decision.ForwardUpstream && profileExists {
@@ -372,20 +393,44 @@ func (r *Runtime) addLocked(binding subscriberBinding, client clientGroupKey,
 	}
 	identity := clientIdentity{address: client.client, mac: client.sourceMAC}
 	delete(r.pending, pendingLeaveKey{stream: streamKey, identity: identity})
+	replicationChanged := !streamExists
 	if !streamExists {
+		stream = &runtimeStream{clients: make(map[clientIdentity]runtimeClient)}
+		stream.clients[identity] = runtimeClient{group: group,
+			tags: cloneVLANTags(tags), lastSeen: r.now()}
+		replicated := effectiveReplicationGroup(stream)
 		change := ReplicationChange{Enable: true, Subscriber: binding.subscriber,
-			Attachment: binding.attachment, Profile: profile, Group: group}
+			Attachment: binding.attachment, Profile: profile, Group: replicated}
 		if err := r.backend.SetReplication(change); err != nil {
 			r.engine.Leave(request)
 			return false, fmt.Errorf("enable multicast replication: %w", err)
 		}
-		stream = &runtimeStream{clients: make(map[clientIdentity]runtimeClient)}
 		r.streams[streamKey] = stream
+	} else {
+		previous := effectiveReplicationGroup(stream)
+		stream.clients[identity] = runtimeClient{group: group,
+			tags: cloneVLANTags(tags), lastSeen: r.now()}
+		current := effectiveReplicationGroup(stream)
+		if !sameReplicationGroup(previous, current) {
+			replicationChanged = true
+			change := ReplicationChange{Enable: true, Subscriber: binding.subscriber,
+				Attachment: binding.attachment, Profile: profile, Group: current}
+			if err := r.backend.SetReplication(change); err != nil {
+				delete(stream.clients, identity)
+				r.engine.Leave(request)
+				return false, fmt.Errorf("update multicast replication: %w", err)
+			}
+		}
 	}
-	stream.clients[identity] = runtimeClient{group: group, tags: cloneVLANTags(tags), lastSeen: r.now()}
-	if profile.IGMPFunction == 0 || !streamExists {
+	reportGroup := effectiveReplicationGroup(stream)
+	if profile.IGMPFunction == 0 {
+		reportGroup = group
+	} else if aggregate, exists := r.effectiveUpstreamGroup(streamKey); exists {
+		reportGroup = aggregate
+	}
+	if profile.IGMPFunction == 0 || replicationChanged {
 		if err := r.sendReportLocked(UpstreamReport{Join: true, Subscriber: binding.subscriber,
-			Attachment: binding.attachment, Profile: profile, Group: group,
+			Attachment: binding.attachment, Profile: profile, Group: reportGroup,
 			SourceMAC: client.sourceMAC, Tags: cloneVLANTags(tags)}); err != nil {
 			return true, err
 		}
@@ -394,7 +439,7 @@ func (r *Runtime) addLocked(binding subscriberBinding, client clientGroupKey,
 }
 
 func (r *Runtime) refreshLocked(binding subscriberBinding, client clientGroupKey,
-	source netip.Addr, tags []VLANTag) error {
+	source netip.Addr, excluded []netip.Addr, tags []VLANTag) error {
 	request := Join{SubscriberID: binding.subscriber.EntityID, Interface: binding.attachment.Interface,
 		UNIVLAN: client.vlan, Source: source, Group: client.group, Client: client.client}
 	decision := r.engine.Join(request)
@@ -412,12 +457,33 @@ func (r *Runtime) refreshLocked(binding subscriberBinding, client clientGroupKey
 		return fmt.Errorf("active multicast stream %s/%s has no runtime state", source, client.group)
 	}
 	group := activeGroup(request, decision)
+	if source.IsUnspecified() {
+		group.ExcludedSources = cloneAddresses(excluded)
+	}
 	identity := clientIdentity{address: client.client, mac: client.sourceMAC}
 	delete(r.pending, pendingLeaveKey{stream: streamKey, identity: identity})
+	previous := effectiveReplicationGroup(stream)
+	previousClient := stream.clients[identity]
 	stream.clients[identity] = runtimeClient{group: group, tags: cloneVLANTags(tags), lastSeen: r.now()}
+	current := effectiveReplicationGroup(stream)
+	changed := !sameReplicationGroup(previous, current)
+	if changed {
+		if err := r.backend.SetReplication(ReplicationChange{Enable: true,
+			Subscriber: binding.subscriber, Attachment: binding.attachment,
+			Profile: profile, Group: current}); err != nil {
+			stream.clients[identity] = previousClient
+			return fmt.Errorf("update multicast replication: %w", err)
+		}
+	}
+	reportGroup := current
 	if profile.IGMPFunction == 0 {
+		reportGroup = group
+	} else if aggregate, exists := r.effectiveUpstreamGroup(streamKey); exists {
+		reportGroup = aggregate
+	}
+	if profile.IGMPFunction == 0 || changed {
 		return r.sendReportLocked(UpstreamReport{Join: true, Subscriber: binding.subscriber,
-			Attachment: binding.attachment, Profile: profile, Group: group,
+			Attachment: binding.attachment, Profile: profile, Group: reportGroup,
 			SourceMAC: client.sourceMAC, Tags: cloneVLANTags(tags)})
 	}
 	return nil
@@ -479,7 +545,9 @@ func (r *Runtime) finalizeClientLocked(binding subscriberBinding, streamKey runt
 	if _, exists := stream.clients[identity]; !exists {
 		return nil
 	}
+	previousUpstream, hadPreviousUpstream := r.effectiveUpstreamGroup(streamKey)
 	last := len(stream.clients) == 1
+	previous := effectiveReplicationGroup(stream)
 	if last {
 		change := ReplicationChange{Enable: false, Subscriber: binding.subscriber,
 			Attachment: binding.attachment, Profile: profile, Group: active.group}
@@ -498,10 +566,31 @@ func (r *Runtime) finalizeClientLocked(binding subscriberBinding, streamKey runt
 	delete(r.pending, pendingLeaveKey{stream: streamKey, identity: identity})
 	if last {
 		delete(r.streams, streamKey)
+	} else {
+		current := effectiveReplicationGroup(stream)
+		if !sameReplicationGroup(previous, current) {
+			if err := r.backend.SetReplication(ReplicationChange{Enable: true,
+				Subscriber: binding.subscriber, Attachment: binding.attachment,
+				Profile: profile, Group: current}); err != nil {
+				return fmt.Errorf("update multicast replication after leave: %w", err)
+			}
+		}
 	}
-	if sendReport && (profile.IGMPFunction == 0 || last) {
+	if sendReport && profile.IGMPFunction == 0 {
 		return r.sendReportLocked(UpstreamReport{Join: false, Subscriber: binding.subscriber,
 			Attachment: binding.attachment, Profile: profile, Group: active.group,
+			SourceMAC: identity.mac, Tags: cloneVLANTags(active.tags)})
+	}
+	if sendReport && profile.IGMPFunction != 0 && hadPreviousUpstream {
+		current, exists := r.effectiveUpstreamGroup(streamKey)
+		if exists && sameMembershipGroup(previousUpstream, current) {
+			return nil
+		}
+		if !exists {
+			current = emptyMembershipGroup(previousUpstream)
+		}
+		return r.sendReportLocked(UpstreamReport{Join: exists, Subscriber: binding.subscriber,
+			Attachment: binding.attachment, Profile: profile, Group: current,
 			SourceMAC: identity.mac, Tags: cloneVLANTags(active.tags)})
 	}
 	return nil
@@ -544,6 +633,7 @@ func (r *Runtime) Expire() error {
 		if stream == nil {
 			continue
 		}
+		previousUpstream, hadPreviousUpstream := r.effectiveUpstreamGroup(streamKey)
 		var identity clientIdentity
 		var active runtimeClient
 		for candidate := range stream.clients {
@@ -554,6 +644,7 @@ func (r *Runtime) Expire() error {
 			}
 		}
 		delete(r.pending, pendingLeaveKey{stream: streamKey, identity: identity})
+		previous := effectiveReplicationGroup(stream)
 		delete(stream.clients, identity)
 		binding := r.bindings[group.Interface]
 		profile := r.profiles[group.ProfileID]
@@ -564,23 +655,50 @@ func (r *Runtime) Expire() error {
 				return fmt.Errorf("expire multicast replication: %w", err)
 			}
 			delete(r.streams, streamKey)
-		}
-		for key, sources := range r.memberships {
-			if key.subscriberID == binding.subscriber.EntityID && key.interfaceName == group.Interface &&
-				key.client == group.Client && key.vlan == group.UNIVLAN && key.group == group.Group {
-				delete(sources, group.Source)
-				if len(sources) == 0 {
-					delete(r.memberships, key)
+		} else {
+			current := effectiveReplicationGroup(stream)
+			if !sameReplicationGroup(previous, current) {
+				if err := r.backend.SetReplication(ReplicationChange{Enable: true,
+					Subscriber: binding.subscriber, Attachment: binding.attachment,
+					Profile: profile, Group: current}); err != nil {
+					return fmt.Errorf("update multicast replication after expiry: %w", err)
 				}
 			}
 		}
-		if profile.IGMPFunction != 0 && len(stream.clients) != 0 {
-			continue
+		for key, membership := range r.memberships {
+			if key.subscriberID == binding.subscriber.EntityID && key.interfaceName == group.Interface &&
+				key.client == group.Client && key.vlan == group.UNIVLAN && key.group == group.Group {
+				if membership.mode == filterModeExclude && group.Source.IsUnspecified() {
+					delete(r.memberships, key)
+					continue
+				}
+				delete(membership.sources, group.Source)
+				if len(membership.sources) == 0 {
+					delete(r.memberships, key)
+				} else {
+					r.memberships[key] = membership
+				}
+			}
 		}
-		if err := r.sendReportLocked(UpstreamReport{Join: false, Subscriber: binding.subscriber,
-			Attachment: binding.attachment, Profile: profile, Group: group, SourceMAC: identity.mac,
-			Tags: cloneVLANTags(active.tags)}); err != nil {
-			return err
+		if profile.IGMPFunction != 0 && hadPreviousUpstream {
+			current, exists := r.effectiveUpstreamGroup(streamKey)
+			if exists && sameMembershipGroup(previousUpstream, current) {
+				continue
+			}
+			if !exists {
+				current = emptyMembershipGroup(previousUpstream)
+			}
+			if err := r.sendReportLocked(UpstreamReport{Join: exists, Subscriber: binding.subscriber,
+				Attachment: binding.attachment, Profile: profile, Group: current,
+				SourceMAC: identity.mac, Tags: cloneVLANTags(active.tags)}); err != nil {
+				return err
+			}
+		} else if profile.IGMPFunction == 0 {
+			if err := r.sendReportLocked(UpstreamReport{Join: false, Subscriber: binding.subscriber,
+				Attachment: binding.attachment, Profile: profile, Group: group, SourceMAC: identity.mac,
+				Tags: cloneVLANTags(active.tags)}); err != nil {
+				return err
+			}
 		}
 	}
 	if err := r.runGeneralQueriesLocked(now); err != nil {
@@ -797,42 +915,59 @@ func activeGroup(request Join, decision Decision) ActiveGroup {
 	}
 }
 
-func transitionSources(before map[netip.Addr]struct{}, record MembershipRecord,
-	bitLength int) map[netip.Addr]struct{} {
+func transitionMembership(before membershipState, record MembershipRecord) membershipState {
+	result := cloneMembershipState(before)
+	sources := sourceSet(record.Sources)
+	switch record.Type {
+	case ModeIsInclude, ChangeToIncludeMode:
+		return membershipState{mode: filterModeInclude, sources: sources}
+	case ModeIsExclude, ChangeToExcludeMode:
+		return membershipState{mode: filterModeExclude, sources: sources}
+	case AllowNewSources:
+		if result.mode == filterModeExclude {
+			for source := range sources {
+				delete(result.sources, source)
+			}
+		} else {
+			for source := range sources {
+				result.sources[source] = struct{}{}
+			}
+		}
+	case BlockOldSources:
+		if result.mode == filterModeExclude {
+			for source := range sources {
+				result.sources[source] = struct{}{}
+			}
+		} else {
+			for source := range sources {
+				delete(result.sources, source)
+			}
+		}
+	}
+	return result
+}
+
+func forwardingSources(state membershipState, bitLength int) map[netip.Addr]struct{} {
+	if state.mode != filterModeExclude {
+		return cloneSourceSet(state.sources)
+	}
 	wildcard := netip.IPv4Unspecified()
 	if bitLength == 128 {
 		wildcard = netip.IPv6Unspecified()
 	}
-	sources := make(map[netip.Addr]struct{}, len(record.Sources))
-	for _, source := range record.Sources {
-		sources[source] = struct{}{}
+	return map[netip.Addr]struct{}{wildcard: {}}
+}
+
+func cloneMembershipState(state membershipState) membershipState {
+	return membershipState{mode: state.mode, sources: cloneSourceSet(state.sources)}
+}
+
+func sourceSet(sources []netip.Addr) map[netip.Addr]struct{} {
+	result := make(map[netip.Addr]struct{}, len(sources))
+	for _, source := range sources {
+		result[source] = struct{}{}
 	}
-	switch record.Type {
-	case ModeIsInclude, ChangeToIncludeMode:
-		return sources
-	case ModeIsExclude, ChangeToExcludeMode:
-		return map[netip.Addr]struct{}{wildcard: {}}
-	case AllowNewSources:
-		result := cloneSourceSet(before)
-		if _, exclude := result[wildcard]; exclude {
-			return result
-		}
-		for source := range sources {
-			result[source] = struct{}{}
-		}
-		return result
-	case BlockOldSources:
-		result := cloneSourceSet(before)
-		if _, exclude := result[wildcard]; exclude {
-			return result
-		}
-		for source := range sources {
-			delete(result, source)
-		}
-		return result
-	default:
-		return cloneSourceSet(before)
-	}
+	return result
 }
 
 func cloneSourceSet(source map[netip.Addr]struct{}) map[netip.Addr]struct{} {
@@ -841,6 +976,151 @@ func cloneSourceSet(source map[netip.Addr]struct{}) map[netip.Addr]struct{} {
 		result[address] = struct{}{}
 	}
 	return result
+}
+
+func sortedSources(source map[netip.Addr]struct{}) []netip.Addr {
+	result := make([]netip.Addr, 0, len(source))
+	for address := range source {
+		result = append(result, address)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Compare(result[j]) < 0 })
+	return result
+}
+
+func cloneAddresses(source []netip.Addr) []netip.Addr {
+	return append([]netip.Addr(nil), source...)
+}
+
+func effectiveReplicationGroup(stream *runtimeStream) ActiveGroup {
+	var result ActiveGroup
+	first := true
+	var excluded map[netip.Addr]struct{}
+	for _, client := range stream.clients {
+		if first {
+			result = client.group
+			first = false
+		}
+		if !client.group.Source.IsUnspecified() {
+			continue
+		}
+		candidate := sourceSet(client.group.ExcludedSources)
+		if excluded == nil {
+			excluded = candidate
+			continue
+		}
+		for source := range excluded {
+			if _, exists := candidate[source]; !exists {
+				delete(excluded, source)
+			}
+		}
+	}
+	result.ExcludedSources = sortedSources(excluded)
+	return result
+}
+
+func (r *Runtime) effectiveUpstreamGroup(wanted runtimeStreamKey) (ActiveGroup, bool) {
+	var result ActiveGroup
+	var included map[netip.Addr]struct{}
+	var excluded map[netip.Addr]struct{}
+	hasExclude := false
+	for key, stream := range r.streams {
+		if key.subscriberID != wanted.subscriberID || key.interfaceName != wanted.interfaceName ||
+			key.group != wanted.group || key.vlan != wanted.vlan || len(stream.clients) == 0 {
+			continue
+		}
+		current := effectiveReplicationGroup(stream)
+		if !result.Group.IsValid() {
+			result = current
+		}
+		if key.source.IsUnspecified() {
+			if !hasExclude {
+				excluded = sourceSet(current.ExcludedSources)
+				hasExclude = true
+			} else {
+				for source := range excluded {
+					if _, exists := sourceSet(current.ExcludedSources)[source]; !exists {
+						delete(excluded, source)
+					}
+				}
+			}
+			continue
+		}
+		if included == nil {
+			included = make(map[netip.Addr]struct{})
+		}
+		included[key.source] = struct{}{}
+	}
+	if !result.Group.IsValid() {
+		return ActiveGroup{}, false
+	}
+	if hasExclude {
+		for source := range included {
+			delete(excluded, source)
+		}
+		if result.Group.Is4() {
+			result.Source = netip.IPv4Unspecified()
+		} else {
+			result.Source = netip.IPv6Unspecified()
+		}
+		result.IncludedSources = nil
+		result.ExcludedSources = sortedSources(excluded)
+		return result, true
+	}
+	result.IncludedSources = sortedSources(included)
+	result.ExcludedSources = nil
+	result.Source = result.IncludedSources[0]
+	return result, true
+}
+
+func emptyMembershipGroup(previous ActiveGroup) ActiveGroup {
+	result := previous
+	if result.Group.Is4() {
+		result.Source = netip.IPv4Unspecified()
+	} else {
+		result.Source = netip.IPv6Unspecified()
+	}
+	result.IncludedSources = nil
+	result.ExcludedSources = nil
+	return result
+}
+
+func sameMembershipGroup(left, right ActiveGroup) bool {
+	if left.Source.IsUnspecified() != right.Source.IsUnspecified() ||
+		len(left.IncludedSources) != len(right.IncludedSources) ||
+		len(left.ExcludedSources) != len(right.ExcludedSources) {
+		return false
+	}
+	for index := range left.IncludedSources {
+		if left.IncludedSources[index] != right.IncludedSources[index] {
+			return false
+		}
+	}
+	for index := range left.ExcludedSources {
+		if left.ExcludedSources[index] != right.ExcludedSources[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func sameReplicationGroup(left, right ActiveGroup) bool {
+	if left.Source != right.Source || left.Group != right.Group || left.UNIVLAN != right.UNIVLAN ||
+		left.ANIVLAN != right.ANIVLAN || left.GEMPortID != right.GEMPortID ||
+		len(left.IncludedSources) != len(right.IncludedSources) ||
+		len(left.ExcludedSources) != len(right.ExcludedSources) {
+		return false
+	}
+	for index := range left.IncludedSources {
+		if left.IncludedSources[index] != right.IncludedSources[index] {
+			return false
+		}
+	}
+	for index := range left.ExcludedSources {
+		if left.ExcludedSources[index] != right.ExcludedSources[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func sortedSourceDifference(left, right map[netip.Addr]struct{}) []netip.Addr {

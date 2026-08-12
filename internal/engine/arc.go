@@ -199,6 +199,13 @@ func (e *Engine) afterSetLocked(key mib.Key, attributes me.AttributeValueMap,
 		}
 		frames = append(frames, generated...)
 	}
+	if sample, present := e.berSample[key]; present && berConfigurationChanged(attributes) {
+		generated, err := e.evaluateBERSampleLocked(key, sample, device)
+		if err != nil {
+			return nil, err
+		}
+		frames = append(frames, generated...)
+	}
 	if arcChanged || intervalChanged {
 		generated, err := e.pollARCKeyLocked(key, device)
 		if err != nil {
@@ -207,6 +214,12 @@ func (e *Engine) afterSetLocked(key mib.Key, attributes me.AttributeValueMap,
 		frames = append(frames, generated...)
 	}
 	return frames, nil
+}
+
+func berConfigurationChanged(attributes me.AttributeValueMap) bool {
+	_, sf := attributes[me.AniG_SignalFailThreshold]
+	_, sd := attributes[me.AniG_SignalDegradeThreshold]
+	return sf || sd
 }
 
 func opticalConfigurationChanged(attributes me.AttributeValueMap) bool {

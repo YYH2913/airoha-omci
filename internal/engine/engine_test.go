@@ -13,6 +13,7 @@ import (
 	me "github.com/opencord/omci-lib-go/v2/generated"
 	"github.com/xg2010g/airoha-omci/internal/checksum"
 	"github.com/xg2010g/airoha-omci/internal/mib"
+	"github.com/xg2010g/airoha-omci/internal/model"
 	"github.com/xg2010g/airoha-omci/internal/optical"
 )
 
@@ -278,6 +279,55 @@ func TestMibResetAndUpload(t *testing.T) {
 	nextResponse := decodeResponse(t, encoded).Layer(omci.LayerTypeMibUploadNextResponse).(*omci.MibUploadNextResponse)
 	if nextResponse.ReportedME.GetClassID() != me.OnuDataClassID {
 		t.Fatalf("reported class = %v, want ONU data", nextResponse.ReportedME.GetClassID())
+	}
+}
+
+func TestCompleteXG2010GFactoryMIBUpload(t *testing.T) {
+	factory, err := model.XG2010G(model.Identity{SerialNumber: "TEST01020304"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	masks, err := model.XG2010GSupportedAttributeMasks(factory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := mib.NewWithOptions(factory, mib.Options{
+		SupportedClasses:        model.XG2010GSupportedClasses(),
+		SupportedAttributeMasks: masks,
+		ValidateInstance:        model.XG2010GValidateInstance,
+		AttributeCapabilities:   model.XG2010GAttributeCapabilities(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	protocol := New(store)
+	for _, device := range []omci.DeviceIdent{omci.BaselineIdent, omci.ExtendedIdent} {
+		t.Run(device.String(), func(t *testing.T) {
+			upload := encodeRequestForDevice(t, 0x100, omci.MibUploadRequestType,
+				&omci.MibUploadRequest{MeBasePacket: omci.MeBasePacket{
+					EntityClass: me.OnuDataClassID, Extended: device == omci.ExtendedIdent,
+				}}, device)
+			encoded, err := protocol.Handle(upload)
+			if err != nil {
+				t.Fatalf("Handle(MIB upload) error = %v", err)
+			}
+			response := decodeResponse(t, encoded).Layer(omci.LayerTypeMibUploadResponse).(*omci.MibUploadResponse)
+			if response.NumberOfCommands == 0 {
+				t.Fatal("complete Factory MIB upload has no commands")
+			}
+			for sequence := uint16(0); sequence < response.NumberOfCommands; sequence++ {
+				next := encodeRequestForDevice(t, sequence+0x101, omci.MibUploadNextRequestType,
+					&omci.MibUploadNextRequest{MeBasePacket: omci.MeBasePacket{
+						EntityClass: me.OnuDataClassID, Extended: device == omci.ExtendedIdent,
+					}, CommandSequenceNumber: sequence}, device)
+				frame, err := protocol.Handle(next)
+				if err != nil {
+					t.Fatalf("Handle(MIB upload next %d/%d) error = %v",
+						sequence, response.NumberOfCommands, err)
+				}
+				decodeResponse(t, frame)
+			}
+		})
 	}
 }
 

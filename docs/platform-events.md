@@ -29,7 +29,7 @@ and emits the complete 224-bit bitmap with the next ONU-wide alarm sequence
 number.
 
 ```json
-{"type":"alarm","class_id":263,"entity_id":32769,"alarm_bit":2,"active":true}
+{"type":"alarm","class_id":11,"entity_id":257,"alarm_bit":0,"active":true}
 ```
 
 ## Attribute value change
@@ -71,3 +71,24 @@ defined by the control helper ABI.
 
 The helper may suppress identical consecutive samples. Threshold changes are
 re-evaluated against the last sample retained by the engine.
+
+The EN7572 `los` indication is not mapped to ANI-G SF or SD. LOS and LOF remain
+separate GPON PHY link-state inputs for activation and fibre-loss recovery.
+
+## BER sample
+
+The EN7581 driver handles the OLT BER Interval PLOAM, snapshots and clears the
+GPON BIP counter at that interval, and sends the upstream REI PLOAM. Each new
+snapshot is emitted once with a monotonic driver-local sequence number:
+
+```json
+{"type":"ber-sample","class_id":263,"entity_id":32769,"sequence":7,"bip_count":25000,"interval_ms":1000,"boot_id":"01234567-89ab-cdef-0123-456789abcdef"}
+```
+
+The protocol engine evaluates ANI-G SF and SD from the current OLT-writable
+`10^-N` thresholds and the 2.48832 Gbit/s GPON downstream rate. A threshold
+change re-evaluates the most recent sample. A zero interval and a repeated or
+older sequence from the same Linux boot ID are rejected. A changed boot ID
+starts a new sequence generation after system restart; an OMCC carrier drop
+clears the sample before re-ranging or driver restart. LOS is never accepted as
+a BER sample.

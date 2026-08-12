@@ -377,10 +377,11 @@ The response contains five cumulative unsigned 64-bit values:
 {"ani_entity_id":32769,"corrected_bytes":11,"corrected_codewords":22,"uncorrectable_codewords":33,"total_codewords":44,"fec_seconds":55}
 ```
 
-The GPON driver snapshots the EN7581 PHY counters at `phy-csr` offsets `0xba8`,
-`0xb28`, `0xb24`, `0xba4` and `0xbbc`, respectively. This order and mapping
-match the vendor GPON FEC statistics API `0x800d`; the SDK binary was used only
-to establish the hardware ABI. The helper reads the read-only `fec_counters`
+The GPON driver latches the EN7581 GPON PHY counters and reads `phy-csr`
+offsets `0x238`, `0x23c`, `0x240`, `0x244` and `0x248`, respectively. This
+order and mapping match the vendor GPON FEC statistics path; the SDK source was
+used only to establish the register and latch ABI, and no proprietary source is
+included. The helper reads the read-only `fec_counters`
 attribute and rejects an unknown ANI-G, a missing field, a reordered kernel
 snapshot or a non-decimal value.
 

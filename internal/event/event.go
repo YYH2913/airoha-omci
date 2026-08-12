@@ -33,6 +33,10 @@ type Event struct {
 	LaserBiasCurrent *uint16                    `json:"laser_bias_current,omitempty"`
 	TransmitPower    *uint16                    `json:"transmit_power,omitempty"`
 	ReceivePower     *uint16                    `json:"receive_power,omitempty"`
+	Sequence         *uint64                    `json:"sequence,omitempty"`
+	BIPCount         *uint32                    `json:"bip_count,omitempty"`
+	IntervalMS       *uint32                    `json:"interval_ms,omitempty"`
+	BootID           *string                    `json:"boot_id,omitempty"`
 }
 
 func Decode(line []byte) (Event, error) {
@@ -106,6 +110,18 @@ func (event Event) Dispatch(protocol *engine.Engine) ([][]byte, error) {
 			LaserBiasCurrent: *event.LaserBiasCurrent,
 			TransmitPower:    *event.TransmitPower,
 			ReceivePower:     *event.ReceivePower,
+		}, device)
+
+	case "ber-sample":
+		if event.Sequence == nil || event.BIPCount == nil || event.IntervalMS == nil ||
+			event.BootID == nil {
+			return nil, fmt.Errorf("BER sample requires sequence, bip_count, interval_ms and boot_id")
+		}
+		return protocol.NotifyBERSample(key, engine.BERSample{
+			Sequence:   *event.Sequence,
+			BIPCount:   *event.BIPCount,
+			IntervalMS: *event.IntervalMS,
+			BootID:     *event.BootID,
 		}, device)
 
 	default:

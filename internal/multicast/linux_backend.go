@@ -22,6 +22,7 @@ import (
 
 const (
 	multicastDownstreamChain = 2013
+	multicastGEMChainBase    = 20000
 	normalDownstreamChain    = 2012
 	proxyQueryMark           = 0xa17f0001
 	gponGEMMarkKey           = 0xa1700000
@@ -86,14 +87,17 @@ type LinuxBackend struct {
 	dynamic      map[dynamicRuleKey]downstreamRule
 	filters      map[dynamicRuleKey][]tcFilterRef
 	baselines    map[dynamicRuleKey]bandwidthBaseline
+	chains       map[string]map[uint16]struct{}
 	now          func() time.Time
 }
 
 type downstreamRule struct {
 	interfaceName string
 	aniVLAN       uint16
+	gemPortID     uint16
 	uniVLAN       VLAN
 	source        netip.Addr
+	excluded      []netip.Addr
 	start         netip.Addr
 	stop          netip.Addr
 	profile       Profile
@@ -114,6 +118,7 @@ type dynamicRuleKey struct {
 
 type tcFilterRef struct {
 	interfaceName string
+	chain         int
 	preference    int
 }
 
@@ -152,7 +157,8 @@ func NewLinuxBackend(options LinuxBackendOptions) *LinuxBackend {
 		pon: options.PON, now: options.Now,
 		control: make(map[string][]downstreamRule), static: make(map[string][]downstreamRule),
 		dynamic: make(map[dynamicRuleKey]downstreamRule),
-		filters: make(map[dynamicRuleKey][]tcFilterRef), baselines: make(map[dynamicRuleKey]bandwidthBaseline)}
+		filters: make(map[dynamicRuleKey][]tcFilterRef), baselines: make(map[dynamicRuleKey]bandwidthBaseline),
+		chains: make(map[string]map[uint16]struct{})}
 }
 
 func (b *LinuxBackend) Configure(config Config) error {
@@ -263,28 +269,29 @@ func staticDownstreamRules(interfaceName string, uniVLAN VLAN, profile Profile) 
 	result := make([]downstreamRule, 0, len(profile.StaticACL))
 	for _, entry := range profile.StaticACL {
 		result = append(result, downstreamRule{interfaceName: interfaceName,
-			aniVLAN: entry.VLANID, uniVLAN: uniVLAN, source: entry.Source,
+			aniVLAN: entry.VLANID, gemPortID: entry.GEMPortID, uniVLAN: uniVLAN, source: entry.Source,
 			start: entry.Start, stop: entry.Stop, profile: profile})
 	}
 	return result
 }
 
 func controlDownstreamRules(interfaceName string, uniVLAN VLAN, profile Profile) []downstreamRule {
-	seen := make(map[uint16]struct{})
+	type controlKey struct {
+		gem  uint16
+		vlan uint16
+	}
+	seen := make(map[controlKey]struct{})
 	result := make([]downstreamRule, 0)
 	for _, entries := range [][]ACLEntry{profile.DynamicACL, profile.StaticACL} {
 		for _, entry := range entries {
-			if _, exists := seen[entry.VLANID]; exists {
+			key := controlKey{gem: entry.GEMPortID, vlan: entry.VLANID}
+			if _, exists := seen[key]; exists {
 				continue
 			}
-			seen[entry.VLANID] = struct{}{}
+			seen[key] = struct{}{}
 			result = append(result, downstreamRule{interfaceName: interfaceName,
-				aniVLAN: entry.VLANID, uniVLAN: uniVLAN, profile: profile})
+				aniVLAN: entry.VLANID, gemPortID: entry.GEMPortID, uniVLAN: uniVLAN, profile: profile})
 		}
-	}
-	if len(result) == 0 {
-		result = append(result, downstreamRule{interfaceName: interfaceName,
-			aniVLAN: math.MaxUint16, uniVLAN: uniVLAN, profile: profile})
 	}
 	return result
 }
@@ -309,7 +316,8 @@ func (b *LinuxBackend) SetReplication(change ReplicationChange) error {
 	previous, existed := b.dynamic[key]
 	if change.Enable {
 		b.dynamic[key] = downstreamRule{interfaceName: change.Attachment.Interface,
-			aniVLAN: change.Group.ANIVLAN, uniVLAN: change.Group.UNIVLAN,
+			aniVLAN: change.Group.ANIVLAN, gemPortID: change.Group.GEMPortID,
+			uniVLAN: change.Group.UNIVLAN, excluded: cloneAddresses(change.Group.ExcludedSources),
 			source: change.Group.Source, start: change.Group.Group, stop: change.Group.Group,
 			profile: change.Profile}
 	} else {
@@ -424,16 +432,59 @@ func (b *LinuxBackend) SendQuery(query DownstreamQuery) error {
 }
 
 func (b *LinuxBackend) rebuildLocked(interfaceName string) error {
+	desiredGEMs := make(map[uint16]struct{})
+	for _, rule := range b.control[interfaceName] {
+		desiredGEMs[rule.gemPortID] = struct{}{}
+	}
+	for _, rule := range b.static[interfaceName] {
+		desiredGEMs[rule.gemPortID] = struct{}{}
+	}
+	for key, rule := range b.dynamic {
+		if key.interfaceName == interfaceName {
+			desiredGEMs[rule.gemPortID] = struct{}{}
+		}
+	}
+	touchedGEMs := make(map[uint16]struct{}, len(desiredGEMs)+len(b.chains[interfaceName]))
+	for gem := range desiredGEMs {
+		touchedGEMs[gem] = struct{}{}
+	}
+	for gem := range b.chains[interfaceName] {
+		touchedGEMs[gem] = struct{}{}
+	}
+	// Retain the attempted set until a complete rebuild succeeds so rollback
+	// can remove child chains created by a partially failed transaction.
+	b.chains[interfaceName] = touchedGEMs
 	// Deleting a missing chain is expected on first configuration.
 	_ = b.runner.Run(b.tc, "filter", "del", "dev", interfaceName, "egress",
 		"chain", strconv.Itoa(multicastDownstreamChain))
+	for gem := range touchedGEMs {
+		_ = b.runner.Run(b.tc, "filter", "del", "dev", interfaceName, "egress",
+			"chain", strconv.Itoa(multicastGEMChain(gem)))
+	}
 	if err := b.runner.Run(b.tc, "filter", "replace", "dev", interfaceName, "egress",
 		"chain", strconv.Itoa(multicastDownstreamChain), "protocol", "all", "pref", "1",
 		"handle", fmt.Sprintf("%#x", proxyQueryMark), "fw", "action", "pass"); err != nil {
 		return err
 	}
+	gems := make([]int, 0, len(desiredGEMs))
+	for gem := range desiredGEMs {
+		gems = append(gems, int(gem))
+	}
+	sort.Ints(gems)
+	for _, gem := range gems {
+		if err := b.runner.Run(b.tc, "filter", "replace", "dev", interfaceName, "egress",
+			"chain", strconv.Itoa(multicastDownstreamChain), "protocol", "all",
+			"pref", strconv.Itoa(100+gem), "handle",
+			fmt.Sprintf("%#x/0xffffffff", gponGEMMarkKey|gem), "fw", "action", "goto",
+			"chain", strconv.Itoa(multicastGEMChain(uint16(gem)))); err != nil {
+			return err
+		}
+	}
 	control := append([]downstreamRule(nil), b.control[interfaceName]...)
 	sort.Slice(control, func(i, j int) bool {
+		if control[i].gemPortID != control[j].gemPortID {
+			return control[i].gemPortID < control[j].gemPortID
+		}
 		if control[i].profile.EntityID != control[j].profile.EntityID {
 			return control[i].profile.EntityID < control[j].profile.EntityID
 		}
@@ -442,8 +493,12 @@ func (b *LinuxBackend) rebuildLocked(interfaceName string) error {
 		}
 		return control[i].uniVLAN.ID < control[j].uniVLAN.ID
 	})
-	preference := 10
+	preferenceByGEM := make(map[uint16]int)
 	for _, rule := range control {
+		preference := preferenceByGEM[rule.gemPortID]
+		if preference == 0 {
+			preference = 10
+		}
 		ipv4 := rule.profile.IGMPVersion <= 3
 		for _, variant := range downstreamVariants(rule.aniVLAN, ipv4) {
 			arguments, err := downstreamControlFilterArguments(interfaceName, preference, rule, variant)
@@ -458,6 +513,7 @@ func (b *LinuxBackend) rebuildLocked(interfaceName string) error {
 				return fmt.Errorf("multicast control filter count exceeds reserved tc preference space")
 			}
 		}
+		preferenceByGEM[rule.gemPortID] = preference
 	}
 
 	// Active exact-match rules precede static ranges. Besides making their byte
@@ -480,6 +536,11 @@ func (b *LinuxBackend) rebuildLocked(interfaceName string) error {
 		if comparison := rules[i].rule.start.Compare(rules[j].rule.start); comparison != 0 {
 			return comparison < 0
 		}
+		leftSpecific := rules[i].rule.source.IsValid() && !rules[i].rule.source.IsUnspecified()
+		rightSpecific := rules[j].rule.source.IsValid() && !rules[j].rule.source.IsUnspecified()
+		if leftSpecific != rightSpecific {
+			return leftSpecific
+		}
 		if comparison := rules[i].rule.source.Compare(rules[j].rule.source); comparison != 0 {
 			return comparison < 0
 		}
@@ -491,10 +552,14 @@ func (b *LinuxBackend) rebuildLocked(interfaceName string) error {
 		}
 		return false
 	})
-	preference = 1000
+	preferenceByGEM = make(map[uint16]int)
 	installedFilters := make(map[dynamicRuleKey][]tcFilterRef)
 	for _, installed := range rules {
 		rule := installed.rule
+		preference := preferenceByGEM[rule.gemPortID]
+		if preference == 0 {
+			preference = 1000
+		}
 		prefixes, err := addressRangePrefixes(rule.start, rule.stop)
 		if err != nil {
 			return err
@@ -502,6 +567,21 @@ func (b *LinuxBackend) rebuildLocked(interfaceName string) error {
 		for _, prefix := range prefixes {
 			variants := downstreamVariants(rule.aniVLAN, prefix.Addr().Is4())
 			for _, variant := range variants {
+				excludedSources := rule.excluded
+				if installed.dynamicKey != nil {
+					excludedSources = b.effectiveExcludedSources(*installed.dynamicKey, rule)
+				}
+				for _, excluded := range excludedSources {
+					arguments, err := downstreamExcludeFilterArguments(interfaceName, preference,
+						rule, prefix, variant, excluded)
+					if err != nil {
+						return err
+					}
+					if err := b.runner.Run(b.tc, arguments...); err != nil {
+						return err
+					}
+					preference++
+				}
 				arguments, err := downstreamFilterArguments(interfaceName, preference,
 					rule, prefix, variant)
 				if err != nil {
@@ -512,13 +592,22 @@ func (b *LinuxBackend) rebuildLocked(interfaceName string) error {
 				}
 				if installed.dynamicKey != nil {
 					installedFilters[*installed.dynamicKey] = append(installedFilters[*installed.dynamicKey],
-						tcFilterRef{interfaceName: interfaceName, preference: preference})
+						tcFilterRef{interfaceName: interfaceName,
+							chain: multicastGEMChain(rule.gemPortID), preference: preference})
 				}
 				preference++
 				if preference >= 64000 {
 					return fmt.Errorf("multicast filter count exceeds tc preference space")
 				}
 			}
+		}
+		preferenceByGEM[rule.gemPortID] = preference
+	}
+	for _, gem := range gems {
+		if err := b.runner.Run(b.tc, "filter", "replace", "dev", interfaceName, "egress",
+			"chain", strconv.Itoa(multicastGEMChain(uint16(gem))), "protocol", "all", "pref", "65000",
+			"flower", "skip_hw", "action", "drop"); err != nil {
+			return err
 		}
 	}
 	if err := b.runner.Run(b.tc, "filter", "replace", "dev", interfaceName, "egress",
@@ -539,7 +628,28 @@ func (b *LinuxBackend) rebuildLocked(interfaceName string) error {
 	for key, references := range installedFilters {
 		b.filters[key] = references
 	}
+	b.chains[interfaceName] = desiredGEMs
 	return nil
+}
+
+func (b *LinuxBackend) effectiveExcludedSources(key dynamicRuleKey, rule downstreamRule) []netip.Addr {
+	if !key.source.IsUnspecified() || len(rule.excluded) == 0 {
+		return rule.excluded
+	}
+	result := make([]netip.Addr, 0, len(rule.excluded))
+	for _, excluded := range rule.excluded {
+		included := dynamicRuleKey{subscriberID: key.subscriberID, interfaceName: key.interfaceName,
+			source: excluded, group: key.group, uniVLAN: key.uniVLAN}
+		includedRule, exists := b.dynamic[included]
+		if !exists || includedRule.gemPortID != rule.gemPortID {
+			result = append(result, excluded)
+		}
+	}
+	return result
+}
+
+func multicastGEMChain(gemPortID uint16) int {
+	return multicastGEMChainBase + int(gemPortID)
 }
 
 func dynamicRuleKeyLess(left, right dynamicRuleKey) bool {
@@ -570,35 +680,47 @@ func (b *LinuxBackend) SampleBandwidth() (map[BandwidthKey]uint32, error) {
 	if b.output == nil || len(b.filters) == 0 {
 		return result, nil
 	}
-	interfaces := make(map[string]struct{})
+	type counterChain struct {
+		interfaceName string
+		chain         int
+	}
+	chains := make(map[counterChain]struct{})
 	for _, references := range b.filters {
 		for _, reference := range references {
-			interfaces[reference.interfaceName] = struct{}{}
+			chains[counterChain{interfaceName: reference.interfaceName, chain: reference.chain}] = struct{}{}
 		}
 	}
-	names := make([]string, 0, len(interfaces))
-	for interfaceName := range interfaces {
-		names = append(names, interfaceName)
+	keys := make([]counterChain, 0, len(chains))
+	for key := range chains {
+		keys = append(keys, key)
 	}
-	sort.Strings(names)
-	counters := make(map[string]map[int]uint64, len(names))
-	for _, interfaceName := range names {
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].interfaceName != keys[j].interfaceName {
+			return keys[i].interfaceName < keys[j].interfaceName
+		}
+		return keys[i].chain < keys[j].chain
+	})
+	counters := make(map[counterChain]map[int]uint64, len(keys))
+	for _, key := range keys {
 		output, err := b.output.Output(b.tc, "-j", "-s", "filter", "show", "dev",
-			interfaceName, "egress", "chain", strconv.Itoa(multicastDownstreamChain))
+			key.interfaceName, "egress", "chain", strconv.Itoa(key.chain))
 		if err != nil {
-			return nil, fmt.Errorf("read multicast filter counters on %s: %w", interfaceName, err)
+			return nil, fmt.Errorf("read multicast filter counters on %s chain %d: %w",
+				key.interfaceName, key.chain, err)
 		}
 		parsed, err := tcFilterByteCounters(output)
 		if err != nil {
-			return nil, fmt.Errorf("decode multicast filter counters on %s: %w", interfaceName, err)
+			return nil, fmt.Errorf("decode multicast filter counters on %s chain %d: %w",
+				key.interfaceName, key.chain, err)
 		}
-		counters[interfaceName] = parsed
+		counters[key] = parsed
 	}
 	now := b.now()
 	for key, references := range b.filters {
 		var total uint64
 		for _, reference := range references {
-			value, exists := counters[reference.interfaceName][reference.preference]
+			value, exists := counters[counterChain{interfaceName: reference.interfaceName,
+				chain: reference.chain}][reference.preference]
 			if !exists {
 				return nil, fmt.Errorf("multicast filter preference %d is missing on %s",
 					reference.preference, reference.interfaceName)
@@ -693,7 +815,7 @@ func tcPreference(value json.RawMessage) (int, error) {
 func downstreamControlFilterArguments(interfaceName string, preference int, rule downstreamRule,
 	variant downstreamVariant) ([]string, error) {
 	arguments := []string{"filter", "replace", "dev", interfaceName, "egress", "chain",
-		strconv.Itoa(multicastDownstreamChain), "protocol", variant.protocol,
+		strconv.Itoa(multicastGEMChain(rule.gemPortID)), "protocol", variant.protocol,
 		"pref", strconv.Itoa(preference), "flower", "skip_hw"}
 	if variant.tagged {
 		arguments = append(arguments, "num_of_vlans", strconv.Itoa(variant.tags))
@@ -755,7 +877,7 @@ func downstreamVariants(aniVLAN uint16, ipv4 bool) []downstreamVariant {
 func downstreamFilterArguments(interfaceName string, preference int, rule downstreamRule,
 	prefix netip.Prefix, variant downstreamVariant) ([]string, error) {
 	arguments := []string{"filter", "replace", "dev", interfaceName, "egress", "chain",
-		strconv.Itoa(multicastDownstreamChain), "protocol", variant.protocol,
+		strconv.Itoa(multicastGEMChain(rule.gemPortID)), "protocol", variant.protocol,
 		"pref", strconv.Itoa(preference), "flower", "skip_hw"}
 	if variant.tagged {
 		arguments = append(arguments, "num_of_vlans", strconv.Itoa(variant.tags))
@@ -781,6 +903,32 @@ func downstreamFilterArguments(interfaceName string, preference int, rule downst
 		return nil, err
 	}
 	return append(arguments, actions...), nil
+}
+
+func downstreamExcludeFilterArguments(interfaceName string, preference int, rule downstreamRule,
+	prefix netip.Prefix, variant downstreamVariant, source netip.Addr) ([]string, error) {
+	if !source.IsValid() || source.BitLen() != prefix.Addr().BitLen() {
+		return nil, fmt.Errorf("multicast exclusion source %s does not match group %s", source, prefix)
+	}
+	arguments := []string{"filter", "replace", "dev", interfaceName, "egress", "chain",
+		strconv.Itoa(multicastGEMChain(rule.gemPortID)), "protocol", variant.protocol,
+		"pref", strconv.Itoa(preference), "flower", "skip_hw"}
+	if variant.tagged {
+		arguments = append(arguments, "num_of_vlans", strconv.Itoa(variant.tags))
+		if rule.aniVLAN <= 4095 {
+			arguments = append(arguments, "vlan_id", strconv.Itoa(int(rule.aniVLAN)))
+		}
+		encapsulated := "vlan_ethtype"
+		if variant.tags == 2 {
+			encapsulated = "cvlan_ethtype"
+		}
+		if prefix.Addr().Is4() {
+			arguments = append(arguments, encapsulated, "ip")
+		} else {
+			arguments = append(arguments, encapsulated, "ipv6")
+		}
+	}
+	return append(arguments, "src_ip", source.String(), "dst_ip", prefix.String(), "action", "drop"), nil
 }
 
 func downstreamActions(profile Profile, uniVLAN VLAN, tagged bool) ([]string, error) {

@@ -161,9 +161,16 @@ after an explicit time synchronization. MIB reset and PM deletion discard
 local state. PM instances with no enabled threshold avoid intra-interval
 hardware sampling.
 
-The fixed-path event helper now maps XG2010G BOSA LOS, GPON activation state,
-optical diagnostics and the four Ethernet carrier states into validated
-Alarm/AVC state. ANI-G optical line supervision tests return all five G.988
+The fixed-path event helper maps GPON activation state, optical diagnostics,
+BER samples and the four Ethernet carrier states into validated Alarm/AVC
+state. The GPON driver handles OLT BER Interval and upstream REI PLOAM, while
+the engine evaluates ANI-G SF/SD from BIP count, interval and the current
+`10^-N` thresholds. BOSA LOS and PHY LOF remain independent link states and
+are not misreported as BER-derived SF or SD. The latest BER window, alarm
+audit, ARC timers, PM baselines/history and active TCAs survive a daemon-only
+restart; an OMCC carrier drop clears the driver-local BER sequence audit before
+re-ranging. ANI-G optical line
+supervision tests return all five G.988
 result types in baseline and extended format. Dynamic ANI-G optical attributes,
 OLT and internal thresholds, clear hysteresis, ARC suppression/cancellation and
 ARC-aware alarm audits are implemented. Get all alarms uses a stable one-minute
@@ -173,6 +180,13 @@ suppresses autonomous alarms, TCAs, AVCs and self-initiated test results without
 incrementing the alarm sequence; alarm conditions remain available to Get all
 alarms. Circuit-pack, Ethernet PPTP and UNI-G locks suppress their Ethernet port
 and dependent PM notifications. Physical OLT verification remains.
+
+Alarm audit state and sequence numbers, problem-free ARC timer starts, the
+15-minute PM boundary, hardware counter baselines, completed PM history and
+active TCAs are stored in a versioned runtime document. Restore is accepted only
+when its MIB data sync, MIB fingerprint, managed-entity references and monotonic
+hardware counters match. The daemon compares deterministic snapshots once per
+second and atomically writes only changes, avoiding periodic flash churn.
 
 Software download now implements baseline and extended sections, negotiated
 maximum windows, shorter OLT-selected windows and complete-window retry without

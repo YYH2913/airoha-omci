@@ -86,6 +86,29 @@ func TestDispatchOpticalSample(t *testing.T) {
 	}
 }
 
+func TestDispatchBERSample(t *testing.T) {
+	protocol := opticalTestEngine(t)
+	event, err := Decode([]byte(`{"type":"ber-sample","class_id":263,"entity_id":32769,"sequence":1,"bip_count":25,"interval_ms":1000,"boot_id":"01234567-89ab-cdef-0123-456789abcdef"}`))
+	if err != nil {
+		t.Fatalf("Decode() error = %v", err)
+	}
+	frames, err := event.Dispatch(protocol)
+	if err != nil {
+		t.Fatalf("Dispatch() error = %v", err)
+	}
+	if len(frames) != 1 {
+		t.Fatalf("BER sample frames = %d, want one SF/SD alarm", len(frames))
+	}
+
+	missing, err := Decode([]byte(`{"type":"ber-sample","class_id":263,"entity_id":32769,"sequence":2,"bip_count":0}`))
+	if err != nil {
+		t.Fatalf("Decode(missing interval) error = %v", err)
+	}
+	if _, err = missing.Dispatch(protocol); err == nil {
+		t.Fatal("Dispatch(missing interval) error = nil")
+	}
+}
+
 func TestDecodeRejectsUnknownAndTrailingFields(t *testing.T) {
 	for _, input := range []string{
 		`{"type":"alarm","extra":1}`,
@@ -138,6 +161,8 @@ func opticalTestEngine(t *testing.T) *engine.Engine {
 	store, err := mib.New([]mib.Instance{{
 		Key: mib.Key{ClassID: me.AniGClassID, EntityID: 0x8001},
 		Attributes: me.AttributeValueMap{
+			me.AniG_SignalFailThreshold:         uint8(5),
+			me.AniG_SignalDegradeThreshold:      uint8(9),
 			me.AniG_Arc:                         uint8(0),
 			me.AniG_ArcInterval:                 uint8(0),
 			me.AniG_OpticalSignalLevel:          uint16(0),
