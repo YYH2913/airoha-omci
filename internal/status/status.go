@@ -8,11 +8,14 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/xg2010g/airoha-omci/internal/pon"
 )
 
 type Snapshot struct {
 	State                string    `json:"state"`
 	Interface            string    `json:"interface"`
+	PONMode              pon.Mode  `json:"pon_mode"`
 	StartedAt            time.Time `json:"started_at"`
 	UpdatedAt            time.Time `json:"updated_at"`
 	MIBDataSync          uint8     `json:"mib_data_sync"`

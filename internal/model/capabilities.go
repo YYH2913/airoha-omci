@@ -8,12 +8,16 @@ import (
 
 	me "github.com/opencord/omci-lib-go/v2/generated"
 	"github.com/xg2010g/airoha-omci/internal/mib"
+	"github.com/xg2010g/airoha-omci/internal/pon"
 )
 
 // XG2010GSupportedClasses is the authoritative list of managed-entity classes
 // accepted by this ONU implementation. A generated G.988 definition alone is
 // not evidence that the XG2010G backend implements the class.
-func XG2010GSupportedClasses() []me.ClassID {
+func XG2010GSupportedClasses(mode pon.Mode) []me.ClassID {
+	if err := mode.Validate(); err != nil {
+		return nil
+	}
 	classes := []me.ClassID{
 		me.OnuDataClassID,
 		me.CardholderClassID,
@@ -55,6 +59,13 @@ func XG2010GSupportedClasses() []me.ClassID {
 		me.FecPerformanceMonitoringHistoryDataClassID,
 		me.GemPortNetworkCtpPerformanceMonitoringHistoryDataClassID,
 	}
+	if mode == pon.XGSPON {
+		classes = append(classes,
+			me.XgPonTcPerformanceMonitoringHistoryDataClassID,
+			me.XgPonDownstreamManagementPerformanceMonitoringHistoryDataClassID,
+			me.XgPonUpstreamManagementPerformanceMonitoringHistoryDataClassID,
+		)
+	}
 	sort.Slice(classes, func(i, j int) bool { return classes[i] < classes[j] })
 	return classes
 }
@@ -64,8 +75,11 @@ func XG2010GSupportedClasses() []me.ClassID {
 // surface from the factory MIB; OLT-created and synthesized classes are audited
 // explicitly here so optional generated definitions never become capabilities
 // by accident.
-func XG2010GSupportedAttributeMasks(factory []mib.Instance) (map[me.ClassID]uint16, error) {
-	classes := XG2010GSupportedClasses()
+func XG2010GSupportedAttributeMasks(mode pon.Mode, factory []mib.Instance) (map[me.ClassID]uint16, error) {
+	if err := mode.Validate(); err != nil {
+		return nil, err
+	}
+	classes := XG2010GSupportedClasses(mode)
 	masks := make(map[me.ClassID]uint16, len(classes))
 	for _, classID := range classes {
 		masks[classID] = 0
@@ -125,6 +139,11 @@ func XG2010GSupportedAttributeMasks(factory []mib.Instance) (map[me.ClassID]uint
 		me.ManagedEntityMeClassID: 0xff00,
 		me.AttributeMeClassID:     0xff80,
 	}
+	if mode == pon.XGSPON {
+		audited[me.XgPonTcPerformanceMonitoringHistoryDataClassID] = 0xfffe
+		audited[me.XgPonDownstreamManagementPerformanceMonitoringHistoryDataClassID] = 0xffff
+		audited[me.XgPonUpstreamManagementPerformanceMonitoringHistoryDataClassID] = 0xff00
+	}
 	for classID, mask := range audited {
 		if _, supported := masks[classID]; !supported {
 			return nil, fmt.Errorf("attribute policy contains unsupported class %v", classID)
@@ -155,7 +174,7 @@ func XG2010GSupportedAttributeMasks(factory []mib.Instance) (map[me.ClassID]uint
 
 // XG2010GAttributeCapabilities describes fixed values and non-contiguous
 // enumerations that are narrower than their generated wire types.
-func XG2010GAttributeCapabilities() map[mib.AttributeCapabilityKey]mib.AttributeCapability {
+func XG2010GAttributeCapabilities(mode pon.Mode) map[mib.AttributeCapabilityKey]mib.AttributeCapability {
 	capabilities := make(map[mib.AttributeCapabilityKey]mib.AttributeCapability)
 	bounds := func(classID me.ClassID, name string, lower, upper uint32) {
 		capabilities[mib.AttributeCapabilityKey{ClassID: classID, Name: name}] =
@@ -175,6 +194,7 @@ func XG2010GAttributeCapabilities() map[mib.AttributeCapabilityKey]mib.Attribute
 		}
 		return values
 	}
+	_ = mode
 
 	fixed(me.AniGClassID, me.AniG_GemBlockLength, 48)
 	bounds(me.AniGClassID, me.AniG_SignalFailThreshold, 3, 8)
@@ -306,7 +326,10 @@ func XG2010GAttributeCapabilities() map[mib.AttributeCapabilityKey]mib.Attribute
 
 // XG2010GValidateInstance constrains standard attributes whose valid wire
 // values exceed what the fixed EN7581 data path can faithfully implement.
-func XG2010GValidateInstance(instance mib.Instance) error {
+func XG2010GValidateInstance(mode pon.Mode, instance mib.Instance) error {
+	if err := mode.Validate(); err != nil {
+		return err
+	}
 	switch instance.ClassID {
 	case me.CardholderClassID:
 		actual, actualPresent := instance.Attributes[me.Cardholder_ActualPlugInUnitType].(uint8)
@@ -399,6 +422,12 @@ func XG2010GValidateInstance(instance mib.Instance) error {
 		}
 	}
 	return nil
+}
+
+func XG2010GInstanceValidator(mode pon.Mode) func(mib.Instance) error {
+	return func(instance mib.Instance) error {
+		return XG2010GValidateInstance(mode, instance)
+	}
 }
 
 func xg2010gAttributeError(classID me.ClassID, name, format string, arguments ...interface{}) error {

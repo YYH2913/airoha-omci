@@ -20,6 +20,7 @@ import (
 	"github.com/xg2010g/airoha-omci/internal/multicast"
 	"github.com/xg2010g/airoha-omci/internal/optical"
 	"github.com/xg2010g/airoha-omci/internal/performance"
+	"github.com/xg2010g/airoha-omci/internal/pon"
 	"github.com/xg2010g/airoha-omci/internal/software"
 )
 
@@ -80,7 +81,8 @@ type Controller interface {
 type Engine struct {
 	mu sync.Mutex
 
-	mib *mib.Store
+	mib     *mib.Store
+	ponMode pon.Mode
 
 	transactions           [transactionChannelCount]transactionReplay
 	oneWayDigest           [sha256.Size]byte
@@ -107,6 +109,8 @@ type Engine struct {
 	fecPMState             map[mib.Key]fecPerformanceState
 	ethernetPerformance    performance.EthernetController
 	ethernetPMState        map[mib.Key]ethernetPerformanceState
+	xgsPerformance         performance.XGSPONController
+	xgsPMState             map[mib.Key]xgsPerformanceState
 	performanceTCA         map[mib.Key][28]byte
 	performanceNext        time.Time
 	performanceIntervalEnd uint8
@@ -115,16 +119,22 @@ type Engine struct {
 }
 
 func New(store *mib.Store) *Engine {
-	return NewWithController(store, nil)
+	return NewForMode(store, nil, nil, pon.GPON)
 }
 
 func NewWithController(store *mib.Store, controller Controller) *Engine {
-	return NewWithControllers(store, controller, nil)
+	return NewForMode(store, controller, nil, pon.GPON)
 }
 
 func NewWithControllers(store *mib.Store, controller Controller, softwareController software.Controller) *Engine {
+	return NewForMode(store, controller, softwareController, pon.GPON)
+}
+
+func NewForMode(store *mib.Store, controller Controller,
+	softwareController software.Controller, mode pon.Mode) *Engine {
 	result := &Engine{
 		mib:              store,
+		ponMode:          mode,
 		upload:           make(map[omci.DeviceIdent]uploadSession),
 		tables:           make(map[tableKey][]byte),
 		alarms:           make(map[mib.Key][28]byte),
@@ -139,6 +149,7 @@ func NewWithControllers(store *mib.Store, controller Controller, softwareControl
 		performanceState: make(map[mib.Key]performanceState),
 		fecPMState:       make(map[mib.Key]fecPerformanceState),
 		ethernetPMState:  make(map[mib.Key]ethernetPerformanceState),
+		xgsPMState:       make(map[mib.Key]xgsPerformanceState),
 		performanceTCA:   make(map[mib.Key][28]byte),
 	}
 	if performanceController, ok := controller.(performance.Controller); ok {
@@ -149,6 +160,9 @@ func NewWithControllers(store *mib.Store, controller Controller, softwareControl
 	}
 	if fecController, ok := controller.(performance.FECController); ok {
 		result.fecPerformance = fecController
+	}
+	if xgsController, ok := controller.(performance.XGSPONController); ok {
+		result.xgsPerformance = xgsController
 	}
 	if multicastController, ok := controller.(multicast.Controller); ok {
 		result.multicast = multicastController
@@ -218,16 +232,29 @@ func (e *Engine) ResetCommunicationSession() {
 // response. G.988 stop-and-wait replay is tracked independently for baseline
 // low/high priority and for the single extended-message priority class.
 func (e *Engine) Handle(frame []byte) ([]byte, error) {
+	return e.HandleFrame(DownstreamFrame{Contents: frame})
+}
+
+// DownstreamFrame carries security metadata supplied by a trusted OMCC
+// adapter. XGS-PON frames are accepted only after that adapter has verified the
+// AES-CMAC and removed any mode-specific trailer.
+type DownstreamFrame struct {
+	Contents    []byte
+	MICVerified bool
+}
+
+func (e *Engine) HandleFrame(frame DownstreamFrame) ([]byte, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	if err := validateFrame(frame); err != nil {
+	if err := validateFrame(e.ponMode, frame); err != nil {
 		return nil, err
 	}
-	if omci.DeviceIdent(frame[3]) == omci.ExtendedIdent {
+	contents := frame.Contents
+	if omci.DeviceIdent(contents[3]) == omci.ExtendedIdent {
 		e.extendedSeen = true
 	}
-	packet := gopacket.NewPacket(frame, omci.LayerTypeOMCI, gopacket.Default)
+	packet := gopacket.NewPacket(contents, omci.LayerTypeOMCI, gopacket.Default)
 	headerLayer := packet.Layer(omci.LayerTypeOMCI)
 	if headerLayer == nil {
 		return nil, errors.New("OMCI header is missing")
@@ -244,11 +271,11 @@ func (e *Engine) Handle(frame []byte) ([]byte, error) {
 	if response, found := e.replayTransaction(header); found {
 		return response, nil
 	}
-	digest := sha256.Sum256(frame)
+	digest := sha256.Sum256(contents)
 	if noResponseDownload && e.oneWayValid && digest == e.oneWayDigest {
 		return nil, nil
 	}
-	if response, handled, err := e.handleRawSpecial(header, frame); handled {
+	if response, handled, err := e.handleRawSpecial(header, contents); handled {
 		if err != nil {
 			return nil, err
 		}
@@ -256,7 +283,7 @@ func (e *Engine) Handle(frame []byte) ([]byte, error) {
 		return append([]byte(nil), response...), nil
 	}
 	if decodeError := packet.ErrorLayer(); decodeError != nil {
-		response, handled, err := e.decodeFailureResponse(header, frame, decodeError.Error())
+		response, handled, err := e.decodeFailureResponse(header, contents, decodeError.Error())
 		if err != nil {
 			return nil, err
 		}
@@ -292,6 +319,7 @@ func (e *Engine) dispatch(packet gopacket.Packet, header *omci.OMCI) ([]byte, er
 		var preparedPerformance *performanceState
 		var preparedFEC *fecPerformanceState
 		var preparedEthernet *ethernetPerformanceState
+		var preparedXGS *xgsPerformanceState
 		var operationError error
 		requestKey := mib.Key{ClassID: request.EntityClass, EntityID: request.EntityInstance}
 		if !e.mib.Exists(requestKey) {
@@ -306,6 +334,9 @@ func (e *Engine) dispatch(packet gopacket.Packet, header *omci.OMCI) ([]byte, er
 			preparedFEC, operationError = e.prepareFECPerformanceCreateLocked(request.EntityInstance)
 		} else if operationError == nil && isEthernetPerformanceClass(request.EntityClass) {
 			preparedEthernet, operationError = e.prepareEthernetPerformanceCreateLocked(
+				request.EntityClass, request.EntityInstance)
+		} else if operationError == nil && isXGSPONPerformanceClass(request.EntityClass) {
+			preparedXGS, operationError = e.prepareXGSPerformanceCreateLocked(
 				request.EntityClass, request.EntityInstance)
 		}
 		if operationError == nil {
@@ -328,6 +359,11 @@ func (e *Engine) dispatch(packet gopacket.Packet, header *omci.OMCI) ([]byte, er
 				e.ethernetPMState[mib.Key{
 					ClassID: request.EntityClass, EntityID: request.EntityInstance,
 				}] = *preparedEthernet
+			}
+			if preparedXGS != nil {
+				e.xgsPMState[mib.Key{
+					ClassID: request.EntityClass, EntityID: request.EntityInstance,
+				}] = *preparedXGS
 			}
 		}
 		return serialize(header, omci.CreateResponseType, &omci.CreateResponse{
@@ -373,6 +409,7 @@ func (e *Engine) dispatch(packet gopacket.Packet, header *omci.OMCI) ([]byte, er
 			delete(e.performanceState, key)
 			delete(e.fecPMState, key)
 			delete(e.ethernetPMState, key)
+			delete(e.xgsPMState, key)
 			e.clearPerformanceTCAKeyLocked(key)
 		}
 		return serialize(header, omci.DeleteResponseType, &omci.DeleteResponse{
@@ -508,6 +545,7 @@ func (e *Engine) dispatch(packet gopacket.Packet, header *omci.OMCI) ([]byte, er
 			e.performanceState = make(map[mib.Key]performanceState)
 			e.fecPMState = make(map[mib.Key]fecPerformanceState)
 			e.ethernetPMState = make(map[mib.Key]ethernetPerformanceState)
+			e.xgsPMState = make(map[mib.Key]xgsPerformanceState)
 			e.clearAllPerformanceTCAsLocked()
 			e.performanceNext = time.Time{}
 			e.performanceIntervalEnd = 0
@@ -1461,22 +1499,35 @@ func transactionPriority(header *omci.OMCI) transactionChannel {
 	return baselineLowPriority
 }
 
-func validateFrame(frame []byte) error {
+func validateFrame(mode pon.Mode, input DownstreamFrame) error {
+	if err := mode.Validate(); err != nil {
+		return err
+	}
+	frame := input.Contents
 	if len(frame) < 4 || len(frame) > omci.MaxExtendedLength {
 		return fmt.Errorf("invalid OMCI frame length %d", len(frame))
 	}
 	switch omci.DeviceIdent(frame[3]) {
 	case omci.BaselineIdent:
+		if mode == pon.XGSPON && !input.MICVerified {
+			return errors.New("XGS-PON OMCI frame has no trusted MIC verification")
+		}
 		// OMCC adapters may remove the MIC or the complete eight-byte trailer
 		// after validating it. omci-lib-go emits the MIC-stripped form.
 		if len(frame) != omci.MaxBaselineLength && len(frame) != omci.MaxBaselineLength-4 &&
 			len(frame) != omci.MaxBaselineLength-8 {
 			return fmt.Errorf("invalid baseline OMCI frame length %d", len(frame))
 		}
-		if len(frame) == omci.MaxBaselineLength {
+		if mode == pon.GPON && len(frame) == omci.MaxBaselineLength {
 			return validateGPONMIC(frame[:omci.MaxBaselineLength-4], frame[omci.MaxBaselineLength-4:])
 		}
+		if mode == pon.XGSPON && len(frame) == omci.MaxBaselineLength {
+			return errors.New("XGS-PON OMCI adapter did not remove the security trailer")
+		}
 	case omci.ExtendedIdent:
+		if mode == pon.XGSPON && !input.MICVerified {
+			return errors.New("XGS-PON OMCI frame has no trusted MIC verification")
+		}
 		if len(frame) < 10 {
 			return fmt.Errorf("invalid extended OMCI frame length %d", len(frame))
 		}
@@ -1487,8 +1538,11 @@ func validateFrame(frame []byte) error {
 			return fmt.Errorf("extended OMCI content length %d does not match frame length %d",
 				payloadEnd-10, len(frame))
 		}
-		if len(frame) == payloadEnd+4 {
+		if mode == pon.GPON && len(frame) == payloadEnd+4 {
 			return validateGPONMIC(frame[:payloadEnd], frame[payloadEnd:])
+		}
+		if mode == pon.XGSPON && len(frame) == payloadEnd+4 {
+			return errors.New("XGS-PON OMCI adapter did not remove the security trailer")
 		}
 	default:
 		return fmt.Errorf("unsupported OMCI device identifier %#x", frame[3])

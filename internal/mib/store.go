@@ -65,6 +65,9 @@ const defaultExtendedVLANTableSize = 64
 type Options struct {
 	Applier               Applier
 	ExtendedVLANTableSize uint16
+	// StateDomain is copied into every committed platform document and must
+	// match before a persistent MIB can be restored.
+	StateDomain string
 	// SupportedClasses constrains the device-specific ME surface. A nil or
 	// empty list preserves the unrestricted behavior used by small unit-test
 	// stores; production callers must provide an explicit platform list.
@@ -86,6 +89,7 @@ type Options struct {
 // The store commits it only after Apply returns successfully.
 type Change struct {
 	Operation   Operation  `json:"operation"`
+	StateDomain string     `json:"state_domain,omitempty"`
 	Before      *Instance  `json:"before,omitempty"`
 	After       *Instance  `json:"after,omitempty"`
 	Snapshot    []Instance `json:"snapshot"`
@@ -135,6 +139,7 @@ type Store struct {
 	dataSync              uint8
 	applier               Applier
 	extendedVLANTableSize uint16
+	stateDomain           string
 	supportedClasses      map[me.ClassID]struct{}
 	supportedAttributes   map[me.ClassID]uint16
 	attributeCapabilities map[AttributeCapabilityKey]AttributeCapability
@@ -162,6 +167,7 @@ func NewWithOptions(factory []Instance, options Options) (*Store, error) {
 		current:               make(map[Key]Instance, len(factory)),
 		applier:               options.Applier,
 		extendedVLANTableSize: tableSize,
+		stateDomain:           options.StateDomain,
 		validateInstance:      options.ValidateInstance,
 	}
 	if options.SupportedAttributeMasks != nil && len(options.SupportedClasses) == 0 {
@@ -725,7 +731,8 @@ func (s *Store) updateByCommand(updates map[Key]me.AttributeValueMap,
 		return s.commitLocked(OperationCommand, nil, nil, proposed, dataSync)
 	}
 	change := Change{
-		Operation: OperationCommand, Snapshot: snapshotInstances(proposed), MIBDataSync: dataSync,
+		Operation: OperationCommand, StateDomain: s.stateDomain,
+		Snapshot: snapshotInstances(proposed), MIBDataSync: dataSync,
 	}
 	if s.applier != nil {
 		if err := s.applier.Apply(change); err != nil {
@@ -738,7 +745,8 @@ func (s *Store) updateByCommand(updates map[Key]me.AttributeValueMap,
 		var rollbackErr error
 		if s.applier != nil {
 			rollback := Change{
-				Operation: OperationCommand, Snapshot: snapshotInstances(s.current),
+				Operation: OperationCommand, StateDomain: s.stateDomain,
+				Snapshot:    snapshotInstances(s.current),
 				MIBDataSync: s.dataSync,
 			}
 			if err := s.applier.Apply(rollback); err != nil {
@@ -860,6 +868,7 @@ func (s *Store) commitLocked(operation Operation, before, after *Instance,
 	setDataSync(next, dataSync)
 	change := Change{
 		Operation:   operation,
+		StateDomain: s.stateDomain,
 		Before:      cloneInstancePointer(before),
 		After:       cloneInstancePointer(after),
 		Snapshot:    snapshotInstances(next),

@@ -12,6 +12,7 @@ import (
 	"github.com/xg2010g/airoha-omci/internal/mib"
 	"github.com/xg2010g/airoha-omci/internal/model"
 	"github.com/xg2010g/airoha-omci/internal/multicast"
+	"github.com/xg2010g/airoha-omci/internal/pon"
 )
 
 const (
@@ -1025,7 +1026,7 @@ func TestBuildServiceGraphRejectsUnsupportedGALConfiguration(t *testing.T) {
 }
 
 func TestOLTCanBuildServiceGraphTransactionByTransaction(t *testing.T) {
-	factory, err := model.XG2010G(model.Identity{SerialNumber: "TEST01020304"})
+	factory, err := model.XG2010G(model.Identity{SerialNumber: "TEST01020304", PONMode: pon.GPON})
 	if err != nil {
 		t.Fatalf("model.XG2010G() error = %v", err)
 	}

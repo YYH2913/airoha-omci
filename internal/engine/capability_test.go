@@ -12,6 +12,7 @@ import (
 	me "github.com/opencord/omci-lib-go/v2/generated"
 	"github.com/xg2010g/airoha-omci/internal/mib"
 	"github.com/xg2010g/airoha-omci/internal/model"
+	"github.com/xg2010g/airoha-omci/internal/pon"
 )
 
 func TestCapabilityMEsMatchXG2010GPolicy(t *testing.T) {
@@ -371,7 +372,7 @@ func TestCapabilityAndAttributePolicyUseProtocolErrorResponses(t *testing.T) {
 	}
 	capability := decodeResponse(t, encoded).Layer(omci.LayerTypeGetResponse).(*omci.GetResponse)
 	if capability.Result != me.Success ||
-		capability.Attributes[me.Omci_MeTypeTable] != uint32(len(model.XG2010GSupportedClasses())*2) ||
+		capability.Attributes[me.Omci_MeTypeTable] != uint32(len(model.XG2010GSupportedClasses(pon.GPON))*2) ||
 		capability.Attributes[me.Omci_MessageTypeTable] != uint32(len(capabilityMessageTypes)) {
 		t.Fatalf("extended OMCI capability response = %#v", capability)
 	}
@@ -393,7 +394,7 @@ func TestCapabilityAndAttributePolicyUseProtocolErrorResponses(t *testing.T) {
 
 func TestCapabilityAttributeIDsAreUnique(t *testing.T) {
 	seen := make(map[uint16]string)
-	for _, classID := range model.XG2010GSupportedClasses() {
+	for _, classID := range model.XG2010GSupportedClasses(pon.GPON) {
 		definition, err := capabilityDefinition(classID)
 		if err != nil {
 			t.Fatal(err)
@@ -419,19 +420,19 @@ func TestCapabilityAttributeIDsAreUnique(t *testing.T) {
 
 func newCapabilityEngine(t *testing.T) (*Engine, *mib.Store, []me.ClassID) {
 	t.Helper()
-	factory, err := model.XG2010G(model.Identity{SerialNumber: "TEST01020304"})
+	factory, err := model.XG2010G(model.Identity{SerialNumber: "TEST01020304", PONMode: pon.GPON})
 	if err != nil {
 		t.Fatal(err)
 	}
-	classes := model.XG2010GSupportedClasses()
-	masks, err := model.XG2010GSupportedAttributeMasks(factory)
+	classes := model.XG2010GSupportedClasses(pon.GPON)
+	masks, err := model.XG2010GSupportedAttributeMasks(pon.GPON, factory)
 	if err != nil {
 		t.Fatal(err)
 	}
 	store, err := mib.NewWithOptions(factory, mib.Options{
 		SupportedClasses: classes, SupportedAttributeMasks: masks,
-		ValidateInstance:      model.XG2010GValidateInstance,
-		AttributeCapabilities: model.XG2010GAttributeCapabilities(),
+		ValidateInstance:      model.XG2010GInstanceValidator(pon.GPON),
+		AttributeCapabilities: model.XG2010GAttributeCapabilities(pon.GPON),
 	})
 	if err != nil {
 		t.Fatal(err)

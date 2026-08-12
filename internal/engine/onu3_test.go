@@ -14,6 +14,7 @@ import (
 	"github.com/xg2010g/airoha-omci/internal/mib"
 	"github.com/xg2010g/airoha-omci/internal/model"
 	"github.com/xg2010g/airoha-omci/internal/onu3"
+	"github.com/xg2010g/airoha-omci/internal/pon"
 )
 
 func TestONU3DefinitionSupportsRequiredProtocolSurface(t *testing.T) {
@@ -242,18 +243,18 @@ type onu3State struct {
 
 func newONU3Engine(t *testing.T, applier mib.Applier) (*Engine, *mib.Store) {
 	t.Helper()
-	factory, err := model.XG2010G(model.Identity{SerialNumber: "TEST01020304"})
+	factory, err := model.XG2010G(model.Identity{SerialNumber: "TEST01020304", PONMode: pon.GPON})
 	if err != nil {
 		t.Fatal(err)
 	}
-	masks, err := model.XG2010GSupportedAttributeMasks(factory)
+	masks, err := model.XG2010GSupportedAttributeMasks(pon.GPON, factory)
 	if err != nil {
 		t.Fatal(err)
 	}
 	store, err := mib.NewWithOptions(factory, mib.Options{
-		Applier: applier, SupportedClasses: model.XG2010GSupportedClasses(),
-		SupportedAttributeMasks: masks, ValidateInstance: model.XG2010GValidateInstance,
-		AttributeCapabilities: model.XG2010GAttributeCapabilities(),
+		Applier: applier, SupportedClasses: model.XG2010GSupportedClasses(pon.GPON),
+		SupportedAttributeMasks: masks, ValidateInstance: model.XG2010GInstanceValidator(pon.GPON),
+		AttributeCapabilities: model.XG2010GAttributeCapabilities(pon.GPON),
 	})
 	if err != nil {
 		t.Fatal(err)

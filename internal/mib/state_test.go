@@ -91,6 +91,22 @@ func TestNewFromStateRejectsIdentityMismatch(t *testing.T) {
 	}
 }
 
+func TestNewFromStateRejectsDifferentCompatibilityDomain(t *testing.T) {
+	factory := stateTestFactory("ABCD")
+	store, err := New(factory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := ExportState(store.Snapshot(), store.DataSync(), "xg2010g:gpon")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = NewFromState(factory, state, Options{StateDomain: "xg2010g:xgspon"})
+	if err == nil || !strings.Contains(err.Error(), "domain") {
+		t.Fatalf("NewFromState(cross-mode) error = %v", err)
+	}
+}
+
 func TestNewFromStateRejectsUnsupportedPersistedClass(t *testing.T) {
 	factory := stateTestFactory("ABCD")
 	store, err := New(factory)

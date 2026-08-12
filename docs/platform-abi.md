@@ -53,16 +53,18 @@ must be idempotent because an OLT may retransmit a request.
 
 The apply helper receives a complete, resolved candidate service graph and its
 corresponding MIB state on stdin and must commit them transactionally. ABI
-version 6 has this top-level
+version 7 has this top-level
 shape:
 
 ```json
 {
-  "version": 6,
+  "version": 7,
+  "state_domain": "xg2010g:gpon",
   "operation": "set-table",
   "mib_data_sync": 17,
-  "mib_state": {
-    "version": 1,
+	"mib_state": {
+	  "version": 1,
+	  "state_domain": "xg2010g:gpon",
     "mib_data_sync": 17,
     "instances": [{
       "class_id": 2,
@@ -123,8 +125,10 @@ must not interpret it as hardware configuration. Attribute values carry an
 explicit scalar, octet, integer-array or table type so JSON cannot erase their
 G.988 representation. Extended VLAN tables are emitted in `service_graph` as
 named filter and treatment fields, including enhanced row keys and directions;
-no encoded table rows cross the hardware boundary. ABI 6 adds the normalized
-class-298 parent and class-280 traffic-descriptor pointers. It retains the class
+no encoded table rows cross the hardware boundary. ABI 7 binds the transaction
+and opaque MIB recovery document to one board/PON compatibility domain; the
+current GPON backend accepts only `xg2010g:gpon`. It retains the normalized
+class-298 parent and class-280 traffic-descriptor pointers added by ABI 6, and the class
 309 ACLs and class 310 service-package/allowed-preview rows introduced by ABI 4
 as normalized logical entries. Set
 control, row-part, test and reserved bits never cross the boundary. Unknown ABI

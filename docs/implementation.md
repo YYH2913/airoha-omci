@@ -255,7 +255,7 @@ CTP are programmed as downstream-only flows, and their receive marks are
 dispatched to that ANI endpoint. The OpenWrt backend disables Linux bridge
 multicast snooping so the native G.988 runtime is the sole membership authority.
 
-The native `airoha-mcastd` backend consumes the committed ABI 6 graph and
+The native `airoha-mcastd` backend consumes the committed ABI 7 graph and
 intercepts IGMPv1/v2/v3 and MLDv1/v2 reports before Linux bridge snooping. It
 enforces class 309 dynamic/static ACL ranges and class 310 service-package,
 allowed-preview, group and imputed-bandwidth policy per UNI. Static ranges and
@@ -370,7 +370,7 @@ representation for these per-field sources. The target kernel and `tc flower`
 expose outer and inner DEI keys, so DEI, VID, PCP, protocol and DSCP criteria are
 matched atomically without a child chain that could hide later EVTO rows.
 
-The runtime MIB and service graph are persisted as one root-only ABI 6 document after
+The runtime MIB and service graph are persisted as one root-only ABI 7 document after
 every acknowledged mutation. A daemon restart restores OLT-created MEs and the
 MIB data-sync counter only after validating the state version, attribute types,
 factory completeness, ONU vendor/serial identity and a graph reconstructed from

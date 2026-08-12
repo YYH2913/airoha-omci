@@ -9,6 +9,7 @@ import (
 	me "github.com/opencord/omci-lib-go/v2/generated"
 	"github.com/xg2010g/airoha-omci/internal/mib"
 	"github.com/xg2010g/airoha-omci/internal/onu3"
+	"github.com/xg2010g/airoha-omci/internal/pon"
 )
 
 const (
@@ -42,9 +43,13 @@ type Identity struct {
 	Version       string
 	EquipmentID   string
 	RestartReason uint8
+	PONMode       pon.Mode
 }
 
 func XG2010G(identity Identity) ([]mib.Instance, error) {
+	if err := identity.PONMode.Validate(); err != nil {
+		return nil, err
+	}
 	serial, err := serialOctets(identity.SerialNumber)
 	if err != nil {
 		return nil, err
@@ -57,6 +62,10 @@ func XG2010G(identity Identity) ([]mib.Instance, error) {
 	}
 
 	vendor := serial[:4]
+	ponEquipmentID := identity.EquipmentID + " GPON"
+	if identity.PONMode == pon.XGSPON {
+		ponEquipmentID = identity.EquipmentID + " XGS-PON"
+	}
 	instances := []mib.Instance{
 		instance(me.OnuDataClassID, 0, me.AttributeValueMap{
 			me.OnuData_MibDataSync: uint8(0),
@@ -150,7 +159,7 @@ func XG2010G(identity Identity) ([]mib.Instance, error) {
 			me.CircuitPack_VendorId:                    cloneBytes(vendor),
 			me.CircuitPack_AdministrativeState:         uint8(0),
 			me.CircuitPack_OperationalState:            uint8(0),
-			me.CircuitPack_EquipmentId:                 octets(identity.EquipmentID+" GPON", 20),
+			me.CircuitPack_EquipmentId:                 octets(ponEquipmentID, 20),
 			me.CircuitPack_TotalTContBufferNumber:      uint8(defaultTContCount),
 			me.CircuitPack_TotalPriorityQueueNumber:    uint8(defaultTContCount * 8),
 			me.CircuitPack_TotalTrafficSchedulerNumber: uint8(defaultTContCount),

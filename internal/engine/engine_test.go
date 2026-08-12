@@ -5,6 +5,7 @@ package engine
 import (
 	"encoding/binary"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"github.com/xg2010g/airoha-omci/internal/mib"
 	"github.com/xg2010g/airoha-omci/internal/model"
 	"github.com/xg2010g/airoha-omci/internal/optical"
+	"github.com/xg2010g/airoha-omci/internal/pon"
 )
 
 func TestCreateDuplicateIsReplayedWithoutDoubleMutation(t *testing.T) {
@@ -189,7 +191,7 @@ func TestFrameBoundsAllowAdapterTrailerModes(t *testing.T) {
 		"extended without MIC":     extended,
 	} {
 		t.Run(name, func(t *testing.T) {
-			if err := validateFrame(frame); err != nil {
+			if err := validateFrame(pon.GPON, DownstreamFrame{Contents: frame}); err != nil {
 				t.Fatalf("validateFrame() error = %v", err)
 			}
 		})
@@ -206,7 +208,7 @@ func TestFrameBoundsAllowAdapterTrailerModes(t *testing.T) {
 		"oversized extended":    append([]byte{0, 1, byte(omci.GetRequestType), byte(omci.ExtendedIdent)}, make([]byte, omci.MaxExtendedLength-3)...),
 	} {
 		t.Run(name, func(t *testing.T) {
-			if err := validateFrame(frame); err == nil {
+			if err := validateFrame(pon.GPON, DownstreamFrame{Contents: frame}); err == nil {
 				t.Fatal("validateFrame() accepted malformed frame")
 			}
 		})
@@ -231,10 +233,30 @@ func TestFrameBoundsRejectInvalidGPONMIC(t *testing.T) {
 		"extended": extended,
 	} {
 		t.Run(name, func(t *testing.T) {
-			if err := validateFrame(frame); err == nil {
+			if err := validateFrame(pon.GPON, DownstreamFrame{Contents: frame}); err == nil {
 				t.Fatal("validateFrame() accepted an invalid GPON MIC")
 			}
 		})
+	}
+}
+
+func TestXGSPONFrameValidationRequiresTrustedMICMetadata(t *testing.T) {
+	baseline := make([]byte, omci.MaxBaselineLength-8)
+	baseline[3] = byte(omci.BaselineIdent)
+	if err := validateFrame(pon.XGSPON, DownstreamFrame{Contents: baseline}); err == nil ||
+		!strings.Contains(err.Error(), "trusted MIC") {
+		t.Fatalf("unverified XGS-PON baseline error = %v", err)
+	}
+	if err := validateFrame(pon.XGSPON, DownstreamFrame{
+		Contents: baseline, MICVerified: true,
+	}); err != nil {
+		t.Fatalf("verified, stripped XGS-PON baseline error = %v", err)
+	}
+	withTrailer := append(append([]byte(nil), baseline...), make([]byte, 8)...)
+	if err := validateFrame(pon.XGSPON, DownstreamFrame{
+		Contents: withTrailer, MICVerified: true,
+	}); err == nil || !strings.Contains(err.Error(), "did not remove") {
+		t.Fatalf("XGS-PON frame retaining trailer error = %v", err)
 	}
 }
 
@@ -283,19 +305,19 @@ func TestMibResetAndUpload(t *testing.T) {
 }
 
 func TestCompleteXG2010GFactoryMIBUpload(t *testing.T) {
-	factory, err := model.XG2010G(model.Identity{SerialNumber: "TEST01020304"})
+	factory, err := model.XG2010G(model.Identity{SerialNumber: "TEST01020304", PONMode: pon.GPON})
 	if err != nil {
 		t.Fatal(err)
 	}
-	masks, err := model.XG2010GSupportedAttributeMasks(factory)
+	masks, err := model.XG2010GSupportedAttributeMasks(pon.GPON, factory)
 	if err != nil {
 		t.Fatal(err)
 	}
 	store, err := mib.NewWithOptions(factory, mib.Options{
-		SupportedClasses:        model.XG2010GSupportedClasses(),
+		SupportedClasses:        model.XG2010GSupportedClasses(pon.GPON),
 		SupportedAttributeMasks: masks,
-		ValidateInstance:        model.XG2010GValidateInstance,
-		AttributeCapabilities:   model.XG2010GAttributeCapabilities(),
+		ValidateInstance:        model.XG2010GInstanceValidator(pon.GPON),
+		AttributeCapabilities:   model.XG2010GAttributeCapabilities(pon.GPON),
 	})
 	if err != nil {
 		t.Fatal(err)

@@ -12,6 +12,7 @@ import (
 	"github.com/xg2010g/airoha-omci/internal/mib"
 	"github.com/xg2010g/airoha-omci/internal/optical"
 	"github.com/xg2010g/airoha-omci/internal/performance"
+	"github.com/xg2010g/airoha-omci/internal/pon"
 )
 
 func TestRuntimeStatePreservesAlarmAuditAndSequence(t *testing.T) {
@@ -265,6 +266,112 @@ func TestRuntimeStateRejectsCounterResetWithoutPartialRestore(t *testing.T) {
 	}
 }
 
+func TestRuntimeStatePreservesXGSPONPerformanceHistoriesAndBaselines(t *testing.T) {
+	baseline := performance.XGSPONCounters{
+		TC: performance.XGSPONTCCounters{
+			PSBdHECErrors: 100, TransmittedNonIdleBytes: 1000,
+		},
+		Downstream: performance.XGSPONDownstreamManagementCounters{
+			PLOAMMICErrors: 200, BaselineOMCIMessages: 2000,
+		},
+		Upstream: performance.XGSPONUpstreamManagementCounters{
+			RegistrationMessages: 300,
+		},
+	}
+	before, store, controller := newXGSPerformanceEngine(t, baseline)
+	now := time.Date(2026, 8, 12, 9, 0, 0, 0, time.UTC)
+	before.now = func() time.Time { return now }
+	pollPerformance(t, before)
+	controller.xgsCounters.TC.PSBdHECErrors += 10
+	controller.xgsCounters.TC.TransmittedNonIdleBytes += 100
+	controller.xgsCounters.Downstream.PLOAMMICErrors += 20
+	controller.xgsCounters.Downstream.BaselineOMCIMessages += 200
+	controller.xgsCounters.Upstream.RegistrationMessages += 30
+	now = now.Add(performanceInterval)
+	pollPerformance(t, before)
+
+	state, err := before.ExportRuntimeState()
+	if err != nil {
+		t.Fatalf("ExportRuntimeState() error = %v", err)
+	}
+	if len(state.XGSPerformance) != len(xgsPerformanceClasses()) {
+		t.Fatalf("exported XGS-PON performance entries = %d, want %d",
+			len(state.XGSPerformance), len(xgsPerformanceClasses()))
+	}
+	controller.xgsCounters.TC.PSBdHECErrors += 1
+	controller.xgsCounters.Downstream.PLOAMMICErrors += 2
+	controller.xgsCounters.Upstream.RegistrationMessages += 3
+	for _, classID := range xgsPerformanceClasses() {
+		key := mib.Key{ClassID: classID, EntityID: testANIEntity}
+		if _, err := store.UpdateAutonomous(key, xgsPerformanceAttributes(
+			classID, 0, performance.XGSPONCounters{})); err != nil {
+			t.Fatalf("clear XGS-PON history class %v: %v", classID, err)
+		}
+	}
+
+	after := NewForMode(store, controller, nil, pon.XGSPON)
+	after.now = func() time.Time { return now }
+	if err := after.RestoreRuntimeState(state); err != nil {
+		t.Fatalf("RestoreRuntimeState() error = %v", err)
+	}
+	checks := []struct {
+		classID     me.ClassID
+		mask        uint16
+		name        string
+		historyWant interface{}
+		currentWant interface{}
+	}{
+		{me.XgPonTcPerformanceMonitoringHistoryDataClassID, 0x2000,
+			me.XgPonTcPerformanceMonitoringHistoryData_PsbdHecErrorCount, uint32(10), uint32(1)},
+		{me.XgPonDownstreamManagementPerformanceMonitoringHistoryDataClassID, 0x2000,
+			me.XgPonDownstreamManagementPerformanceMonitoringHistoryData_PloamMessageIntegrityCheckMicErrorCount,
+			uint32(20), uint32(2)},
+		{me.XgPonUpstreamManagementPerformanceMonitoringHistoryDataClassID, 0x0800,
+			me.XgPonUpstreamManagementPerformanceMonitoringHistoryData_RegistrationMessageCount,
+			uint32(30), uint32(3)},
+	}
+	for index, check := range checks {
+		key := mib.Key{ClassID: check.classID, EntityID: testANIEntity}
+		history, err := store.Get(key, 0x8000|check.mask)
+		if err != nil || history.Attributes[check.name] != check.historyWant ||
+			history.Attributes[me.XgPonTcPerformanceMonitoringHistoryData_IntervalEndTime] != uint8(1) {
+			t.Fatalf("restored XGS-PON history class %v = %#v error=%v",
+				check.classID, history.Attributes, err)
+		}
+		current := getCurrentXGSPerformance(t, after, check.classID, testANIEntity,
+			check.mask, uint16(0x790+index))
+		if current.Attributes[check.name] != check.currentWant {
+			t.Fatalf("restored XGS-PON current class %v = %#v, want %v",
+				check.classID, current.Attributes[check.name], check.currentWant)
+		}
+	}
+}
+
+func TestRuntimeStateRejectsXGSPONCounterResetWithoutPartialRestore(t *testing.T) {
+	baseline := performance.XGSPONCounters{
+		TC: performance.XGSPONTCCounters{XGEMKeyErrors: 100},
+	}
+	before, store, controller := newXGSPerformanceEngine(t, baseline)
+	state, err := before.ExportRuntimeState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller.xgsCounters.TC.XGEMKeyErrors = 99
+	after := NewForMode(store, controller, nil, pon.XGSPON)
+	var alarm [28]byte
+	alarm[0] = 0x80
+	sentinel := mib.Key{ClassID: me.AniGClassID, EntityID: testANIEntity}
+	after.alarms[sentinel] = alarm
+	err = after.RestoreRuntimeState(state)
+	if err == nil || !strings.Contains(err.Error(), "reset below") {
+		t.Fatalf("RestoreRuntimeState(XGS-PON counter reset) error = %v", err)
+	}
+	if len(after.alarms) != 1 || after.alarms[sentinel] != alarm || len(after.xgsPMState) != 0 {
+		t.Fatalf("failed XGS-PON restore partially changed engine: alarms=%#v PM=%#v",
+			after.alarms, after.xgsPMState)
+	}
+}
+
 func TestRuntimeStateRejectsDifferentMIB(t *testing.T) {
 	before, store := newNotificationEngine(t)
 	state, err := before.ExportRuntimeState()
@@ -280,5 +387,18 @@ func TestRuntimeStateRejectsDifferentMIB(t *testing.T) {
 	if err == nil || (!strings.Contains(err.Error(), "data sync") &&
 		!strings.Contains(err.Error(), "fingerprint")) {
 		t.Fatalf("RestoreRuntimeState(different MIB) error = %v", err)
+	}
+}
+
+func TestRuntimeStateRejectsDifferentPONMode(t *testing.T) {
+	before, store := newNotificationEngine(t)
+	state, err := before.ExportRuntimeState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	after := NewForMode(store, nil, nil, pon.XGSPON)
+	err = after.RestoreRuntimeState(state)
+	if err == nil || !strings.Contains(err.Error(), "PON mode") {
+		t.Fatalf("RestoreRuntimeState(cross-mode) error = %v", err)
 	}
 }

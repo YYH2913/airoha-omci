@@ -14,6 +14,7 @@ const StateVersion = 1
 
 type State struct {
 	Version     uint8           `json:"version"`
+	StateDomain string          `json:"state_domain,omitempty"`
 	MIBDataSync uint8           `json:"mib_data_sync"`
 	Instances   []StateInstance `json:"instances"`
 }
@@ -34,9 +35,15 @@ type StateAttribute struct {
 	NumRows  int      `json:"num_rows,omitempty"`
 }
 
-func ExportState(snapshot []Instance, dataSync uint8) (State, error) {
+func ExportState(snapshot []Instance, dataSync uint8, stateDomain ...string) (State, error) {
+	if len(stateDomain) > 1 {
+		return State{}, fmt.Errorf("MIB state has multiple compatibility domains")
+	}
 	state := State{Version: StateVersion, MIBDataSync: dataSync,
 		Instances: make([]StateInstance, 0, len(snapshot))}
+	if len(stateDomain) == 1 {
+		state.StateDomain = stateDomain[0]
+	}
 	for _, instance := range snapshot {
 		encoded := StateInstance{
 			ClassID: instance.ClassID, EntityID: instance.EntityID, Origin: instance.Origin,
@@ -87,6 +94,10 @@ func (s State) Validate() error {
 }
 
 func NewFromState(factory []Instance, state State, options Options) (*Store, error) {
+	if state.StateDomain != options.StateDomain {
+		return nil, fmt.Errorf("MIB state domain %q does not match configured domain %q",
+			state.StateDomain, options.StateDomain)
+	}
 	store, err := NewWithOptions(factory, options)
 	if err != nil {
 		return nil, err
@@ -173,7 +184,14 @@ func NewFromState(factory []Instance, state State, options Options) (*Store, err
 // from a persisted MIB document. Service MEs in that document may be stale and
 // are deliberately ignored; current identity and capability values come from
 // the supplied factory MIB.
-func RestoreONU3Factory(factory []Instance, state State) ([]Instance, error) {
+func RestoreONU3Factory(factory []Instance, state State, stateDomain ...string) ([]Instance, error) {
+	if len(stateDomain) > 1 {
+		return nil, fmt.Errorf("ONU3 restore has multiple compatibility domains")
+	}
+	if len(stateDomain) == 1 && state.StateDomain != stateDomain[0] {
+		return nil, fmt.Errorf("MIB state domain %q does not match configured domain %q",
+			state.StateDomain, stateDomain[0])
+	}
 	if err := state.Validate(); err != nil {
 		return nil, err
 	}

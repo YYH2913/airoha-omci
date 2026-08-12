@@ -42,13 +42,29 @@ type performanceThresholdRule struct {
 func isPerformanceClass(classID me.ClassID) bool {
 	return classID == me.GemPortNetworkCtpPerformanceMonitoringHistoryDataClassID ||
 		classID == me.FecPerformanceMonitoringHistoryDataClassID ||
-		isEthernetPerformanceClass(classID)
+		isEthernetPerformanceClass(classID) || isXGSPONPerformanceClass(classID)
 }
 
 func performanceThresholdRules(classID me.ClassID) []performanceThresholdRule {
 	switch classID {
 	case me.GemPortNetworkCtpPerformanceMonitoringHistoryDataClassID:
 		// XG2010G does not expose a GEM encryption-error counter or TCA.
+		return nil
+	case me.XgPonTcPerformanceMonitoringHistoryDataClassID:
+		return []performanceThresholdRule{
+			{counter: me.XgPonTcPerformanceMonitoringHistoryData_PsbdHecErrorCount, threshold: 1, alarm: 1},
+			{counter: me.XgPonTcPerformanceMonitoringHistoryData_XgtcHecErrorCount, threshold: 2, alarm: 2},
+			{counter: me.XgPonTcPerformanceMonitoringHistoryData_UnknownProfileCount, threshold: 3, alarm: 3},
+			{counter: me.XgPonTcPerformanceMonitoringHistoryData_XgemHecLostWordsCount, threshold: 4, alarm: 4},
+			{counter: me.XgPonTcPerformanceMonitoringHistoryData_XgemKeyErrors, threshold: 5, alarm: 5},
+			{counter: me.XgPonTcPerformanceMonitoringHistoryData_XgemHecErrorCount, threshold: 6, alarm: 6},
+		}
+	case me.XgPonDownstreamManagementPerformanceMonitoringHistoryDataClassID:
+		return []performanceThresholdRule{
+			{counter: me.XgPonDownstreamManagementPerformanceMonitoringHistoryData_PloamMessageIntegrityCheckMicErrorCount, threshold: 1, alarm: 1},
+			{counter: me.XgPonDownstreamManagementPerformanceMonitoringHistoryData_OmciMicErrorCount, threshold: 2, alarm: 2},
+		}
+	case me.XgPonUpstreamManagementPerformanceMonitoringHistoryDataClassID:
 		return nil
 	case me.FecPerformanceMonitoringHistoryDataClassID:
 		return []performanceThresholdRule{

@@ -30,10 +30,16 @@ type fecPerformanceState struct {
 	baseline    performance.FECCounters
 }
 
+type xgsPerformanceState struct {
+	aniEntityID uint16
+	baseline    performance.XGSPONCounters
+}
+
 type performanceSynchronization struct {
 	gem      map[mib.Key]performance.GEMPortCounters
 	fec      map[mib.Key]performance.FECCounters
 	ethernet map[mib.Key]performance.EthernetCounters
+	xgs      map[mib.Key]performance.XGSPONCounters
 }
 
 func isEthernetPerformanceClass(classID me.ClassID) bool {
@@ -46,6 +52,37 @@ func isEthernetPerformanceClass(classID me.ClassID) bool {
 	default:
 		return false
 	}
+}
+
+func isXGSPONPerformanceClass(classID me.ClassID) bool {
+	switch classID {
+	case me.XgPonTcPerformanceMonitoringHistoryDataClassID,
+		me.XgPonDownstreamManagementPerformanceMonitoringHistoryDataClassID,
+		me.XgPonUpstreamManagementPerformanceMonitoringHistoryDataClassID:
+		return true
+	default:
+		return false
+	}
+}
+
+func (e *Engine) prepareXGSPerformanceCreateLocked(classID me.ClassID,
+	entityID uint16) (*xgsPerformanceState, error) {
+	key := mib.Key{ClassID: classID, EntityID: entityID}
+	if e.mib.Exists(key) {
+		return nil, nil
+	}
+	if e.xgsPerformance == nil {
+		return nil, &mib.ResultError{Result: me.NotSupported}
+	}
+	if !e.mib.Exists(mib.Key{ClassID: me.AniGClassID, EntityID: entityID}) {
+		return nil, &mib.ResultError{Result: me.ParameterError,
+			Cause: fmt.Errorf("XGS-PON PM references missing ANI-G %#x", entityID)}
+	}
+	baseline, err := e.xgsPerformance.XGSPONCounters(entityID)
+	if err != nil {
+		return nil, &mib.ResultError{Result: me.ProcessingError, Cause: err}
+	}
+	return &xgsPerformanceState{aniEntityID: entityID, baseline: baseline}, nil
 }
 
 func (e *Engine) resolveEthernetPerformanceUNILocked(key mib.Key) (uint16, error) {
@@ -175,6 +212,8 @@ func (e *Engine) SetPerformanceController(controller performance.Controller) {
 	e.fecPMState = make(map[mib.Key]fecPerformanceState)
 	e.ethernetPerformance, _ = controller.(performance.EthernetController)
 	e.ethernetPMState = make(map[mib.Key]ethernetPerformanceState)
+	e.xgsPerformance, _ = controller.(performance.XGSPONController)
+	e.xgsPMState = make(map[mib.Key]xgsPerformanceState)
 	e.clearAllPerformanceTCAsLocked()
 	e.performanceNext = time.Time{}
 	e.performanceIntervalEnd = 0
@@ -200,7 +239,8 @@ type performanceThresholdEvaluation struct {
 
 func (e *Engine) pollPerformanceLocked(now time.Time,
 	device omci.DeviceIdent) ([][]byte, error) {
-	if e.performance == nil && e.fecPerformance == nil && e.ethernetPerformance == nil {
+	if e.performance == nil && e.fecPerformance == nil && e.ethernetPerformance == nil &&
+		e.xgsPerformance == nil {
 		return nil, nil
 	}
 	if err := e.reconcilePerformanceLocked(); err != nil {
@@ -217,10 +257,10 @@ func (e *Engine) pollPerformanceLocked(now time.Time,
 	}
 	intervalEnd := e.performanceIntervalEnd + uint8(intervals)
 	updates := make(map[mib.Key]me.AttributeValueMap,
-		len(e.performanceState)+len(e.fecPMState)+len(e.ethernetPMState))
+		len(e.performanceState)+len(e.fecPMState)+len(e.ethernetPMState)+len(e.xgsPMState))
 	baselines := make(map[mib.Key]performance.GEMPortCounters, len(e.performanceState))
 	evaluations := make(map[mib.Key]performanceThresholdEvaluation,
-		len(e.performanceState)+len(e.fecPMState)+len(e.ethernetPMState))
+		len(e.performanceState)+len(e.fecPMState)+len(e.ethernetPMState)+len(e.xgsPMState))
 	for key, state := range e.performanceState {
 		rules, err := e.performanceThresholdsLocked(key)
 		if err != nil {
@@ -304,6 +344,35 @@ func (e *Engine) pollPerformanceLocked(now time.Time,
 			evaluations[key] = performanceThresholdEvaluation{attributes: attributes, rules: rules}
 		}
 	}
+	xgsBaselines := make(map[mib.Key]performance.XGSPONCounters, len(e.xgsPMState))
+	for key, state := range e.xgsPMState {
+		rules, err := e.performanceThresholdsLocked(key)
+		if err != nil {
+			return nil, fmt.Errorf("resolve XGS-PON performance thresholds for %v/%#x: %w",
+				key.ClassID, key.EntityID, err)
+		}
+		if intervals == 0 && len(rules) == 0 {
+			continue
+		}
+		current, err := e.xgsPerformance.XGSPONCounters(state.aniEntityID)
+		if err != nil {
+			return nil, fmt.Errorf("read ANI-G %#x XGS-PON performance counters: %w",
+				state.aniEntityID, err)
+		}
+		attributes := xgsPerformanceAttributes(key.ClassID, intervalEnd,
+			performance.XGSPONCounters{})
+		if intervals <= 1 {
+			attributes = xgsPerformanceAttributes(key.ClassID, intervalEnd,
+				deltaXGSPONCounters(state.baseline, current))
+		}
+		if intervals != 0 {
+			updates[key] = attributes
+			xgsBaselines[key] = current
+		}
+		if intervals <= 1 && len(rules) != 0 {
+			evaluations[key] = performanceThresholdEvaluation{attributes: attributes, rules: rules}
+		}
+	}
 	if intervals != 0 {
 		if err := e.mib.UpdateAutonomousBatch(updates); err != nil {
 			return nil, fmt.Errorf("update performance history: %w", err)
@@ -322,6 +391,11 @@ func (e *Engine) pollPerformanceLocked(now time.Time,
 			state := e.ethernetPMState[key]
 			state.baseline = baseline
 			e.ethernetPMState[key] = state
+		}
+		for key, baseline := range xgsBaselines {
+			state := e.xgsPMState[key]
+			state.baseline = baseline
+			e.xgsPMState[key] = state
 		}
 		e.performanceIntervalEnd = intervalEnd
 		e.performanceNext = e.performanceNext.Add(time.Duration(intervals) * performanceInterval)
@@ -447,6 +521,32 @@ func (e *Engine) reconcilePerformanceLocked() error {
 			delete(e.ethernetPMState, key)
 		}
 	}
+
+	activeXGS := make(map[mib.Key]struct{})
+	for _, instance := range e.mib.Snapshot() {
+		if !isXGSPONPerformanceClass(instance.ClassID) || e.xgsPerformance == nil {
+			continue
+		}
+		key := instance.Key
+		activeXGS[key] = struct{}{}
+		if !e.mib.Exists(mib.Key{ClassID: me.AniGClassID, EntityID: key.EntityID}) {
+			return fmt.Errorf("XGS-PON PM references missing ANI-G %#x", key.EntityID)
+		}
+		if _, present := e.xgsPMState[key]; present {
+			continue
+		}
+		baseline, err := e.xgsPerformance.XGSPONCounters(key.EntityID)
+		if err != nil {
+			return fmt.Errorf("initialize ANI-G %#x XGS-PON performance counters: %w",
+				key.EntityID, err)
+		}
+		e.xgsPMState[key] = xgsPerformanceState{aniEntityID: key.EntityID, baseline: baseline}
+	}
+	for key := range e.xgsPMState {
+		if _, present := activeXGS[key]; !present {
+			delete(e.xgsPMState, key)
+		}
+	}
 	return nil
 }
 
@@ -454,9 +554,11 @@ func (e *Engine) getCurrentPerformanceLocked(key mib.Key, mask uint16) (mib.Inst
 	gemPerformance := key.ClassID == me.GemPortNetworkCtpPerformanceMonitoringHistoryDataClassID
 	fecPerformance := key.ClassID == me.FecPerformanceMonitoringHistoryDataClassID
 	ethernetPerformance := isEthernetPerformanceClass(key.ClassID)
+	xgsPerformance := isXGSPONPerformanceClass(key.ClassID)
 	if (!gemPerformance || e.performance == nil) &&
 		(!fecPerformance || e.fecPerformance == nil) &&
-		(!ethernetPerformance || e.ethernetPerformance == nil) {
+		(!ethernetPerformance || e.ethernetPerformance == nil) &&
+		(!xgsPerformance || e.xgsPerformance == nil) {
 		return mib.Instance{}, &mib.ResultError{Result: me.NotSupported}
 	}
 	if currentDataSize(key.ClassID, mask) > 25 {
@@ -492,7 +594,7 @@ func (e *Engine) getCurrentPerformanceLocked(key mib.Key, mask uint16) (mib.Inst
 		}
 		values = fecPerformanceAttributes(e.performanceIntervalEnd,
 			deltaFECCounters(state.baseline, current))
-	} else {
+	} else if ethernetPerformance {
 		state, present := e.ethernetPMState[key]
 		if !present {
 			return mib.Instance{}, &mib.ResultError{Result: me.UnknownInstance}
@@ -503,6 +605,17 @@ func (e *Engine) getCurrentPerformanceLocked(key mib.Key, mask uint16) (mib.Inst
 		}
 		values = ethernetPerformanceAttributes(key.ClassID, e.performanceIntervalEnd,
 			deltaEthernetCounters(state.baseline, current))
+	} else {
+		state, present := e.xgsPMState[key]
+		if !present {
+			return mib.Instance{}, &mib.ResultError{Result: me.UnknownInstance}
+		}
+		current, err := e.xgsPerformance.XGSPONCounters(state.aniEntityID)
+		if err != nil {
+			return mib.Instance{}, &mib.ResultError{Result: me.ProcessingError, Cause: err}
+		}
+		values = xgsPerformanceAttributes(key.ClassID, e.performanceIntervalEnd,
+			deltaXGSPONCounters(state.baseline, current))
 	}
 	for name := range instance.Attributes {
 		if value, dynamic := values[name]; dynamic {
@@ -513,7 +626,8 @@ func (e *Engine) getCurrentPerformanceLocked(key mib.Key, mask uint16) (mib.Inst
 }
 
 func (e *Engine) preparePerformanceSynchronizationLocked() (performanceSynchronization, error) {
-	if e.performance == nil && e.fecPerformance == nil && e.ethernetPerformance == nil {
+	if e.performance == nil && e.fecPerformance == nil && e.ethernetPerformance == nil &&
+		e.xgsPerformance == nil {
 		return performanceSynchronization{}, nil
 	}
 	if err := e.reconcilePerformanceLocked(); err != nil {
@@ -523,6 +637,7 @@ func (e *Engine) preparePerformanceSynchronizationLocked() (performanceSynchroni
 		gem:      make(map[mib.Key]performance.GEMPortCounters, len(e.performanceState)),
 		fec:      make(map[mib.Key]performance.FECCounters, len(e.fecPMState)),
 		ethernet: make(map[mib.Key]performance.EthernetCounters, len(e.ethernetPMState)),
+		xgs:      make(map[mib.Key]performance.XGSPONCounters, len(e.xgsPMState)),
 	}
 	for key, state := range e.performanceState {
 		current, err := e.performance.GEMPortCounters(state.portID)
@@ -550,13 +665,22 @@ func (e *Engine) preparePerformanceSynchronizationLocked() (performanceSynchroni
 		}
 		baselines.ethernet[key] = current
 	}
+	for key, state := range e.xgsPMState {
+		current, err := e.xgsPerformance.XGSPONCounters(state.aniEntityID)
+		if err != nil {
+			return performanceSynchronization{}, fmt.Errorf(
+				"synchronize ANI-G %#x XGS-PON performance counters: %w",
+				state.aniEntityID, err)
+		}
+		baselines.xgs[key] = current
+	}
 	return baselines, nil
 }
 
 func (e *Engine) commitPerformanceSynchronizationLocked(now time.Time,
 	baselines performanceSynchronization) error {
 	updates := make(map[mib.Key]me.AttributeValueMap,
-		len(baselines.gem)+len(baselines.fec)+len(baselines.ethernet))
+		len(baselines.gem)+len(baselines.fec)+len(baselines.ethernet)+len(baselines.xgs))
 	for key := range baselines.gem {
 		updates[key] = zeroGEMPerformanceAttributes(0)
 	}
@@ -566,6 +690,9 @@ func (e *Engine) commitPerformanceSynchronizationLocked(now time.Time,
 	for key := range baselines.ethernet {
 		updates[key] = ethernetPerformanceAttributes(key.ClassID, 0,
 			performance.EthernetCounters{})
+	}
+	for key := range baselines.xgs {
+		updates[key] = xgsPerformanceAttributes(key.ClassID, 0, performance.XGSPONCounters{})
 	}
 	if err := e.mib.UpdateAutonomousBatch(updates); err != nil {
 		return err
@@ -584,6 +711,11 @@ func (e *Engine) commitPerformanceSynchronizationLocked(now time.Time,
 		state := e.ethernetPMState[key]
 		state.baseline = baseline
 		e.ethernetPMState[key] = state
+	}
+	for key, baseline := range baselines.xgs {
+		state := e.xgsPMState[key]
+		state.baseline = baseline
+		e.xgsPMState[key] = state
 	}
 	e.performanceIntervalEnd = 0
 	e.performanceNext = now.Add(performanceInterval)
@@ -627,6 +759,62 @@ func fecPerformanceAttributes(intervalEnd uint8,
 		me.FecPerformanceMonitoringHistoryData_UncorrectableCodeWords: saturatingUint32(counters.UncorrectableCodeWords),
 		me.FecPerformanceMonitoringHistoryData_TotalCodeWords:         saturatingUint32(counters.TotalCodeWords),
 		me.FecPerformanceMonitoringHistoryData_FecSeconds:             saturatingUint16(counters.FECSeconds),
+	}
+}
+
+func xgsPerformanceAttributes(classID me.ClassID, intervalEnd uint8,
+	counters performance.XGSPONCounters) me.AttributeValueMap {
+	switch classID {
+	case me.XgPonTcPerformanceMonitoringHistoryDataClassID:
+		value := counters.TC
+		return me.AttributeValueMap{
+			me.XgPonTcPerformanceMonitoringHistoryData_IntervalEndTime:                               intervalEnd,
+			me.XgPonTcPerformanceMonitoringHistoryData_PsbdHecErrorCount:                             saturatingUint32(value.PSBdHECErrors),
+			me.XgPonTcPerformanceMonitoringHistoryData_XgtcHecErrorCount:                             saturatingUint32(value.XGTCHECErrors),
+			me.XgPonTcPerformanceMonitoringHistoryData_UnknownProfileCount:                           saturatingUint32(value.UnknownProfiles),
+			me.XgPonTcPerformanceMonitoringHistoryData_TransmittedXgPonEncapsulationMethodXgemFrames: saturatingUint32(value.TransmittedXGEMFrames),
+			me.XgPonTcPerformanceMonitoringHistoryData_FragmentXgemFrames:                            saturatingUint32(value.FragmentXGEMFrames),
+			me.XgPonTcPerformanceMonitoringHistoryData_XgemHecLostWordsCount:                         saturatingUint32(value.XGEMHECLostWords),
+			me.XgPonTcPerformanceMonitoringHistoryData_XgemKeyErrors:                                 saturatingUint32(value.XGEMKeyErrors),
+			me.XgPonTcPerformanceMonitoringHistoryData_XgemHecErrorCount:                             saturatingUint32(value.XGEMHECErrors),
+			me.XgPonTcPerformanceMonitoringHistoryData_TransmittedBytesInNonIdleXgemFrames:           value.TransmittedNonIdleBytes,
+			me.XgPonTcPerformanceMonitoringHistoryData_ReceivedBytesInNonIdleXgemFrames:              value.ReceivedNonIdleBytes,
+			me.XgPonTcPerformanceMonitoringHistoryData_LossOfDownstreamSynchronizationLodsEventCount: saturatingUint32(value.LODSEvents),
+			me.XgPonTcPerformanceMonitoringHistoryData_LodsEventRestoredCount:                        saturatingUint32(value.LODSRestored),
+			me.XgPonTcPerformanceMonitoringHistoryData_OnuReactivationByLodsEvents:                   saturatingUint32(value.ONUReactivationsByLODS),
+		}
+	case me.XgPonDownstreamManagementPerformanceMonitoringHistoryDataClassID:
+		value := counters.Downstream
+		return me.AttributeValueMap{
+			me.XgPonDownstreamManagementPerformanceMonitoringHistoryData_IntervalEndTime:                         intervalEnd,
+			me.XgPonDownstreamManagementPerformanceMonitoringHistoryData_PloamMessageIntegrityCheckMicErrorCount: saturatingUint32(value.PLOAMMICErrors),
+			me.XgPonDownstreamManagementPerformanceMonitoringHistoryData_DownstreamPloamMessagesCount:            saturatingUint32(value.PLOAMMessages),
+			me.XgPonDownstreamManagementPerformanceMonitoringHistoryData_ProfileMessagesReceived:                 saturatingUint32(value.ProfileMessages),
+			me.XgPonDownstreamManagementPerformanceMonitoringHistoryData_RangingTimeMessagesReceived:             saturatingUint32(value.RangingTimeMessages),
+			me.XgPonDownstreamManagementPerformanceMonitoringHistoryData_DeactivateOnuIdMessagesReceived:         saturatingUint32(value.DeactivateONUIDMessages),
+			me.XgPonDownstreamManagementPerformanceMonitoringHistoryData_DisableSerialNumberMessagesReceived:     saturatingUint32(value.DisableSerialNumberMessages),
+			me.XgPonDownstreamManagementPerformanceMonitoringHistoryData_RequestRegistrationMessagesReceived:     saturatingUint32(value.RequestRegistrationMessages),
+			me.XgPonDownstreamManagementPerformanceMonitoringHistoryData_AssignAllocIdMessagesReceived:           saturatingUint32(value.AssignAllocIDMessages),
+			me.XgPonDownstreamManagementPerformanceMonitoringHistoryData_KeyControlMessagesReceived:              saturatingUint32(value.KeyControlMessages),
+			me.XgPonDownstreamManagementPerformanceMonitoringHistoryData_SleepAllowMessagesReceived:              saturatingUint32(value.SleepAllowMessages),
+			me.XgPonDownstreamManagementPerformanceMonitoringHistoryData_BaselineOmciMessagesReceivedCount:       saturatingUint32(value.BaselineOMCIMessages),
+			me.XgPonDownstreamManagementPerformanceMonitoringHistoryData_ExtendedOmciMessagesReceivedCount:       saturatingUint32(value.ExtendedOMCIMessages),
+			me.XgPonDownstreamManagementPerformanceMonitoringHistoryData_AssignOnuIdMessagesReceived:             saturatingUint32(value.AssignONUIDMessages),
+			me.XgPonDownstreamManagementPerformanceMonitoringHistoryData_OmciMicErrorCount:                       saturatingUint32(value.OMCIMICErrors),
+		}
+	case me.XgPonUpstreamManagementPerformanceMonitoringHistoryDataClassID:
+		value := counters.Upstream
+		return me.AttributeValueMap{
+			me.XgPonUpstreamManagementPerformanceMonitoringHistoryData_IntervalEndTime:             intervalEnd,
+			me.XgPonUpstreamManagementPerformanceMonitoringHistoryData_UpstreamPloamMessageCount:   saturatingUint32(value.PLOAMMessages),
+			me.XgPonUpstreamManagementPerformanceMonitoringHistoryData_SerialNumberOnuMessageCount: saturatingUint32(value.SerialNumberMessages),
+			me.XgPonUpstreamManagementPerformanceMonitoringHistoryData_RegistrationMessageCount:    saturatingUint32(value.RegistrationMessages),
+			me.XgPonUpstreamManagementPerformanceMonitoringHistoryData_KeyReportMessageCount:       saturatingUint32(value.KeyReportMessages),
+			me.XgPonUpstreamManagementPerformanceMonitoringHistoryData_AcknowledgeMessageCount:     saturatingUint32(value.AcknowledgeMessages),
+			me.XgPonUpstreamManagementPerformanceMonitoringHistoryData_SleepRequestMessageCount:    saturatingUint32(value.SleepRequestMessages),
+		}
+	default:
+		return nil
 	}
 }
 
@@ -770,6 +958,50 @@ func deltaEthernetDirection(start, current performance.EthernetDirectionCounters
 		delta.SizeBuckets[index] = counterDelta(start.SizeBuckets[index], current.SizeBuckets[index])
 	}
 	return delta
+}
+
+func deltaXGSPONCounters(start, current performance.XGSPONCounters) performance.XGSPONCounters {
+	return performance.XGSPONCounters{
+		TC: performance.XGSPONTCCounters{
+			PSBdHECErrors:           counterDelta(start.TC.PSBdHECErrors, current.TC.PSBdHECErrors),
+			XGTCHECErrors:           counterDelta(start.TC.XGTCHECErrors, current.TC.XGTCHECErrors),
+			UnknownProfiles:         counterDelta(start.TC.UnknownProfiles, current.TC.UnknownProfiles),
+			TransmittedXGEMFrames:   counterDelta(start.TC.TransmittedXGEMFrames, current.TC.TransmittedXGEMFrames),
+			FragmentXGEMFrames:      counterDelta(start.TC.FragmentXGEMFrames, current.TC.FragmentXGEMFrames),
+			XGEMHECLostWords:        counterDelta(start.TC.XGEMHECLostWords, current.TC.XGEMHECLostWords),
+			XGEMKeyErrors:           counterDelta(start.TC.XGEMKeyErrors, current.TC.XGEMKeyErrors),
+			XGEMHECErrors:           counterDelta(start.TC.XGEMHECErrors, current.TC.XGEMHECErrors),
+			TransmittedNonIdleBytes: counterDelta(start.TC.TransmittedNonIdleBytes, current.TC.TransmittedNonIdleBytes),
+			ReceivedNonIdleBytes:    counterDelta(start.TC.ReceivedNonIdleBytes, current.TC.ReceivedNonIdleBytes),
+			LODSEvents:              counterDelta(start.TC.LODSEvents, current.TC.LODSEvents),
+			LODSRestored:            counterDelta(start.TC.LODSRestored, current.TC.LODSRestored),
+			ONUReactivationsByLODS:  counterDelta(start.TC.ONUReactivationsByLODS, current.TC.ONUReactivationsByLODS),
+		},
+		Downstream: performance.XGSPONDownstreamManagementCounters{
+			PLOAMMICErrors:              counterDelta(start.Downstream.PLOAMMICErrors, current.Downstream.PLOAMMICErrors),
+			PLOAMMessages:               counterDelta(start.Downstream.PLOAMMessages, current.Downstream.PLOAMMessages),
+			ProfileMessages:             counterDelta(start.Downstream.ProfileMessages, current.Downstream.ProfileMessages),
+			RangingTimeMessages:         counterDelta(start.Downstream.RangingTimeMessages, current.Downstream.RangingTimeMessages),
+			DeactivateONUIDMessages:     counterDelta(start.Downstream.DeactivateONUIDMessages, current.Downstream.DeactivateONUIDMessages),
+			DisableSerialNumberMessages: counterDelta(start.Downstream.DisableSerialNumberMessages, current.Downstream.DisableSerialNumberMessages),
+			RequestRegistrationMessages: counterDelta(start.Downstream.RequestRegistrationMessages, current.Downstream.RequestRegistrationMessages),
+			AssignAllocIDMessages:       counterDelta(start.Downstream.AssignAllocIDMessages, current.Downstream.AssignAllocIDMessages),
+			KeyControlMessages:          counterDelta(start.Downstream.KeyControlMessages, current.Downstream.KeyControlMessages),
+			SleepAllowMessages:          counterDelta(start.Downstream.SleepAllowMessages, current.Downstream.SleepAllowMessages),
+			BaselineOMCIMessages:        counterDelta(start.Downstream.BaselineOMCIMessages, current.Downstream.BaselineOMCIMessages),
+			ExtendedOMCIMessages:        counterDelta(start.Downstream.ExtendedOMCIMessages, current.Downstream.ExtendedOMCIMessages),
+			AssignONUIDMessages:         counterDelta(start.Downstream.AssignONUIDMessages, current.Downstream.AssignONUIDMessages),
+			OMCIMICErrors:               counterDelta(start.Downstream.OMCIMICErrors, current.Downstream.OMCIMICErrors),
+		},
+		Upstream: performance.XGSPONUpstreamManagementCounters{
+			PLOAMMessages:        counterDelta(start.Upstream.PLOAMMessages, current.Upstream.PLOAMMessages),
+			SerialNumberMessages: counterDelta(start.Upstream.SerialNumberMessages, current.Upstream.SerialNumberMessages),
+			RegistrationMessages: counterDelta(start.Upstream.RegistrationMessages, current.Upstream.RegistrationMessages),
+			KeyReportMessages:    counterDelta(start.Upstream.KeyReportMessages, current.Upstream.KeyReportMessages),
+			AcknowledgeMessages:  counterDelta(start.Upstream.AcknowledgeMessages, current.Upstream.AcknowledgeMessages),
+			SleepRequestMessages: counterDelta(start.Upstream.SleepRequestMessages, current.Upstream.SleepRequestMessages),
+		},
+	}
 }
 
 func counterDelta(start, current uint64) uint64 {

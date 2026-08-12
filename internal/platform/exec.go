@@ -18,13 +18,14 @@ import (
 
 const defaultApplyTimeout = 10 * time.Second
 
-const ApplyABIVersion = 6
+const ApplyABIVersion = 7
 
 // ApplyRequest is the versioned boundary between the G.988 engine and a
 // privileged platform helper. The helper consumes resolved connectivity, not
 // raw managed-entity attributes.
 type ApplyRequest struct {
 	Version     uint8         `json:"version"`
+	StateDomain string        `json:"state_domain"`
 	Operation   mib.Operation `json:"operation"`
 	MIBDataSync uint8         `json:"mib_data_sync"`
 	MIBState    *mib.State    `json:"mib_state"`
@@ -51,6 +52,9 @@ func DecodeApplyRequest(reader io.Reader) (ApplyRequest, error) {
 	if request.Version != ApplyABIVersion {
 		return ApplyRequest{}, fmt.Errorf("unsupported platform ABI %d", request.Version)
 	}
+	if request.StateDomain == "" {
+		return ApplyRequest{}, fmt.Errorf("platform request has no state domain")
+	}
 	switch request.Operation {
 	case mib.OperationCreate, mib.OperationSet, mib.OperationSetTable,
 		mib.OperationDelete, mib.OperationReset, mib.OperationCommand,
@@ -60,6 +64,10 @@ func DecodeApplyRequest(reader io.Reader) (ApplyRequest, error) {
 	}
 	if request.MIBState == nil {
 		return ApplyRequest{}, fmt.Errorf("platform request has no MIB state")
+	}
+	if request.MIBState.StateDomain != request.StateDomain {
+		return ApplyRequest{}, fmt.Errorf("platform state domain %q does not match MIB state %q",
+			request.StateDomain, request.MIBState.StateDomain)
 	}
 	if err := request.MIBState.Validate(); err != nil {
 		return ApplyRequest{}, fmt.Errorf("invalid platform MIB state: %w", err)
@@ -101,7 +109,10 @@ func (a ExecApplier) Apply(change mib.Change) error {
 	if err := multicast.Validate(policy); err != nil {
 		return err
 	}
-	mibState, err := mib.ExportState(change.Snapshot, change.MIBDataSync)
+	if change.StateDomain == "" {
+		return fmt.Errorf("platform change has no state domain")
+	}
+	mibState, err := mib.ExportState(change.Snapshot, change.MIBDataSync, change.StateDomain)
 	if err != nil {
 		return err
 	}
@@ -111,6 +122,7 @@ func (a ExecApplier) Apply(change mib.Change) error {
 	}
 	payload, err := json.Marshal(ApplyRequest{
 		Version:     ApplyABIVersion,
+		StateDomain: change.StateDomain,
 		Operation:   change.Operation,
 		MIBDataSync: change.MIBDataSync,
 		MIBState:    &mibState,

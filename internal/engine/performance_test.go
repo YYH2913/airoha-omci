@@ -14,6 +14,7 @@ import (
 	"github.com/xg2010g/airoha-omci/internal/model"
 	"github.com/xg2010g/airoha-omci/internal/optical"
 	"github.com/xg2010g/airoha-omci/internal/performance"
+	"github.com/xg2010g/airoha-omci/internal/pon"
 )
 
 const (
@@ -31,6 +32,8 @@ type recordingPerformanceController struct {
 	fecCalls         int
 	ethernetCalls    int
 	synced           time.Time
+	xgsCounters      performance.XGSPONCounters
+	xgsCalls         int
 }
 
 func (c *recordingPerformanceController) SynchronizeTime(value time.Time) error {
@@ -66,6 +69,162 @@ func (c *recordingPerformanceController) FECCounters(entityID uint16) (performan
 		return performance.FECCounters{}, errors.New("unexpected ANI-G")
 	}
 	return c.fecCounters, c.err
+}
+
+func (c *recordingPerformanceController) XGSPONCounters(entityID uint16) (performance.XGSPONCounters, error) {
+	c.xgsCalls++
+	if entityID != testANIEntity {
+		return performance.XGSPONCounters{}, errors.New("unexpected XGS-PON ANI-G")
+	}
+	return c.xgsCounters, c.err
+}
+
+func TestXGSPONPerformanceClassesRequireDedicatedBackend(t *testing.T) {
+	factory, err := model.XG2010G(model.Identity{
+		SerialNumber: "TEST01020304", PONMode: pon.XGSPON,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	masks, err := model.XG2010GSupportedAttributeMasks(pon.XGSPON, factory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := mib.NewWithOptions(factory, mib.Options{
+		SupportedClasses:        model.XG2010GSupportedClasses(pon.XGSPON),
+		SupportedAttributeMasks: masks,
+		ValidateInstance:        model.XG2010GInstanceValidator(pon.XGSPON),
+		AttributeCapabilities:   model.XG2010GAttributeCapabilities(pon.XGSPON),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	protocol := NewForMode(store, nil, nil, pon.XGSPON)
+	classes := []me.ClassID{
+		me.XgPonTcPerformanceMonitoringHistoryDataClassID,
+		me.XgPonDownstreamManagementPerformanceMonitoringHistoryDataClassID,
+		me.XgPonUpstreamManagementPerformanceMonitoringHistoryDataClassID,
+	}
+	for index, classID := range classes {
+		request := encodeRequest(t, uint16(0x6a0+index), omci.CreateRequestType, &omci.CreateRequest{
+			MeBasePacket: omci.MeBasePacket{EntityClass: classID, EntityInstance: testANIEntity},
+			Attributes: me.AttributeValueMap{
+				me.XgPonTcPerformanceMonitoringHistoryData_ThresholdData12Id: uint16(0),
+			},
+		})
+		responseBytes, err := protocol.HandleFrame(DownstreamFrame{Contents: request, MICVerified: true})
+		if err != nil {
+			t.Fatalf("HandleFrame(Create class %v) error = %v", classID, err)
+		}
+		response := decodeResponse(t, responseBytes).Layer(omci.LayerTypeCreateResponse).(*omci.CreateResponse)
+		key := mib.Key{ClassID: classID, EntityID: testANIEntity}
+		if response.Result != me.NotSupported || store.Exists(key) {
+			t.Fatalf("Create class %v without XGS backend result=%v exists=%v",
+				classID, response.Result, store.Exists(key))
+		}
+	}
+}
+
+func TestXGSPONPerformanceBackendPopulatesAllThreeClasses(t *testing.T) {
+	protocol, store, controller := newXGSPerformanceEngine(t, performance.XGSPONCounters{
+		TC: performance.XGSPONTCCounters{PSBdHECErrors: 10, TransmittedNonIdleBytes: 1000},
+		Downstream: performance.XGSPONDownstreamManagementCounters{
+			PLOAMMICErrors: 20, BaselineOMCIMessages: 200,
+		},
+		Upstream: performance.XGSPONUpstreamManagementCounters{
+			RegistrationMessages: 30,
+		},
+	})
+	now := time.Date(2026, 8, 12, 8, 0, 0, 0, time.UTC)
+	protocol.now = func() time.Time { return now }
+	if controller.xgsCalls != len(xgsPerformanceClasses()) {
+		t.Fatalf("XGS-PON baseline reads = %d, want %d", controller.xgsCalls, len(xgsPerformanceClasses()))
+	}
+	if _, err := protocol.PollPerformance(omci.BaselineIdent); err != nil {
+		t.Fatal(err)
+	}
+	controller.xgsCounters.TC.PSBdHECErrors += 3
+	controller.xgsCounters.TC.TransmittedNonIdleBytes += 400
+	controller.xgsCounters.Downstream.PLOAMMICErrors += 4
+	controller.xgsCounters.Downstream.BaselineOMCIMessages += 5
+	controller.xgsCounters.Upstream.RegistrationMessages += 6
+	now = now.Add(performanceInterval)
+	if frames, err := protocol.PollPerformance(omci.BaselineIdent); err != nil || len(frames) != 0 {
+		t.Fatalf("PollPerformance(XGS-PON) frames=%d error=%v", len(frames), err)
+	}
+	checks := []struct {
+		classID me.ClassID
+		mask    uint16
+		name    string
+		want    interface{}
+	}{
+		{me.XgPonTcPerformanceMonitoringHistoryDataClassID, 0x2000,
+			me.XgPonTcPerformanceMonitoringHistoryData_PsbdHecErrorCount, uint32(3)},
+		{me.XgPonTcPerformanceMonitoringHistoryDataClassID, 0x0020,
+			me.XgPonTcPerformanceMonitoringHistoryData_TransmittedBytesInNonIdleXgemFrames, uint64(400)},
+		{me.XgPonDownstreamManagementPerformanceMonitoringHistoryDataClassID, 0x2000,
+			me.XgPonDownstreamManagementPerformanceMonitoringHistoryData_PloamMessageIntegrityCheckMicErrorCount, uint32(4)},
+		{me.XgPonUpstreamManagementPerformanceMonitoringHistoryDataClassID, 0x0800,
+			me.XgPonUpstreamManagementPerformanceMonitoringHistoryData_RegistrationMessageCount, uint32(6)},
+	}
+	for _, check := range checks {
+		instance, err := store.Get(mib.Key{ClassID: check.classID, EntityID: testANIEntity}, check.mask)
+		if err != nil || instance.Attributes[check.name] != check.want {
+			t.Fatalf("XGS-PON class %v %s = %#v, want %#v (error=%v)",
+				check.classID, check.name, instance.Attributes[check.name], check.want, err)
+		}
+	}
+}
+
+func xgsPerformanceClasses() []me.ClassID {
+	return []me.ClassID{
+		me.XgPonTcPerformanceMonitoringHistoryDataClassID,
+		me.XgPonDownstreamManagementPerformanceMonitoringHistoryDataClassID,
+		me.XgPonUpstreamManagementPerformanceMonitoringHistoryDataClassID,
+	}
+}
+
+func newXGSPerformanceEngine(t *testing.T, counters performance.XGSPONCounters) (
+	*Engine, *mib.Store, *recordingPerformanceController) {
+	t.Helper()
+	factory, err := model.XG2010G(model.Identity{
+		SerialNumber: "TEST01020304", PONMode: pon.XGSPON,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	masks, err := model.XG2010GSupportedAttributeMasks(pon.XGSPON, factory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := mib.NewWithOptions(factory, mib.Options{
+		SupportedClasses:        model.XG2010GSupportedClasses(pon.XGSPON),
+		SupportedAttributeMasks: masks,
+		ValidateInstance:        model.XG2010GInstanceValidator(pon.XGSPON),
+		AttributeCapabilities:   model.XG2010GAttributeCapabilities(pon.XGSPON),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller := &recordingPerformanceController{xgsCounters: counters}
+	protocol := NewForMode(store, controller, nil, pon.XGSPON)
+	for index, classID := range xgsPerformanceClasses() {
+		request := encodeRequest(t, uint16(0x6b0+index), omci.CreateRequestType, &omci.CreateRequest{
+			MeBasePacket: omci.MeBasePacket{EntityClass: classID, EntityInstance: testANIEntity},
+			Attributes: me.AttributeValueMap{
+				me.XgPonTcPerformanceMonitoringHistoryData_ThresholdData12Id: uint16(0),
+			},
+		})
+		responseBytes, err := protocol.HandleFrame(DownstreamFrame{Contents: request, MICVerified: true})
+		if err != nil {
+			t.Fatalf("HandleFrame(Create class %v) error = %v", classID, err)
+		}
+		response := decodeResponse(t, responseBytes).Layer(omci.LayerTypeCreateResponse).(*omci.CreateResponse)
+		if response.Result != me.Success {
+			t.Fatalf("Create class %v result = %v", classID, response.Result)
+		}
+	}
+	return protocol, store, controller
 }
 
 func TestFECPerformanceCurrentHistoryAndTCA(t *testing.T) {
@@ -897,19 +1056,19 @@ func TestSynchronizeTimeAtomicallyRestartsPerformanceIntervals(t *testing.T) {
 }
 
 func TestXG2010GGEMPerformanceLifecycleUsesAdvertisedAttributes(t *testing.T) {
-	factory, err := model.XG2010G(model.Identity{SerialNumber: "TEST01020304"})
+	factory, err := model.XG2010G(model.Identity{SerialNumber: "TEST01020304", PONMode: pon.GPON})
 	if err != nil {
 		t.Fatal(err)
 	}
-	masks, err := model.XG2010GSupportedAttributeMasks(factory)
+	masks, err := model.XG2010GSupportedAttributeMasks(pon.GPON, factory)
 	if err != nil {
 		t.Fatal(err)
 	}
 	store, err := mib.NewWithOptions(factory, mib.Options{
-		SupportedClasses:        model.XG2010GSupportedClasses(),
+		SupportedClasses:        model.XG2010GSupportedClasses(pon.GPON),
 		SupportedAttributeMasks: masks,
-		ValidateInstance:        model.XG2010GValidateInstance,
-		AttributeCapabilities:   model.XG2010GAttributeCapabilities(),
+		ValidateInstance:        model.XG2010GInstanceValidator(pon.GPON),
+		AttributeCapabilities:   model.XG2010GAttributeCapabilities(pon.GPON),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1200,6 +1359,23 @@ func getCurrentPerformance(t *testing.T, protocol *Engine, classID me.ClassID,
 	encoded, err := protocol.Handle(request)
 	if err != nil {
 		t.Fatalf("Handle(GetCurrentData %v/%#x) error = %v", classID, entityID, err)
+	}
+	return decodeResponse(t, encoded).Layer(omci.LayerTypeGetCurrentDataResponse).(*omci.GetCurrentDataResponse)
+}
+
+func getCurrentXGSPerformance(t *testing.T, protocol *Engine, classID me.ClassID,
+	entityID, mask, transactionID uint16) *omci.GetCurrentDataResponse {
+	t.Helper()
+	request := encodeRequest(t, transactionID, omci.GetCurrentDataRequestType,
+		&omci.GetCurrentDataRequest{
+			MeBasePacket: omci.MeBasePacket{
+				EntityClass: classID, EntityInstance: entityID,
+			},
+			AttributeMask: mask,
+		})
+	encoded, err := protocol.HandleFrame(DownstreamFrame{Contents: request, MICVerified: true})
+	if err != nil {
+		t.Fatalf("HandleFrame(GetCurrentData %v/%#x) error = %v", classID, entityID, err)
 	}
 	return decodeResponse(t, encoded).Layer(omci.LayerTypeGetCurrentDataResponse).(*omci.GetCurrentDataResponse)
 }

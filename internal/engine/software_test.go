@@ -15,6 +15,7 @@ import (
 	"github.com/xg2010g/airoha-omci/internal/checksum"
 	"github.com/xg2010g/airoha-omci/internal/mib"
 	"github.com/xg2010g/airoha-omci/internal/model"
+	"github.com/xg2010g/airoha-omci/internal/pon"
 	"github.com/xg2010g/airoha-omci/internal/software"
 )
 
@@ -564,7 +565,7 @@ func TestRefreshSoftwareImagesRejectsInvalidSelectedImage(t *testing.T) {
 
 func newSoftwareTestEngine(t *testing.T) (*Engine, *mib.Store, *recordingSoftwareController) {
 	t.Helper()
-	factory, err := model.XG2010G(model.Identity{SerialNumber: "TEST01020304", Version: "old"})
+	factory, err := model.XG2010G(model.Identity{SerialNumber: "TEST01020304", Version: "old", PONMode: pon.GPON})
 	if err != nil {
 		t.Fatalf("model.XG2010G() error = %v", err)
 	}
@@ -579,7 +580,7 @@ func newSoftwareTestEngine(t *testing.T) (*Engine, *mib.Store, *recordingSoftwar
 func newTransactionalSoftwareTestEngine(t *testing.T) (*Engine, *mib.Store,
 	*recordingSoftwareController, *[]mib.Change) {
 	t.Helper()
-	factory, err := model.XG2010G(model.Identity{SerialNumber: "TEST01020304", Version: "old"})
+	factory, err := model.XG2010G(model.Identity{SerialNumber: "TEST01020304", Version: "old", PONMode: pon.GPON})
 	if err != nil {
 		t.Fatalf("model.XG2010G() error = %v", err)
 	}

@@ -24,6 +24,7 @@ import (
 	"github.com/xg2010g/airoha-omci/internal/mib"
 	"github.com/xg2010g/airoha-omci/internal/model"
 	"github.com/xg2010g/airoha-omci/internal/platform"
+	"github.com/xg2010g/airoha-omci/internal/pon"
 	"github.com/xg2010g/airoha-omci/internal/software"
 	"github.com/xg2010g/airoha-omci/internal/status"
 	"github.com/xg2010g/airoha-omci/internal/transaction"
@@ -47,6 +48,7 @@ type options struct {
 	onu3StatePath    string
 	runtimeStatePath string
 	restartReason    uint
+	ponMode          string
 }
 
 func main() {
@@ -63,6 +65,7 @@ func main() {
 	flag.StringVar(&opts.onu3StatePath, "onu3-state", "", "persistent platform document used to restore ONU3-G snapshots")
 	flag.StringVar(&opts.runtimeStatePath, "runtime-state", "", "persistent alarm, ARC and performance runtime state")
 	flag.UintVar(&opts.restartReason, "restart-reason", 0, "G.988 ONU3-G latest restart reason (0..255)")
+	flag.StringVar(&opts.ponMode, "pon-mode", string(pon.GPON), "PON protocol mode: gpon or xgspon")
 	flag.Parse()
 
 	if err := run(opts); err != nil {
@@ -75,17 +78,29 @@ func run(opts options) error {
 	if opts.restartReason > 0xff {
 		return fmt.Errorf("restart reason %d is outside 0..255", opts.restartReason)
 	}
+	mode, err := pon.ParseMode(opts.ponMode)
+	if err != nil {
+		return err
+	}
+	stateDomain, err := mode.StateDomain()
+	if err != nil {
+		return err
+	}
+	if mode == pon.XGSPON {
+		return errors.New("xgspon mode requires a secure OMCC transport that reports verified AES-CMAC frames; the AF_PACKET backend is GPON-only")
+	}
 	factory, err := model.XG2010G(model.Identity{
 		SerialNumber:  opts.serialNumber,
 		Version:       version,
 		EquipmentID:   opts.equipmentID,
 		RestartReason: uint8(opts.restartReason),
+		PONMode:       mode,
 	})
 	if err != nil {
 		return err
 	}
 	if opts.onu3StatePath != "" {
-		restored, restoreErr := restoreONU3Factory(factory, opts.onu3StatePath)
+		restored, restoreErr := restoreONU3Factory(factory, opts.onu3StatePath, stateDomain)
 		if restoreErr != nil {
 			log.Printf("discard persistent ONU3-G state %s: %v", opts.onu3StatePath, restoreErr)
 		} else {
@@ -98,7 +113,7 @@ func run(opts options) error {
 		applier = platform.ExecApplier{Path: opts.applyHelper}
 		platformBackend = opts.applyHelper
 	}
-	store, err := initializeMIB(factory, applier, opts.statePath)
+	store, err := initializeMIB(mode, stateDomain, factory, applier, opts.statePath)
 	if err != nil {
 		return fmt.Errorf("initialize ONU MIB: %w", err)
 	}
@@ -112,7 +127,7 @@ func run(opts options) error {
 		softwareController = platform.ExecSoftwareController{Path: opts.softwareHelper}
 		softwareBackend = opts.softwareHelper
 	}
-	protocol := engine.NewWithControllers(store, controller, softwareController)
+	protocol := engine.NewForMode(store, controller, softwareController, mode)
 	if opts.runtimeStatePath != "" {
 		if restoreErr := restoreRuntimeState(protocol, opts.runtimeStatePath); restoreErr != nil {
 			log.Printf("discard persistent OMCI runtime state %s: %v",
@@ -136,6 +151,7 @@ func run(opts options) error {
 	state := status.Snapshot{
 		State:           "online",
 		Interface:       opts.interfaceName,
+		PONMode:         mode,
 		StartedAt:       started,
 		MIBDataSync:     store.DataSync(),
 		MIBEntries:      len(store.Snapshot()),
@@ -513,7 +529,7 @@ func writeRuntimeStateAtomic(path string, document []byte) error {
 	return nil
 }
 
-func restoreONU3Factory(factory []mib.Instance, path string) ([]mib.Instance, error) {
+func restoreONU3Factory(factory []mib.Instance, path, stateDomain string) ([]mib.Instance, error) {
 	document, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return factory, nil
@@ -527,20 +543,22 @@ func restoreONU3Factory(factory []mib.Instance, path string) ([]mib.Instance, er
 	if err != nil {
 		return nil, fmt.Errorf("decode persistent platform document: %w", err)
 	}
-	return mib.RestoreONU3Factory(factory, *request.MIBState)
+	return mib.RestoreONU3Factory(factory, *request.MIBState, stateDomain)
 }
 
-func initializeMIB(factory []mib.Instance, applier mib.Applier, statePath string) (*mib.Store, error) {
-	attributeMasks, err := model.XG2010GSupportedAttributeMasks(factory)
+func initializeMIB(mode pon.Mode, stateDomain string, factory []mib.Instance,
+	applier mib.Applier, statePath string) (*mib.Store, error) {
+	attributeMasks, err := model.XG2010GSupportedAttributeMasks(mode, factory)
 	if err != nil {
 		return nil, fmt.Errorf("build XG2010G attribute policy: %w", err)
 	}
 	options := mib.Options{
 		Applier:                 applier,
-		SupportedClasses:        model.XG2010GSupportedClasses(),
+		StateDomain:             stateDomain,
+		SupportedClasses:        model.XG2010GSupportedClasses(mode),
 		SupportedAttributeMasks: attributeMasks,
-		ValidateInstance:        model.XG2010GValidateInstance,
-		AttributeCapabilities:   model.XG2010GAttributeCapabilities(),
+		ValidateInstance:        model.XG2010GInstanceValidator(mode),
+		AttributeCapabilities:   model.XG2010GAttributeCapabilities(mode),
 	}
 	if statePath == "" {
 		return mib.NewWithOptions(factory, options)

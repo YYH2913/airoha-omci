@@ -10,10 +10,11 @@ import (
 
 	me "github.com/opencord/omci-lib-go/v2/generated"
 	"github.com/xg2010g/airoha-omci/internal/mib"
+	"github.com/xg2010g/airoha-omci/internal/pon"
 )
 
 func TestXG2010GFactoryMIB(t *testing.T) {
-	factory, err := XG2010G(Identity{SerialNumber: "ABCD01020304"})
+	factory, err := XG2010G(Identity{SerialNumber: "ABCD01020304", PONMode: pon.GPON})
 	if err != nil {
 		t.Fatalf("XG2010G() error = %v", err)
 	}
@@ -156,13 +157,13 @@ func TestXG2010GFactoryMIB(t *testing.T) {
 }
 
 func TestXG2010GRejectsMalformedSerial(t *testing.T) {
-	if _, err := XG2010G(Identity{SerialNumber: "bad"}); err == nil {
+	if _, err := XG2010G(Identity{SerialNumber: "bad", PONMode: pon.GPON}); err == nil {
 		t.Fatal("XG2010G() error = nil, want malformed serial error")
 	}
 }
 
 func TestXG2010GSupportedClassesAreExplicitAndSorted(t *testing.T) {
-	classes := XG2010GSupportedClasses()
+	classes := XG2010GSupportedClasses(pon.GPON)
 	if !slices.IsSorted(classes) {
 		t.Fatalf("supported classes are not sorted: %v", classes)
 	}
@@ -189,16 +190,50 @@ func TestXG2010GSupportedClassesAreExplicitAndSorted(t *testing.T) {
 	}
 }
 
+func TestXG2010GCapabilitiesAreIsolatedByPONMode(t *testing.T) {
+	xgsClasses := XG2010GSupportedClasses(pon.XGSPON)
+	gponClasses := XG2010GSupportedClasses(pon.GPON)
+	for _, classID := range []me.ClassID{
+		me.XgPonTcPerformanceMonitoringHistoryDataClassID,
+		me.XgPonDownstreamManagementPerformanceMonitoringHistoryDataClassID,
+		me.XgPonUpstreamManagementPerformanceMonitoringHistoryDataClassID,
+	} {
+		if !slices.Contains(xgsClasses, classID) {
+			t.Fatalf("XGS-PON capability list omits class %v", classID)
+		}
+		if slices.Contains(gponClasses, classID) {
+			t.Fatalf("GPON capability list advertises XGS-PON class %v", classID)
+		}
+	}
+	factory, err := XG2010G(Identity{SerialNumber: "TEST01020304", PONMode: pon.XGSPON})
+	if err != nil {
+		t.Fatal(err)
+	}
+	masks, err := XG2010GSupportedAttributeMasks(pon.XGSPON, factory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for classID, want := range map[me.ClassID]uint16{
+		me.XgPonTcPerformanceMonitoringHistoryDataClassID:                   0xfffe,
+		me.XgPonDownstreamManagementPerformanceMonitoringHistoryDataClassID: 0xffff,
+		me.XgPonUpstreamManagementPerformanceMonitoringHistoryDataClassID:   0xff00,
+	} {
+		if masks[classID] != want {
+			t.Fatalf("XGS-PON class %v mask = %#x, want %#x", classID, masks[classID], want)
+		}
+	}
+}
+
 func TestXG2010GAttributePolicyMatchesImplementedSurface(t *testing.T) {
-	factory, err := XG2010G(Identity{SerialNumber: "TEST01020304"})
+	factory, err := XG2010G(Identity{SerialNumber: "TEST01020304", PONMode: pon.GPON})
 	if err != nil {
 		t.Fatal(err)
 	}
-	masks, err := XG2010GSupportedAttributeMasks(factory)
+	masks, err := XG2010GSupportedAttributeMasks(pon.GPON, factory)
 	if err != nil {
 		t.Fatal(err)
 	}
-	classes := XG2010GSupportedClasses()
+	classes := XG2010GSupportedClasses(pon.GPON)
 	if len(masks) != len(classes) {
 		t.Fatalf("attribute policies = %d, supported classes = %d", len(masks), len(classes))
 	}
@@ -221,9 +256,9 @@ func TestXG2010GAttributePolicyMatchesImplementedSurface(t *testing.T) {
 	}
 
 	store, err := mib.NewWithOptions(factory, mib.Options{
-		SupportedClasses: XG2010GSupportedClasses(), SupportedAttributeMasks: masks,
-		ValidateInstance:      XG2010GValidateInstance,
-		AttributeCapabilities: XG2010GAttributeCapabilities(),
+		SupportedClasses: XG2010GSupportedClasses(pon.GPON), SupportedAttributeMasks: masks,
+		ValidateInstance:      XG2010GInstanceValidator(pon.GPON),
+		AttributeCapabilities: XG2010GAttributeCapabilities(pon.GPON),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -265,18 +300,18 @@ func TestXG2010GAttributePolicyMatchesImplementedSurface(t *testing.T) {
 }
 
 func TestXG2010GRejectsUnsupportedFixedAttributeValues(t *testing.T) {
-	factory, err := XG2010G(Identity{SerialNumber: "TEST01020304"})
+	factory, err := XG2010G(Identity{SerialNumber: "TEST01020304", PONMode: pon.GPON})
 	if err != nil {
 		t.Fatal(err)
 	}
-	masks, err := XG2010GSupportedAttributeMasks(factory)
+	masks, err := XG2010GSupportedAttributeMasks(pon.GPON, factory)
 	if err != nil {
 		t.Fatal(err)
 	}
 	store, err := mib.NewWithOptions(factory, mib.Options{
-		SupportedClasses: XG2010GSupportedClasses(), SupportedAttributeMasks: masks,
-		ValidateInstance:      XG2010GValidateInstance,
-		AttributeCapabilities: XG2010GAttributeCapabilities(),
+		SupportedClasses: XG2010GSupportedClasses(pon.GPON), SupportedAttributeMasks: masks,
+		ValidateInstance:      XG2010GInstanceValidator(pon.GPON),
+		AttributeCapabilities: XG2010GAttributeCapabilities(pon.GPON),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -365,15 +400,15 @@ func TestXG2010GRejectsUnsupportedFixedAttributeValues(t *testing.T) {
 }
 
 func TestXG2010GCapabilitiesCoverAdvertisedEnumerations(t *testing.T) {
-	factory, err := XG2010G(Identity{SerialNumber: "TEST01020304"})
+	factory, err := XG2010G(Identity{SerialNumber: "TEST01020304", PONMode: pon.GPON})
 	if err != nil {
 		t.Fatal(err)
 	}
-	masks, err := XG2010GSupportedAttributeMasks(factory)
+	masks, err := XG2010GSupportedAttributeMasks(pon.GPON, factory)
 	if err != nil {
 		t.Fatal(err)
 	}
-	capabilities := XG2010GAttributeCapabilities()
+	capabilities := XG2010GAttributeCapabilities(pon.GPON)
 	var missing []string
 	for classID, mask := range masks {
 		definitions, omciErr := me.GetAttributesDefinitions(classID)

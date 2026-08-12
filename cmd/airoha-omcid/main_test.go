@@ -16,7 +16,10 @@ import (
 	"github.com/xg2010g/airoha-omci/internal/mib"
 	"github.com/xg2010g/airoha-omci/internal/model"
 	"github.com/xg2010g/airoha-omci/internal/platform"
+	"github.com/xg2010g/airoha-omci/internal/pon"
 )
+
+const daemonTestStateDomain = "xg2010g:gpon"
 
 func TestRuntimeStateWriterPublishesOnlyChangesAndRestores(t *testing.T) {
 	protocol, key := daemonRuntimeEngine(t)
@@ -105,7 +108,7 @@ func TestInitializeMIBRestoresCommittedState(t *testing.T) {
 	}
 	statePath := writeDaemonState(t, committed)
 	applyCalls := 0
-	restored, err := initializeMIB(factory, mib.ApplyFunc(func(mib.Change) error {
+	restored, err := initializeMIB(pon.GPON, daemonTestStateDomain, factory, mib.ApplyFunc(func(mib.Change) error {
 		applyCalls++
 		return nil
 	}), statePath)
@@ -128,7 +131,8 @@ func TestInitializeMIBResetsStateForDifferentONU(t *testing.T) {
 	}
 	statePath := writeDaemonState(t, committed)
 	var changes []mib.Change
-	restored, err := initializeMIB(daemonTestFactory(t, "WXYZ01020304"),
+	restored, err := initializeMIB(pon.GPON, daemonTestStateDomain,
+		daemonTestFactory(t, "WXYZ01020304"),
 		mib.ApplyFunc(func(change mib.Change) error {
 			changes = append(changes, change)
 			return nil
@@ -147,7 +151,7 @@ func TestInitializeMIBResetsMismatchedServiceGraph(t *testing.T) {
 	if err != nil {
 		t.Fatalf("mib.New() error = %v", err)
 	}
-	state, err := mib.ExportState(committed.Snapshot(), committed.DataSync())
+	state, err := mib.ExportState(committed.Snapshot(), committed.DataSync(), daemonTestStateDomain)
 	if err != nil {
 		t.Fatalf("ExportState() error = %v", err)
 	}
@@ -157,11 +161,12 @@ func TestInitializeMIBResetsMismatchedServiceGraph(t *testing.T) {
 	}
 	graph.UNIs = nil
 	statePath := writeDaemonRequest(t, platform.ApplyRequest{
-		Version: platform.ApplyABIVersion, Operation: mib.OperationSet,
+		Version: platform.ApplyABIVersion, StateDomain: daemonTestStateDomain,
+		Operation:   mib.OperationSet,
 		MIBDataSync: state.MIBDataSync, MIBState: &state, Service: graph,
 	})
 	applyCalls := 0
-	_, err = initializeMIB(factory, mib.ApplyFunc(func(mib.Change) error {
+	_, err = initializeMIB(pon.GPON, daemonTestStateDomain, factory, mib.ApplyFunc(func(mib.Change) error {
 		applyCalls++
 		return nil
 	}), statePath)
@@ -194,12 +199,12 @@ func TestRestoreONU3FactoryLoadsPersistentSnapshots(t *testing.T) {
 	}
 	persistentPath := writeDaemonState(t, persisted)
 	currentFactory, err := model.XG2010G(model.Identity{
-		SerialNumber: "ABCD01020304", Version: "test", RestartReason: 9,
+		SerialNumber: "ABCD01020304", Version: "test", RestartReason: 9, PONMode: pon.GPON,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	restoredFactory, err := restoreONU3Factory(currentFactory, persistentPath)
+	restoredFactory, err := restoreONU3Factory(currentFactory, persistentPath, daemonTestStateDomain)
 	if err != nil {
 		t.Fatalf("restoreONU3Factory() error = %v", err)
 	}
@@ -221,7 +226,9 @@ func TestRestoreONU3FactoryLoadsPersistentSnapshots(t *testing.T) {
 
 func daemonTestFactory(t *testing.T, serial string) []mib.Instance {
 	t.Helper()
-	factory, err := model.XG2010G(model.Identity{SerialNumber: serial, Version: "test"})
+	factory, err := model.XG2010G(model.Identity{
+		SerialNumber: serial, Version: "test", PONMode: pon.GPON,
+	})
 	if err != nil {
 		t.Fatalf("model.XG2010G() error = %v", err)
 	}
@@ -230,7 +237,7 @@ func daemonTestFactory(t *testing.T, serial string) []mib.Instance {
 
 func writeDaemonState(t *testing.T, store *mib.Store) string {
 	t.Helper()
-	state, err := mib.ExportState(store.Snapshot(), store.DataSync())
+	state, err := mib.ExportState(store.Snapshot(), store.DataSync(), daemonTestStateDomain)
 	if err != nil {
 		t.Fatalf("ExportState() error = %v", err)
 	}
@@ -239,7 +246,8 @@ func writeDaemonState(t *testing.T, store *mib.Store) string {
 		t.Fatalf("BuildServiceGraph() error = %v", err)
 	}
 	return writeDaemonRequest(t, platform.ApplyRequest{
-		Version: platform.ApplyABIVersion, Operation: mib.OperationSet,
+		Version: platform.ApplyABIVersion, StateDomain: daemonTestStateDomain,
+		Operation:   mib.OperationSet,
 		MIBDataSync: state.MIBDataSync, MIBState: &state, Service: graph,
 	})
 }
