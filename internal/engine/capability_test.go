@@ -79,6 +79,27 @@ func TestCapabilityMEsMatchXG2010GPolicy(t *testing.T) {
 	if !reflect.DeepEqual(onu3AVCs.Rows, []byte{4, 5}) {
 		t.Fatalf("ONU3-G AVC table = %#v", onu3AVCs)
 	}
+	aniCapability, err, handled := protocol.getCapabilityLocked(mib.Key{
+		ClassID: me.ManagedEntityMeClassID, EntityID: uint16(me.AniGClassID),
+	}, 0x0c00)
+	if !handled || err != nil {
+		t.Fatalf("get ANI-G ME capability: handled=%t error=%v", handled, err)
+	}
+	aniAVCs := aniCapability.Attributes[me.ManagedEntityMe_AvcsTable].(me.TableRows)
+	if !reflect.DeepEqual(aniAVCs.Rows, []byte{8, 10, 14}) {
+		t.Fatalf("ANI-G AVC table = %#v", aniAVCs)
+	}
+	uniCapability, err, handled := protocol.getCapabilityLocked(mib.Key{
+		ClassID:  me.ManagedEntityMeClassID,
+		EntityID: uint16(me.PhysicalPathTerminationPointEthernetUniClassID),
+	}, 0x0c00)
+	if !handled || err != nil {
+		t.Fatalf("get Ethernet UNI ME capability: handled=%t error=%v", handled, err)
+	}
+	uniAVCs := uniCapability.Attributes[me.ManagedEntityMe_AvcsTable].(me.TableRows)
+	if !reflect.DeepEqual(uniAVCs.Rows, []byte{6, 12}) {
+		t.Fatalf("Ethernet UNI AVC table = %#v", uniAVCs)
+	}
 
 	onuDefinition, definitionErr := capabilityDefinition(me.OnuGClassID)
 	if definitionErr != nil {

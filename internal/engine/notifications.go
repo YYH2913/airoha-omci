@@ -61,6 +61,9 @@ func (e *Engine) notifyAlarmLocked(key mib.Key, bitmap [28]byte,
 	if err := validateAlarmBitmap(entity.GetAlarmMap(), bitmap); err != nil {
 		return nil, false, fmt.Errorf("alarm target %v/%#x: %w", key.ClassID, key.EntityID, err)
 	}
+	if err := e.validateCapabilityAlarmLocked(key.ClassID, bitmap); err != nil {
+		return nil, false, fmt.Errorf("alarm target %v/%#x: %w", key.ClassID, key.EntityID, err)
+	}
 	previous, found := e.alarms[key]
 	if found && previous == bitmap {
 		return nil, false, nil
@@ -157,11 +160,71 @@ func (e *Engine) NotifyAttributeChange(key mib.Key, attributes me.AttributeValue
 
 func (e *Engine) notifyAttributeChangeLocked(key mib.Key, attributes me.AttributeValueMap,
 	device omci.DeviceIdent) ([][]byte, error) {
+	if err := e.validateCapabilityAVCLocked(key, attributes); err != nil {
+		return nil, err
+	}
 	changed, err := e.mib.UpdateAutonomous(key, attributes)
 	if err != nil {
 		return nil, err
 	}
 	return e.attributeValueChangeFramesLocked(key, changed, device)
+}
+
+// validateCapabilityAlarmLocked keeps autonomous alarms within the explicit
+// class-288 alarm table used by a device-constrained production store. An
+// unrestricted store retains the generated library alarm map behavior.
+func (e *Engine) validateCapabilityAlarmLocked(classID me.ClassID, bitmap [28]byte) error {
+	_, explicit := e.mib.SupportedAttributeMask(classID)
+	if !explicit {
+		return nil
+	}
+	allowed := capabilityAlarmCodes(classID)
+	for alarm := uint8(0); alarm < omci.AlarmBitmapSize; alarm++ {
+		octet := alarm / 8
+		bit := uint(7 - alarm%8)
+		if bitmap[octet]&(1<<bit) == 0 {
+			continue
+		}
+		if !containsCapabilityCode(allowed, alarm) {
+			return fmt.Errorf("alarm bit %d is not advertised by the ONU capability", alarm)
+		}
+	}
+	return nil
+}
+
+// validateCapabilityAVCLocked rejects an ONU-originated state update that
+// would produce an AVC absent from the explicit class-288 AVC table. It runs
+// before the MIB update so rejected notifications leave state untouched.
+func (e *Engine) validateCapabilityAVCLocked(key mib.Key, attributes me.AttributeValueMap) error {
+	_, explicit := e.mib.SupportedAttributeMask(key.ClassID)
+	if !explicit {
+		return nil
+	}
+	entity, omciErr := me.LoadManagedEntityDefinition(key.ClassID, me.ParamData{EntityID: key.EntityID})
+	if omciErr.StatusCode() != me.Success {
+		return omciErr.GetError()
+	}
+	allowed := capabilityAVCIndexes(key.ClassID)
+	for name := range attributes {
+		definition, err := me.GetAttributeDefinitionByName(entity.GetAttributeDefinitions(), name)
+		if err != nil {
+			return fmt.Errorf("AVC attribute %q is not defined for class %d", name, key.ClassID)
+		}
+		if definition.GetIndex() > 255 ||
+			!containsCapabilityCode(allowed, uint8(definition.GetIndex())) {
+			return fmt.Errorf("AVC attribute %s is not advertised by the ONU capability", name)
+		}
+	}
+	return nil
+}
+
+func containsCapabilityCode(codes []byte, candidate uint8) bool {
+	for _, code := range codes {
+		if code == candidate {
+			return true
+		}
+	}
+	return false
 }
 
 func (e *Engine) attributeValueChangeFramesLocked(key mib.Key, changed me.AttributeValueMap,

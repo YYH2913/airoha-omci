@@ -3,6 +3,7 @@
 package engine
 
 import (
+	"reflect"
 	"testing"
 
 	"github.com/google/gopacket"
@@ -238,6 +239,53 @@ func TestAVCUpdatesMIBWithoutDataSync(t *testing.T) {
 	}, omci.BaselineIdent)
 	if err != nil || len(frames) != 0 {
 		t.Fatalf("duplicate AVC frames=%d err=%v, want 0/nil", len(frames), err)
+	}
+}
+
+func TestProductionCapabilityRejectsUnadvertisedNotificationsWithoutMutation(t *testing.T) {
+	protocol, store, _ := newCapabilityEngine(t)
+	key := mib.Key{
+		ClassID:  me.PhysicalPathTerminationPointEthernetUniClassID,
+		EntityID: notificationUNI,
+	}
+
+	before, err := store.Get(key, 0x4200)
+	if err != nil {
+		t.Fatalf("Get(Ethernet UNI before rejected AVC) error = %v", err)
+	}
+	frames, err := protocol.NotifyAttributeChange(key, me.AttributeValueMap{
+		me.PhysicalPathTerminationPointEthernetUni_ConfigurationInd: uint8(0),
+	}, omci.BaselineIdent)
+	if err == nil || len(frames) != 0 {
+		t.Fatalf("unadvertised AVC frames=%d error=%v, want 0/error", len(frames), err)
+	}
+	after, getErr := store.Get(key, 0x4200)
+	if getErr != nil {
+		t.Fatalf("Get(Ethernet UNI after rejected AVC) error = %v", getErr)
+	}
+	if !reflect.DeepEqual(after.Attributes, before.Attributes) {
+		t.Fatalf("rejected AVC changed MIB: before=%#v after=%#v", before.Attributes, after.Attributes)
+	}
+
+	var bitmap [28]byte
+	bitmap[0] = 0x40 // Generated LAN alarm bit 1 is absent from class 288.
+	frame, emitted, err := protocol.NotifyAlarm(key, bitmap, omci.BaselineIdent)
+	if err == nil || emitted || frame != nil {
+		t.Fatalf("unadvertised alarm frame=%x emitted=%t error=%v", frame, emitted, err)
+	}
+	if _, present := protocol.alarms[key]; present || protocol.alarmSequence != 0 {
+		t.Fatalf("rejected alarm changed audit=%t sequence=%d", present, protocol.alarmSequence)
+	}
+
+	frames, err = protocol.NotifyAttributeChange(key, me.AttributeValueMap{
+		me.PhysicalPathTerminationPointEthernetUni_OperationalState: uint8(0),
+	}, omci.BaselineIdent)
+	if err != nil || len(frames) != 1 {
+		t.Fatalf("advertised AVC frames=%d error=%v", len(frames), err)
+	}
+	frame, emitted, err = protocol.NotifyAlarmBit(key, 0, true, omci.BaselineIdent)
+	if err != nil || !emitted || frame == nil {
+		t.Fatalf("advertised alarm frame=%x emitted=%t error=%v", frame, emitted, err)
 	}
 }
 

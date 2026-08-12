@@ -611,7 +611,6 @@ func gemPerformanceAttributes(intervalEnd uint8, counters performance.GEMPortCou
 		me.GemPortNetworkCtpPerformanceMonitoringHistoryData_ReceivedGemFrames:       saturatingUint32(counters.ReceivedGEMFrames),
 		me.GemPortNetworkCtpPerformanceMonitoringHistoryData_ReceivedPayloadBytes:    counters.ReceivedPayloadBytes,
 		me.GemPortNetworkCtpPerformanceMonitoringHistoryData_TransmittedPayloadBytes: counters.TransmittedPayloadBytes,
-		me.GemPortNetworkCtpPerformanceMonitoringHistoryData_EncryptionKeyErrors:     uint32(0),
 	}
 }
 

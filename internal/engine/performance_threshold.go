@@ -48,10 +48,8 @@ func isPerformanceClass(classID me.ClassID) bool {
 func performanceThresholdRules(classID me.ClassID) []performanceThresholdRule {
 	switch classID {
 	case me.GemPortNetworkCtpPerformanceMonitoringHistoryDataClassID:
-		return []performanceThresholdRule{{
-			counter:   me.GemPortNetworkCtpPerformanceMonitoringHistoryData_EncryptionKeyErrors,
-			threshold: 1, alarm: 1,
-		}}
+		// XG2010G does not expose a GEM encryption-error counter or TCA.
+		return nil
 	case me.FecPerformanceMonitoringHistoryDataClassID:
 		return []performanceThresholdRule{
 			{counter: me.FecPerformanceMonitoringHistoryData_CorrectedBytes, threshold: 1, alarm: 0},

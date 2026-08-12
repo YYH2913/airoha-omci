@@ -11,6 +11,7 @@ import (
 	omci "github.com/opencord/omci-lib-go/v2"
 	me "github.com/opencord/omci-lib-go/v2/generated"
 	"github.com/xg2010g/airoha-omci/internal/mib"
+	"github.com/xg2010g/airoha-omci/internal/model"
 	"github.com/xg2010g/airoha-omci/internal/optical"
 	"github.com/xg2010g/airoha-omci/internal/performance"
 )
@@ -895,6 +896,84 @@ func TestSynchronizeTimeAtomicallyRestartsPerformanceIntervals(t *testing.T) {
 	}
 }
 
+func TestXG2010GGEMPerformanceLifecycleUsesAdvertisedAttributes(t *testing.T) {
+	factory, err := model.XG2010G(model.Identity{SerialNumber: "TEST01020304"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	masks, err := model.XG2010GSupportedAttributeMasks(factory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := mib.NewWithOptions(factory, mib.Options{
+		SupportedClasses:        model.XG2010GSupportedClasses(),
+		SupportedAttributeMasks: masks,
+		ValidateInstance:        model.XG2010GValidateInstance,
+		AttributeCapabilities:   model.XG2010GAttributeCapabilities(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Create(me.GemPortNetworkCtpClassID, testGEMEntity, me.AttributeValueMap{
+		me.GemPortNetworkCtp_PortId:                                       testGEMPort,
+		me.GemPortNetworkCtp_TContPointer:                                 uint16(0x8001),
+		me.GemPortNetworkCtp_Direction:                                    uint8(3),
+		me.GemPortNetworkCtp_TrafficDescriptorProfilePointerForUpstream:   uint16(0),
+		me.GemPortNetworkCtp_TrafficDescriptorProfilePointerForDownstream: uint16(0),
+	}); err != nil {
+		t.Fatalf("Create(GEM parent) error = %v", err)
+	}
+	controller := &recordingPerformanceController{}
+	protocol := NewWithController(store, controller)
+	now := time.Date(2026, 8, 12, 0, 0, 0, 0, time.UTC)
+	protocol.now = func() time.Time { return now }
+
+	encoded, err := protocol.Handle(createGEMPerformanceRequest(t, 0x680))
+	if err != nil {
+		t.Fatalf("Handle(Create production GEM PM) error = %v", err)
+	}
+	response := decodeResponse(t, encoded).Layer(omci.LayerTypeCreateResponse).(*omci.CreateResponse)
+	if response.Result != me.Success {
+		t.Fatalf("Create production GEM PM result = %v", response.Result)
+	}
+	pollPerformance(t, protocol) // Arms the first collection interval.
+	controller.counters = performance.GEMPortCounters{
+		TransmittedGEMFrames: 9, ReceivedGEMFrames: 7,
+		ReceivedPayloadBytes: 1234, TransmittedPayloadBytes: 5678,
+	}
+	now = now.Add(performanceInterval)
+	pollPerformance(t, protocol)
+	history, err := store.Get(gemPerformanceKey(), 0xfc00)
+	if err != nil {
+		t.Fatalf("Get(production GEM history) error = %v", err)
+	}
+	if history.Attributes[me.GemPortNetworkCtpPerformanceMonitoringHistoryData_IntervalEndTime] != uint8(1) ||
+		history.Attributes[me.GemPortNetworkCtpPerformanceMonitoringHistoryData_ReceivedGemFrames] != uint32(7) {
+		t.Fatalf("production GEM history = %#v", history.Attributes)
+	}
+	if _, present := history.Attributes[me.GemPortNetworkCtpPerformanceMonitoringHistoryData_EncryptionKeyErrors]; present {
+		t.Fatalf("production GEM history contains unsupported encryption errors: %#v", history.Attributes)
+	}
+
+	requested := now.Add(time.Minute)
+	request := encodeRequest(t, 0x681, omci.SynchronizeTimeRequestType, &omci.SynchronizeTimeRequest{
+		MeBasePacket: omci.MeBasePacket{EntityClass: me.OnuGClassID, EntityInstance: 0},
+		Year:         uint16(requested.Year()), Month: uint8(requested.Month()), Day: uint8(requested.Day()),
+		Hour: uint8(requested.Hour()), Minute: uint8(requested.Minute()), Second: uint8(requested.Second()),
+	})
+	encoded, err = protocol.Handle(request)
+	if err != nil || me.Results(encoded[8]) != me.Success {
+		t.Fatalf("SynchronizeTime production GEM PM result=%v error=%v", me.Results(encoded[8]), err)
+	}
+	history, err = store.Get(gemPerformanceKey(), 0xfc00)
+	if err != nil || history.Attributes[me.GemPortNetworkCtpPerformanceMonitoringHistoryData_IntervalEndTime] != uint8(0) {
+		t.Fatalf("reset production GEM history=%#v error=%v", history.Attributes, err)
+	}
+	if alarms := capabilityAlarmCodes(me.GemPortNetworkCtpPerformanceMonitoringHistoryDataClassID); len(alarms) != 0 {
+		t.Fatalf("GEM PM capability alarms = %v, want none", alarms)
+	}
+}
+
 func newPerformanceEngine(t *testing.T) (*Engine, *mib.Store, *recordingPerformanceController) {
 	t.Helper()
 	store, err := mib.New([]mib.Instance{
@@ -915,7 +994,6 @@ func newPerformanceEngine(t *testing.T) (*Engine, *mib.Store, *recordingPerforma
 				me.GemPortNetworkCtpPerformanceMonitoringHistoryData_ReceivedGemFrames:       uint32(0),
 				me.GemPortNetworkCtpPerformanceMonitoringHistoryData_ReceivedPayloadBytes:    uint64(0),
 				me.GemPortNetworkCtpPerformanceMonitoringHistoryData_TransmittedPayloadBytes: uint64(0),
-				me.GemPortNetworkCtpPerformanceMonitoringHistoryData_EncryptionKeyErrors:     uint32(0),
 			},
 		},
 	})
