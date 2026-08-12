@@ -48,12 +48,12 @@ func OpenPacket(interfaceName string) (*PacketConn, error) {
 	return &PacketConn{fd: fd, ifindex: ifc.Index}, nil
 }
 
-func (c *PacketConn) ReadFrame(ctx context.Context) ([]byte, error) {
+func (c *PacketConn) ReadFrame(ctx context.Context) (Frame, error) {
 	buf := make([]byte, MaxFrameSize+1)
 
 	for {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return Frame{}, err
 		}
 
 		poll := []unix.PollFd{{Fd: int32(c.fd), Events: unix.POLLIN}}
@@ -62,13 +62,13 @@ func (c *PacketConn) ReadFrame(ctx context.Context) ([]byte, error) {
 			if errors.Is(err, unix.EINTR) {
 				continue
 			}
-			return nil, fmt.Errorf("poll OMCI packet socket: %w", err)
+			return Frame{}, fmt.Errorf("poll OMCI packet socket: %w", err)
 		}
 		if n == 0 {
 			continue
 		}
 		if poll[0].Revents&(unix.POLLERR|unix.POLLHUP|unix.POLLNVAL) != 0 {
-			return nil, syscall.EBADF
+			return Frame{}, syscall.EBADF
 		}
 
 		var source unix.Sockaddr
@@ -77,7 +77,7 @@ func (c *PacketConn) ReadFrame(ctx context.Context) ([]byte, error) {
 			if errors.Is(err, unix.EINTR) || errors.Is(err, unix.EAGAIN) {
 				continue
 			}
-			return nil, fmt.Errorf("receive OMCI frame: %w", err)
+			return Frame{}, fmt.Errorf("receive OMCI frame: %w", err)
 		}
 		if n == 0 {
 			continue
@@ -86,9 +86,9 @@ func (c *PacketConn) ReadFrame(ctx context.Context) ([]byte, error) {
 			continue
 		}
 		if n > MaxFrameSize {
-			return nil, fmt.Errorf("invalid OMCI frame length %d", n)
+			return Frame{}, fmt.Errorf("invalid OMCI frame length %d", n)
 		}
-		return append([]byte(nil), buf[:n]...), nil
+		return Frame{Contents: append([]byte(nil), buf[:n]...)}, nil
 	}
 }
 
@@ -116,6 +116,10 @@ func (c *PacketConn) Close() error {
 		err = unix.Close(c.fd)
 	})
 	return err
+}
+
+func (c *PacketConn) Capabilities() Capabilities {
+	return Capabilities{}
 }
 
 func htons(value uint16) uint16 {

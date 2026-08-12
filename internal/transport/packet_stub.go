@@ -5,8 +5,6 @@ package transport
 
 import "fmt"
 
-type PacketConn struct{}
-
-func OpenPacket(interfaceName string) (*PacketConn, error) {
+func OpenPacket(interfaceName string) (Conn, error) {
 	return nil, fmt.Errorf("AF_PACKET OMCI transport is unavailable on this platform: %s", interfaceName)
 }

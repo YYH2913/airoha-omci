@@ -5,7 +5,7 @@ and extended messages.  A successful build or reaching GPON O5 is not enough.
 
 | Area | Required behavior | State |
 | --- | --- | --- |
-| OMCC transport | raw RX/TX, cancellation, frame bounds, counters | implemented; physical adapter verification pending |
+| OMCC transport | raw RX/TX, cancellation, frame bounds, counters | GPON packet path implemented; XGS secure-device ABI and fail-closed client implemented, kernel adapter pending |
 | Transactions | per-priority scheduling, stop-and-wait replay and TCI validation | implemented; physical saturation verification pending |
 | MIB | ONU defaults, platform-gated create/delete/set, reset, data sync | implemented; physical OLT verification pending |
 | MIB upload | baseline fragmentation and extended multi-ME packing | implemented; physical OLT verification pending |

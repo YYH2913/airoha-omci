@@ -9,6 +9,7 @@ import (
 	"time"
 
 	omci "github.com/opencord/omci-lib-go/v2"
+	"github.com/xg2010g/airoha-omci/internal/transport"
 )
 
 func TestFrameQueuePrioritizesBaselineHighAndRetainsFIFO(t *testing.T) {
@@ -16,7 +17,7 @@ func TestFrameQueuePrioritizesBaselineHighAndRetainsFIFO(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newFrameQueue() error = %v", err)
 	}
-	frames := [][]byte{
+	frames := []transport.Frame{
 		frame(1, omci.BaselineIdent),
 		frame(0x8002, omci.ExtendedIdent),
 		frame(3, omci.BaselineIdent),
@@ -35,8 +36,25 @@ func TestFrameQueuePrioritizesBaselineHighAndRetainsFIFO(t *testing.T) {
 		}
 		queue.pop()
 	}
-	if queue.peek() != nil || queue.length() != 0 {
-		t.Fatalf("drained queue length = %d, peek = %x", queue.length(), queue.peek())
+	if queue.peek().Contents != nil || queue.length() != 0 {
+		t.Fatalf("drained queue length = %d, peek = %+v", queue.length(), queue.peek())
+	}
+}
+
+func TestFrameQueuePreservesTrustedMetadataAndOwnsContents(t *testing.T) {
+	queue, err := newFrameQueue(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := frame(1, omci.BaselineIdent)
+	input.MICVerified = true
+	if err := queue.push(input); err != nil {
+		t.Fatal(err)
+	}
+	input.Contents[0] = 0xff
+	queued := queue.peek()
+	if !queued.MICVerified || transactionID(queued) != 1 {
+		t.Fatalf("queued frame=%+v", queued)
 	}
 }
 
@@ -49,7 +67,7 @@ func TestFrameQueueCapacityAndOwnership(t *testing.T) {
 	if err := queue.push(value); err != nil {
 		t.Fatalf("push() error = %v", err)
 	}
-	value[0] = 0xff
+	value.Contents[0] = 0xff
 	if got := transactionID(queue.peek()); got != 1 {
 		t.Fatalf("queued transaction = %#x, want 1", got)
 	}
@@ -124,10 +142,12 @@ func TestDispatcherRejectsInvalidCapacity(t *testing.T) {
 	}
 }
 
-func frame(transactionID uint16, device omci.DeviceIdent) []byte {
-	return []byte{byte(transactionID >> 8), byte(transactionID), 0, byte(device)}
+func frame(transactionID uint16, device omci.DeviceIdent) transport.Frame {
+	return transport.Frame{Contents: []byte{
+		byte(transactionID >> 8), byte(transactionID), 0, byte(device),
+	}}
 }
 
-func transactionID(frame []byte) uint16 {
-	return uint16(frame[0])<<8 | uint16(frame[1])
+func transactionID(frame transport.Frame) uint16 {
+	return uint16(frame.Contents[0])<<8 | uint16(frame.Contents[1])
 }

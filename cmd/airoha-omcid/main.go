@@ -28,7 +28,6 @@ import (
 	"github.com/xg2010g/airoha-omci/internal/software"
 	"github.com/xg2010g/airoha-omci/internal/status"
 	"github.com/xg2010g/airoha-omci/internal/transaction"
-	"github.com/xg2010g/airoha-omci/internal/transport"
 )
 
 var version = "devel"
@@ -49,6 +48,8 @@ type options struct {
 	runtimeStatePath string
 	restartReason    uint
 	ponMode          string
+	transportBackend string
+	devicePath       string
 }
 
 func main() {
@@ -66,6 +67,8 @@ func main() {
 	flag.StringVar(&opts.runtimeStatePath, "runtime-state", "", "persistent alarm, ARC and performance runtime state")
 	flag.UintVar(&opts.restartReason, "restart-reason", 0, "G.988 ONU3-G latest restart reason (0..255)")
 	flag.StringVar(&opts.ponMode, "pon-mode", string(pon.GPON), "PON protocol mode: gpon or xgspon")
+	flag.StringVar(&opts.transportBackend, "transport", "packet", "OMCC transport: packet or device")
+	flag.StringVar(&opts.devicePath, "device", "/dev/airoha-xgs-omcc", "secure OMCC character device")
 	flag.Parse()
 
 	if err := run(opts); err != nil {
@@ -85,9 +88,6 @@ func run(opts options) error {
 	stateDomain, err := mode.StateDomain()
 	if err != nil {
 		return err
-	}
-	if mode == pon.XGSPON {
-		return errors.New("xgspon mode requires a secure OMCC transport that reports verified AES-CMAC frames; the AF_PACKET backend is GPON-only")
 	}
 	factory, err := model.XG2010G(model.Identity{
 		SerialNumber:  opts.serialNumber,
@@ -138,11 +138,14 @@ func run(opts options) error {
 		return fmt.Errorf("load software image state: %w", err)
 	}
 
-	conn, err := transport.OpenPacket(opts.interfaceName)
+	conn, err := openTransport(opts)
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
+	if mode == pon.XGSPON && !conn.Capabilities().SecureOMCC() {
+		return errors.New("xgspon mode requires kernel-verified downstream and kernel-signed upstream OMCC")
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -381,12 +384,15 @@ func run(opts options) error {
 			}
 
 		case frame := <-dispatcher.Frames():
+			contents := frame.Contents
 			state.RXFrames++
-			if len(frame) >= 4 {
-				state.LastTransactionID = uint16(frame[0])<<8 | uint16(frame[1])
-				state.LastMessageType = frame[2]
+			if len(contents) >= 4 {
+				state.LastTransactionID = uint16(contents[0])<<8 | uint16(contents[1])
+				state.LastMessageType = contents[2]
 			}
-			response, err := protocol.Handle(frame)
+			response, err := protocol.HandleFrame(engine.DownstreamFrame{
+				Contents: contents, MICVerified: frame.MICVerified,
+			})
 			if err != nil {
 				state.DecodeErrors++
 				state.LastError = err.Error()

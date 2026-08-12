@@ -14,7 +14,9 @@ independently from kernel and LuCI changes.  The OpenWrt tree contains only:
 ## Components
 
 1. `transport` binds an `AF_PACKET/SOCK_RAW` socket to the kernel `omci`
-   netdev.  Frames contain OMCI bytes directly, without an Ethernet header.
+   netdev for GPON, or a capability-negotiated secure character device for
+   XGS-PON. Frames contain OMCI bytes directly, without an Ethernet header;
+   only the device transport can attach trusted MIC-verification metadata.
 2. `engine` validates the OMCI header, de-duplicates OLT transactions,
    dispatches requests and serializes responses.
 3. `mib` owns ONU-created defaults and OLT-created managed entities.  Every
@@ -32,8 +34,9 @@ independently from kernel and LuCI changes.  The OpenWrt tree contains only:
    circular-buffer semantics; the OpenWrt command transaction provides the
    non-volatile storage boundary.
 
-The kernel is responsible only for GPON/PLOAM, OMCC frame transport and the
-low-level T-CONT/GEM control ABI.  G.988 policy remains in userspace.
+The kernel is responsible for mode-specific TC/PLOAM, secure OMCC transport
+and the low-level T-CONT/GEM or XGEM control ABI. G.988 policy remains in
+userspace.
 
 The event helper is a platform adapter, not part of the protocol engine. It is
 started directly without a shell and cannot choose executables or command-line
