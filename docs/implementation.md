@@ -5,7 +5,7 @@ and extended messages.  A successful build or reaching GPON O5 is not enough.
 
 | Area | Required behavior | State |
 | --- | --- | --- |
-| OMCC transport | raw RX/TX, cancellation, frame bounds, counters | GPON packet path implemented; XGS secure-device ABI and fail-closed client implemented, kernel adapter pending |
+| OMCC transport | raw RX/TX, cancellation, frame bounds, counters | GPON packet path implemented; XGS secure-device ABI, trusted downstream RX and gated upstream signing/TX are implemented and host-built; target injection and OLT verification pending |
 | Transactions | per-priority scheduling, stop-and-wait replay and TCI validation | implemented; physical saturation verification pending |
 | MIB | ONU defaults, platform-gated create/delete/set, reset, data sync | implemented; physical OLT verification pending |
 | MIB upload | baseline fragmentation and extended multi-ME packing | implemented; physical OLT verification pending |
@@ -14,13 +14,13 @@ and extended messages.  A successful build or reaching GPON O5 is not enough.
 | Notifications | alarm audit/sequence, event-driven Alarm/AVC, requested optical tests and ARC | implemented; physical OLT verification pending |
 | Equipment | ONU-G, ONU2-G, ANI-G, four speed-specific Ethernet UNIs, software images | implemented; physical OLT verification pending |
 | ONU diagnostics | ONU3-G restart reason, enhanced-mode declaration, persistent circular snapshots, Snap/Reset and M/K AVCs | baseline/extended host coverage implemented; power-loss and physical OLT verification pending |
-| Traffic | 8 advertised T-CONTs, scheduler/queue graph, GEM CTP/IW and class-298 rate-limit validation and apply | upstream SP/WRR/TRTCM, per-GEM downstream red-drop, per-bridge-port aggregate policing and bridge flood/broadcast/multicast policing implemented; physical verification pending |
+| Traffic | 8 advertised T-CONTs, fixed scheduler/queue graph, scheduler-policy-only QoS flexibility, GEM CTP/IW and class-298 rate-limit validation and apply | unsupported T-CONT/queue rebinding returns `ParameterError` atomically; upstream SP/WRR/TRTCM, per-GEM downstream red-drop, per-bridge-port aggregate policing and bridge flood/broadcast/multicast policing implemented; physical verification pending |
 | Performance | common 15-minute engine, FEC, GEM CTP and Ethernet UNI/frame PM | class 312, 341, 24, 296, 321 and 322 counters, threshold data 1/2 and TCA implemented; physical verification pending |
 | Ethernet service | resolved bridge, mapper, VLAN and extended VLAN graph | UNI, bridge-port, mapper, GEM-IW, packet-dependent cross-tag copy, structural multi-tag inverse and DSCP-derived PCP implemented; physical verification pending |
 | Multicast | multicast GEM-IW, IGMP/MLD policy, subscriber limits and live groups | class 281 and class 309/310 tables, ACL/preview enforcement, native report/query interception, proxy querier and sampled class 311 monitoring implemented; physical OLT verification pending |
 | Lifecycle | reboot, time sync, software download/activate/commit | implemented; OLT verification pending |
 | Platform | multi-T-CONT/GEM Airoha ABI and transactional Linux backend | GEM, 16-channel GPON QDMA QoS, downstream GEM/bridge-port policing, UNI VLAN, bridge FDB/rate limits and multi-profile MAC bridge implemented; Ethernet offload pending |
-| OpenWrt | package, procd, UCI, rpcd/ubus and LuCI | optical configuration, live service status and automatic/manual service handover implemented |
+| OpenWrt | package, procd, UCI, rpcd/ubus and LuCI | optical configuration, live service status, read-only XGS PHY evidence, threaded PHY IRQ/recovery and automatic/manual service handover implemented; board validation pending |
 | Verification | unit/fuzz/race/cross-build plus physical OLT traces | pending |
 
 ## Current interoperability limits
@@ -223,6 +223,34 @@ on the OLT's `Encrypted_Port` message; class 268 does not advertise the optional
 G.987/XG-PON encryption key-ring attribute and the OMCI platform graph does not
 attempt to select a key ring.
 
+The XGS control owner authenticates Deactivate ONU-ID with the active PLOAM
+integrity key and accepts only the assigned ONU-ID or standard broadcast
+destinations with zero padding. A valid Deactivate forces O1, locks optical TX
+off, disables automatic reactivation, clears active QDMA/GDM2/PSE and business
+XGEM state, invalidates EqD/T-CONT/default OMCC/ONU-ID, wipes session keys and
+advances the session generation so stale OMCC and ACK records cannot escape.
+Key Control/Key Report is implemented at the trusted kernel boundary. Strict
+downstream parsing and PLOAM MIC verification feed two read-back-verified
+unicast AES slots. Generate writes a random key, wraps it with KEK AES-ECB,
+sets the matching downstream-valid bit and sends a Key Report with TK5 retry
+inside the TK4 transaction deadline. Confirm switches and verifies the upstream
+slot, clears the old downstream slot/key and reports the existing-key CMAC.
+Encrypted XGEM apply remains blocked until that matching Confirm report receives
+a successful PLOAMU completion. Timeout and transmit faults restore the complete
+pre-exchange hardware/software snapshot and remove stale queued reports. Fixed
+vectors, SDK source checks and the Linux 6.18.41 cross-build pass; real OLT key
+exchange and encrypted traffic remain board-required evidence.
+
+Disable Serial Number and Sleep Allow are also handled at the trusted kernel
+boundary. A matching global or specific authenticated Disable command clears the
+current session, enters O7 and locks BOSA transmission off; discovery-silence
+instead remains quiet in O2/3. An authenticated Allow resets to O1 for a clean
+discovery cycle. Sleep Allow is intentionally recorded only:
+the recovered SDK validates its address but has no low-power state transition
+or upstream Sleep Request implementation. NG-PON2-only tuning, protection and
+power controls remain unavailable on this fixed-wavelength XGS board and are
+explicitly counted as ignored. These behaviours are host-verified only.
+
 The OpenWrt backend programs all OLT-provisioned GEM CTPs. TC classifiers set
 the reserved skb mark for P-bit, DSCP and default mapper branches, dispatch
 downstream frames by their receive GEM mark, and apply classic and extended
@@ -309,6 +337,15 @@ and 1 use strict priority and policy 2 uses WRR8. CIR/PIR retain their G.988
 bytes-per-second units until the driver converts them to kbit/s; CBS/PBS are
 bytes. Multiple GEMs sharing a T-CONT must select the same upstream traffic
 descriptor because EN7581 exposes one egress meter per channel.
+
+ONU2-G QoS configuration flexibility is `0x0008`, so only the traffic-
+scheduler policy is configurable. The T-CONT policy, scheduler-to-T-CONT
+pointer, priority-queue related port and priority-queue scheduler pointer keep
+their factory bindings. Attempts to change those writable-but-fixed attributes
+return G.988 `ParameterError`; the candidate MIB is rejected before platform
+apply, so neither the stored relationship nor MIB data sync changes. The
+traffic-scheduler chaining pointer is read-only in the standard ME definition
+and is rejected by generic OMCI access validation.
 
 ONU-G traffic-management option 0 remains the advertised capability because
 the native meter is per T-CONT rather than per GEM connection. Advertising

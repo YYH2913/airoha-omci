@@ -10,6 +10,7 @@ import (
 
 	me "github.com/opencord/omci-lib-go/v2/generated"
 	"github.com/xg2010g/airoha-omci/internal/mib"
+	"github.com/xg2010g/airoha-omci/internal/pon"
 	"github.com/xg2010g/airoha-omci/internal/vlan"
 )
 
@@ -27,6 +28,10 @@ var mapperPBitAttributes = [...]string{
 }
 
 type ServiceGraph struct {
+	// PONMode is omitted by the legacy GPON wrapper for persisted ABI
+	// compatibility. New callers should use BuildServiceGraphForMode so the
+	// privileged backend cannot infer the hardware family from GEM ranges.
+	PONMode               pon.Mode                        `json:"pon_mode,omitempty"`
 	UNIs                  []EthernetUNI                   `json:"unis"`
 	TCONTs                []TCONT                         `json:"tconts"`
 	TrafficDescs          []TrafficDescriptor             `json:"traffic_descriptors"`
@@ -70,6 +75,9 @@ type GEMPort struct {
 	DownstreamQueue uint16 `json:"downstream_queue"`
 	UpstreamTD      uint16 `json:"upstream_traffic_descriptor"`
 	DownstreamTD    uint16 `json:"downstream_traffic_descriptor"`
+	// EncryptionKeyRing is the G.987/XGS-PON key-ring selector.  The native
+	// XGS backend only consumes the upstream-encrypted bit derived from it.
+	EncryptionKeyRing uint8 `json:"encryption_key_ring"`
 }
 
 // TrafficDescriptor is the normalized class-280 ME consumed by a native
@@ -300,6 +308,21 @@ func ValidateServiceGraph(snapshot []mib.Instance) error {
 // Airoha backend. Null mapper branches remain present as 0xffff so the OLT can
 // construct a service over several transactions.
 func BuildServiceGraph(snapshot []mib.Instance) (ServiceGraph, error) {
+	return buildServiceGraph(snapshot, pon.GPON, false)
+}
+
+// BuildServiceGraphForMode resolves a graph with the limits and explicit
+// protocol tag required by the selected PON family. XGS-PON uses 16-bit XGEM
+// IDs (0xffff remains the G.988 null pointer) and 14-bit Alloc-IDs as exposed
+// by the EN7581 table.
+func BuildServiceGraphForMode(snapshot []mib.Instance, mode pon.Mode) (ServiceGraph, error) {
+	if err := mode.Validate(); err != nil {
+		return ServiceGraph{}, err
+	}
+	return buildServiceGraph(snapshot, mode, true)
+}
+
+func buildServiceGraph(snapshot []mib.Instance, mode pon.Mode, explicitMode bool) (ServiceGraph, error) {
 	instances := make(map[mib.Key]mib.Instance, len(snapshot))
 	for _, instance := range snapshot {
 		if _, exists := instances[instance.Key]; exists {
@@ -309,6 +332,15 @@ func BuildServiceGraph(snapshot []mib.Instance) (ServiceGraph, error) {
 	}
 
 	graph := ServiceGraph{}
+	if explicitMode {
+		graph.PONMode = mode
+	}
+	allocIDLimit := uint16(0x0fff)
+	gemPortLimit := uint16(0x0fff)
+	if mode == pon.XGSPON {
+		allocIDLimit = 0x3fff
+		gemPortLimit = 0xfffe
+	}
 	tconts := make(map[uint16]TCONT)
 	activeAllocIDs := make(map[uint16]uint16)
 	unis := make(map[uint16]EthernetUNI)
@@ -391,7 +423,7 @@ func BuildServiceGraph(snapshot []mib.Instance) (ServiceGraph, error) {
 			if err != nil {
 				return ServiceGraph{}, err
 			}
-			if allocID != nullPointer && allocID > 0x0fff {
+			if allocID != nullPointer && allocID > allocIDLimit {
 				return ServiceGraph{}, fmt.Errorf("T-CONT %#x has out-of-range Alloc-ID %d", instance.EntityID, allocID)
 			}
 			if previous, duplicate := activeAllocIDs[allocID]; allocID != nullPointer && duplicate {
@@ -430,7 +462,7 @@ func BuildServiceGraph(snapshot []mib.Instance) (ServiceGraph, error) {
 			graph.Mappers = append(graph.Mappers, mapper)
 
 		case me.MulticastOperationsProfileClassID:
-			profile, err := buildMulticastOperationsProfile(instance)
+			profile, err := buildMulticastOperationsProfile(instance, mode)
 			if err != nil {
 				return ServiceGraph{}, err
 			}
@@ -584,7 +616,7 @@ func BuildServiceGraph(snapshot []mib.Instance) (ServiceGraph, error) {
 		if err != nil {
 			return ServiceGraph{}, err
 		}
-		if portID > 0x0fff {
+		if portID > gemPortLimit {
 			return ServiceGraph{}, fmt.Errorf("GEM CTP %#x has out-of-range port ID %d", instance.EntityID, portID)
 		}
 		if previous, duplicate := gemPortIDs[portID]; duplicate {
@@ -640,10 +672,19 @@ func BuildServiceGraph(snapshot []mib.Instance) (ServiceGraph, error) {
 			"downstream", downstreamTD); err != nil {
 			return ServiceGraph{}, err
 		}
+		encryptionKeyRing, err := uint8AttributeDefault(instance,
+			me.GemPortNetworkCtp_EncryptionKeyRing, 0)
+		if err != nil {
+			return ServiceGraph{}, err
+		}
+		if encryptionKeyRing > 3 {
+			return ServiceGraph{}, fmt.Errorf("GEM CTP %#x has invalid encryption key ring %d",
+				instance.EntityID, encryptionKeyRing)
+		}
 		gemPort := GEMPort{EntityID: instance.EntityID, PortID: portID, TCONT: tcontID,
 			AllocID: tcont.AllocID, Direction: direction, UpstreamQueue: upstreamQueue,
 			DownstreamQueue: downstreamQueue, UpstreamTD: upstreamTD,
-			DownstreamTD: downstreamTD}
+			DownstreamTD: downstreamTD, EncryptionKeyRing: encryptionKeyRing}
 		gemPorts[instance.EntityID] = gemPort
 		graph.GEMPorts = append(graph.GEMPorts, gemPort)
 	}
@@ -665,7 +706,7 @@ func BuildServiceGraph(snapshot []mib.Instance) (ServiceGraph, error) {
 			continue
 		}
 		interworking, err := buildMulticastGEMInterworking(instance, instances,
-			gemPorts, bridges, mappers)
+			gemPorts, bridges, mappers, mode)
 		if err != nil {
 			return ServiceGraph{}, err
 		}
@@ -1179,7 +1220,7 @@ func buildGEMInterworking(instance mib.Instance, instances map[mib.Key]mib.Insta
 
 func buildMulticastGEMInterworking(instance mib.Instance, instances map[mib.Key]mib.Instance,
 	gemPorts map[uint16]GEMPort, bridges map[uint16]*MACBridge,
-	mappers map[uint16]PBitMapper) (MulticastGEMInterworking, error) {
+	mappers map[uint16]PBitMapper, mode pon.Mode) (MulticastGEMInterworking, error) {
 	pointer, err := uint16Attribute(instance,
 		me.MulticastGemInterworkingTerminationPoint_GemPortNetworkCtpConnectivityPointer)
 	if err != nil {
@@ -1251,11 +1292,11 @@ func buildMulticastGEMInterworking(instance mib.Instance, instances map[mib.Key]
 		}
 	}
 
-	ipv4, err := multicastIPv4Ranges(instance)
+	ipv4, err := multicastIPv4Ranges(instance, mode)
 	if err != nil {
 		return MulticastGEMInterworking{}, err
 	}
-	ipv6, err := multicastIPv6Ranges(instance)
+	ipv6, err := multicastIPv6Ranges(instance, mode)
 	if err != nil {
 		return MulticastGEMInterworking{}, err
 	}
@@ -1281,7 +1322,7 @@ func validateGALProfile(instances map[mib.Key]mib.Instance, interworking, gal ui
 	return nil
 }
 
-func multicastIPv4Ranges(instance mib.Instance) ([]MulticastIPv4Range, error) {
+func multicastIPv4Ranges(instance mib.Instance, mode pon.Mode) ([]MulticastIPv4Range, error) {
 	rows, err := tableAttributeDefault(instance,
 		me.MulticastGemInterworkingTerminationPoint_Ipv4MulticastAddressTable, 12)
 	if err != nil {
@@ -1295,7 +1336,9 @@ func multicastIPv4Ranges(instance mib.Instance) ([]MulticastIPv4Range, error) {
 		secondary := binary.BigEndian.Uint16(row[2:4])
 		start := binary.BigEndian.Uint32(row[4:8])
 		stop := binary.BigEndian.Uint32(row[8:12])
-		if portID > 0x0fff || start>>28 != 0xe || stop>>28 != 0xe || start > stop {
+		if (mode == pon.GPON && portID > 0x0fff) ||
+			(mode == pon.XGSPON && portID == 0xffff) ||
+			start>>28 != 0xe || stop>>28 != 0xe || start > stop {
 			return nil, fmt.Errorf("multicast GEM IW TP %#x has invalid IPv4 address row %x",
 				instance.EntityID, row)
 		}
@@ -1322,7 +1365,7 @@ func multicastIPv4Ranges(instance mib.Instance) ([]MulticastIPv4Range, error) {
 	return ranges, nil
 }
 
-func multicastIPv6Ranges(instance mib.Instance) ([]MulticastIPv6Range, error) {
+func multicastIPv6Ranges(instance mib.Instance, mode pon.Mode) ([]MulticastIPv6Range, error) {
 	rows, err := tableAttributeDefault(instance,
 		me.MulticastGemInterworkingTerminationPoint_Ipv6MulticastAddressTable, 24)
 	if err != nil {
@@ -1336,7 +1379,9 @@ func multicastIPv6Ranges(instance mib.Instance) ([]MulticastIPv6Range, error) {
 		secondary := binary.BigEndian.Uint16(row[2:4])
 		startLow := binary.BigEndian.Uint32(row[4:8])
 		stopLow := binary.BigEndian.Uint32(row[8:12])
-		if portID > 0x0fff || row[12] != 0xff || startLow > stopLow {
+		if (mode == pon.GPON && portID > 0x0fff) ||
+			(mode == pon.XGSPON && portID == 0xffff) ||
+			row[12] != 0xff || startLow > stopLow {
 			return nil, fmt.Errorf("multicast GEM IW TP %#x has invalid IPv6 address row %x",
 				instance.EntityID, row)
 		}
@@ -1365,7 +1410,7 @@ func multicastIPv6Ranges(instance mib.Instance) ([]MulticastIPv6Range, error) {
 	return ranges, nil
 }
 
-func buildMulticastOperationsProfile(instance mib.Instance) (MulticastOperationsProfile, error) {
+func buildMulticastOperationsProfile(instance mib.Instance, mode pon.Mode) (MulticastOperationsProfile, error) {
 	profile := MulticastOperationsProfile{EntityID: instance.EntityID}
 	var err error
 	if profile.IGMPVersion, err = uint8Attribute(instance,
@@ -1409,11 +1454,11 @@ func buildMulticastOperationsProfile(instance mib.Instance) (MulticastOperations
 	}
 
 	if profile.DynamicACL, err = multicastACL(instance,
-		me.MulticastOperationsProfile_DynamicAccessControlListTable); err != nil {
+		me.MulticastOperationsProfile_DynamicAccessControlListTable, mode); err != nil {
 		return MulticastOperationsProfile{}, err
 	}
 	if profile.StaticACL, err = multicastACL(instance,
-		me.MulticastOperationsProfile_StaticAccessControlListTable); err != nil {
+		me.MulticastOperationsProfile_StaticAccessControlListTable, mode); err != nil {
 		return MulticastOperationsProfile{}, err
 	}
 	if profile.Robustness, err = uint8AttributeDefault(instance,
@@ -1459,7 +1504,7 @@ func buildMulticastOperationsProfile(instance mib.Instance) (MulticastOperations
 	return profile, nil
 }
 
-func multicastACL(instance mib.Instance, name string) ([]MulticastACLEntry, error) {
+func multicastACL(instance mib.Instance, name string, mode pon.Mode) ([]MulticastACLEntry, error) {
 	const rowSize = 24
 	rows, err := tableAttributeDefault(instance, name, rowSize)
 	if err != nil {
@@ -1499,7 +1544,7 @@ func multicastACL(instance mib.Instance, name string) ([]MulticastACLEntry, erro
 			// have no forwarding meaning until row part 0 is present.
 			continue
 		}
-		resolved, err := resolveMulticastACLEntry(instance, name, key, entry)
+		resolved, err := resolveMulticastACLEntry(instance, name, key, entry, mode)
 		if err != nil {
 			return nil, err
 		}
@@ -1523,7 +1568,7 @@ func multicastACL(instance mib.Instance, name string) ([]MulticastACLEntry, erro
 }
 
 func resolveMulticastACLEntry(instance mib.Instance, name string, key uint16,
-	parts [3][]byte) (MulticastACLEntry, error) {
+	parts [3][]byte, mode pon.Mode) (MulticastACLEntry, error) {
 	part0 := parts[0]
 	result := MulticastACLEntry{
 		RowKey:           key,
@@ -1531,7 +1576,8 @@ func resolveMulticastACLEntry(instance mib.Instance, name string, key uint16,
 		VLANID:           binary.BigEndian.Uint16(part0[4:6]),
 		ImputedBandwidth: binary.BigEndian.Uint32(part0[18:22]),
 	}
-	if result.GEMPortID > 0x0fff {
+	if (mode == pon.GPON && result.GEMPortID > 0x0fff) ||
+		(mode == pon.XGSPON && result.GEMPortID == 0xffff) {
 		return MulticastACLEntry{}, fmt.Errorf("multicast operations profile %#x %s row key %d has invalid GEM Port-ID %d",
 			instance.EntityID, name, key, result.GEMPortID)
 	}

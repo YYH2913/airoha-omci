@@ -373,18 +373,17 @@ func XG2010GValidateInstance(mode pon.Mode, instance mib.Instance) error {
 		}
 	case me.TContClassID:
 		if value, present := instance.Attributes[me.TCont_Policy].(uint8); present && value != 0 {
-			return xg2010gAttributeError(instance.ClassID, me.TCont_Policy,
+			return xg2010gParameterError(
 				"T-CONT policy %d is fixed; configure the associated traffic scheduler", value)
 		}
 	case me.TrafficSchedulerClassID:
 		if value, present := instance.Attributes[me.TrafficScheduler_TContPointer].(uint16); present &&
 			value != instance.EntityID {
-			return xg2010gAttributeError(instance.ClassID, me.TrafficScheduler_TContPointer,
+			return xg2010gParameterError(
 				"traffic scheduler %#x is fixed to T-CONT %#x", instance.EntityID, instance.EntityID)
 		}
 		if value, present := instance.Attributes[me.TrafficScheduler_TrafficSchedulerPointer].(uint16); present && value != 0 {
-			return xg2010gAttributeError(instance.ClassID,
-				me.TrafficScheduler_TrafficSchedulerPointer,
+			return xg2010gParameterError(
 				"traffic scheduler %#x cannot be chained to scheduler %#x", instance.EntityID, value)
 		}
 	case me.PriorityQueueClassID:
@@ -403,7 +402,7 @@ func XG2010GValidateInstance(mode pon.Mode, instance mib.Instance) error {
 			}
 			want := uint32(wantOwner)<<16 | uint32(wantPriority)
 			if related != want {
-				return xg2010gAttributeError(instance.ClassID, me.PriorityQueue_RelatedPort,
+				return xg2010gParameterError(
 					"priority queue %#x has fixed related port %#x, not %#x",
 					instance.EntityID, want, related)
 			}
@@ -414,8 +413,7 @@ func XG2010GValidateInstance(mode pon.Mode, instance mib.Instance) error {
 				want = uint16(0x8001 + (instance.EntityID&0x7fff)/queuesPerPort)
 			}
 			if scheduler != want {
-				return xg2010gAttributeError(instance.ClassID,
-					me.PriorityQueue_TrafficSchedulerPointer,
+				return xg2010gParameterError(
 					"priority queue %#x has fixed scheduler %#x, not %#x",
 					instance.EntityID, want, scheduler)
 			}
@@ -441,4 +439,8 @@ func xg2010gAttributeError(classID me.ClassID, name, format string, arguments ..
 	}
 	return &mib.ResultError{Result: me.AttributeFailure, FailedMask: definition.Mask,
 		Cause: fmt.Errorf(format, arguments...)}
+}
+
+func xg2010gParameterError(format string, arguments ...interface{}) error {
+	return &mib.ResultError{Result: me.ParameterError, Cause: fmt.Errorf(format, arguments...)}
 }

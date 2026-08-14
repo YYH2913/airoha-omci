@@ -34,22 +34,58 @@ var version = "devel"
 
 const transactionQueueCapacity = 1024
 
+type xgsOMCIKernelSessionAction uint8
+
+const (
+	xgsOMCIKernelSessionAccept xgsOMCIKernelSessionAction = iota
+	xgsOMCIKernelSessionAdvance
+	xgsOMCIKernelSessionStale
+)
+
+func observeXGSOMCIKernelSession(evidence *status.XGSOMCIEvidence,
+	known *bool, instanceGeneration, sessionGeneration uint64) xgsOMCIKernelSessionAction {
+	if !*known {
+		evidence.KernelInstanceGeneration = instanceGeneration
+		evidence.KernelSessionGeneration = sessionGeneration
+		*known = true
+		return xgsOMCIKernelSessionAccept
+	}
+	if instanceGeneration != evidence.KernelInstanceGeneration {
+		evidence.KernelInstanceGeneration = instanceGeneration
+		evidence.KernelSessionGeneration = sessionGeneration
+		evidence.BaselineMessages = 0
+		evidence.ExtendedMessages = 0
+		return xgsOMCIKernelSessionAdvance
+	}
+	if sessionGeneration < evidence.KernelSessionGeneration {
+		return xgsOMCIKernelSessionStale
+	}
+	if sessionGeneration == evidence.KernelSessionGeneration {
+		return xgsOMCIKernelSessionAccept
+	}
+	evidence.KernelSessionGeneration = sessionGeneration
+	evidence.BaselineMessages = 0
+	evidence.ExtendedMessages = 0
+	return xgsOMCIKernelSessionAdvance
+}
+
 type options struct {
-	interfaceName    string
-	serialNumber     string
-	equipmentID      string
-	statusPath       string
-	statePath        string
-	applyHelper      string
-	controlHelper    string
-	eventHelper      string
-	softwareHelper   string
-	onu3StatePath    string
-	runtimeStatePath string
-	restartReason    uint
-	ponMode          string
-	transportBackend string
-	devicePath       string
+	interfaceName       string
+	serialNumber        string
+	equipmentID         string
+	statusPath          string
+	xgsOMCIEvidencePath string
+	statePath           string
+	applyHelper         string
+	controlHelper       string
+	eventHelper         string
+	softwareHelper      string
+	onu3StatePath       string
+	runtimeStatePath    string
+	restartReason       uint
+	ponMode             string
+	transportBackend    string
+	devicePath          string
 }
 
 func main() {
@@ -58,6 +94,7 @@ func main() {
 	flag.StringVar(&opts.serialNumber, "serial", "", "ONU serial: four vendor characters and eight hex digits")
 	flag.StringVar(&opts.equipmentID, "equipment-id", "XG2010G", "ONU equipment identifier")
 	flag.StringVar(&opts.statusPath, "status", "/var/run/airoha-omcid/status.json", "atomic JSON status path")
+	flag.StringVar(&opts.xgsOMCIEvidencePath, "xgs-omci-evidence", "/var/run/airoha-omcid/xgs-omci-evidence.json", "atomic XGS OMCI diagnostic path")
 	flag.StringVar(&opts.statePath, "state", "", "committed platform state used to restore the ONU MIB")
 	flag.StringVar(&opts.applyHelper, "apply-helper", "", "fixed executable receiving candidate service graphs as JSON")
 	flag.StringVar(&opts.controlHelper, "control-helper", "", "fixed executable handling time sync and scheduled reboot")
@@ -174,6 +211,28 @@ func run(opts options) error {
 	if err := statusWriter.Write(state); err != nil {
 		return err
 	}
+	var xgsOMCIEvidence status.XGSOMCIEvidence
+	var xgsOMCIEvidenceWriter *status.XGSOMCIEvidenceWriter
+	xgsOMCIKernelSessionKnown := false
+	if mode == pon.XGSPON && opts.xgsOMCIEvidencePath != "" {
+		xgsOMCIEvidence = status.XGSOMCIEvidence{
+			Version: 3, Complete: false,
+			Semantics: "application-accepted-kernel-instance-session",
+			PONMode:   mode, StartedAt: started,
+		}
+		xgsOMCIEvidenceWriter = status.NewXGSOMCIEvidenceWriter(opts.xgsOMCIEvidencePath)
+		if err := xgsOMCIEvidenceWriter.Write(xgsOMCIEvidence); err != nil {
+			return err
+		}
+	}
+	publishXGSOMCIEvidence := func() {
+		if xgsOMCIEvidenceWriter == nil {
+			return
+		}
+		if err := xgsOMCIEvidenceWriter.Write(xgsOMCIEvidence); err != nil {
+			log.Printf("publish XGS OMCI evidence: %v", err)
+		}
+	}
 	sendNotifications := func(frames [][]byte) error {
 		for _, frame := range frames {
 			if err := conn.WriteFrame(ctx, frame); err != nil {
@@ -284,6 +343,10 @@ func run(opts options) error {
 					_ = statusWriter.Write(state)
 					return fmt.Errorf("reset OMCI transaction queue: %w", err)
 				}
+				xgsOMCIEvidence.DispatcherGeneration = dispatcher.Generation()
+				xgsOMCIEvidence.BaselineMessages = 0
+				xgsOMCIEvidence.ExtendedMessages = 0
+				publishXGSOMCIEvidence()
 			}
 			frames, err := value.Dispatch(protocol)
 			if err != nil {
@@ -385,6 +448,30 @@ func run(opts options) error {
 
 		case frame := <-dispatcher.Frames():
 			contents := frame.Contents
+			if xgsOMCIEvidenceWriter != nil {
+				sessionAction := observeXGSOMCIKernelSession(
+					&xgsOMCIEvidence, &xgsOMCIKernelSessionKnown,
+					frame.InstanceGeneration,
+					frame.SessionGeneration)
+				if sessionAction == xgsOMCIKernelSessionStale {
+					// The kernel supplies this trusted monotonic session generation.
+					// Never let a stale queued frame enter the application counter.
+					continue
+				}
+				if sessionAction == xgsOMCIKernelSessionAdvance {
+					if err := dispatcher.Reset(ctx); err != nil {
+						if errors.Is(err, context.Canceled) {
+							state.State = "stopped"
+							_ = statusWriter.Write(state)
+							return nil
+						}
+						return fmt.Errorf("reset OMCI transaction queue for kernel session: %w", err)
+					}
+					protocol.ResetCommunicationSession()
+					xgsOMCIEvidence.DispatcherGeneration = dispatcher.Generation()
+					publishXGSOMCIEvidence()
+				}
+			}
 			state.RXFrames++
 			if len(contents) >= 4 {
 				state.LastTransactionID = uint16(contents[0])<<8 | uint16(contents[1])
@@ -402,6 +489,15 @@ func run(opts options) error {
 				_ = statusWriter.Write(state)
 				log.Printf("OMCI request rejected: %v", err)
 				continue
+			}
+			if xgsOMCIEvidenceWriter != nil {
+				switch omci.DeviceIdent(contents[3]) {
+				case omci.BaselineIdent:
+					xgsOMCIEvidence.BaselineMessages++
+				case omci.ExtendedIdent:
+					xgsOMCIEvidence.ExtendedMessages++
+				}
+				publishXGSOMCIEvidence()
 			}
 			if len(response) != 0 {
 				if err := conn.WriteFrame(ctx, response); err != nil {
@@ -584,7 +680,13 @@ func initializeMIB(mode pon.Mode, stateDomain string, factory []mib.Instance,
 			if stateErr != nil {
 				restoreError = stateErr
 			} else {
-				graph, graphErr := platform.BuildServiceGraph(store.Snapshot())
+				var graph platform.ServiceGraph
+				var graphErr error
+				if mode == pon.GPON {
+					graph, graphErr = platform.BuildServiceGraph(store.Snapshot())
+				} else {
+					graph, graphErr = platform.BuildServiceGraphForMode(store.Snapshot(), mode)
+				}
 				if graphErr != nil {
 					restoreError = graphErr
 				} else if !reflect.DeepEqual(graph, request.Service) {

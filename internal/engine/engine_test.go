@@ -305,24 +305,7 @@ func TestMibResetAndUpload(t *testing.T) {
 }
 
 func TestCompleteXG2010GFactoryMIBUpload(t *testing.T) {
-	factory, err := model.XG2010G(model.Identity{SerialNumber: "TEST01020304", PONMode: pon.GPON})
-	if err != nil {
-		t.Fatal(err)
-	}
-	masks, err := model.XG2010GSupportedAttributeMasks(pon.GPON, factory)
-	if err != nil {
-		t.Fatal(err)
-	}
-	store, err := mib.NewWithOptions(factory, mib.Options{
-		SupportedClasses:        model.XG2010GSupportedClasses(pon.GPON),
-		SupportedAttributeMasks: masks,
-		ValidateInstance:        model.XG2010GInstanceValidator(pon.GPON),
-		AttributeCapabilities:   model.XG2010GAttributeCapabilities(pon.GPON),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	protocol := New(store)
+	protocol, _ := newXG2010GTestEngine(t)
 	for _, device := range []omci.DeviceIdent{omci.BaselineIdent, omci.ExtendedIdent} {
 		t.Run(device.String(), func(t *testing.T) {
 			upload := encodeRequestForDevice(t, 0x100, omci.MibUploadRequestType,
@@ -348,6 +331,91 @@ func TestCompleteXG2010GFactoryMIBUpload(t *testing.T) {
 						sequence, response.NumberOfCommands, err)
 				}
 				decodeResponse(t, frame)
+			}
+		})
+	}
+}
+
+func TestXG2010GQoSFlexibilitySetSemantics(t *testing.T) {
+	protocol, store := newXG2010GTestEngine(t)
+
+	schedulerKey := mib.Key{ClassID: me.TrafficSchedulerClassID, EntityID: 0x8001}
+	request := encodeRequest(t, 0x160, omci.SetRequestType, &omci.SetRequest{
+		MeBasePacket: omci.MeBasePacket{
+			EntityClass:    schedulerKey.ClassID,
+			EntityInstance: schedulerKey.EntityID,
+		},
+		AttributeMask: 0x2000,
+		Attributes: me.AttributeValueMap{
+			me.TrafficScheduler_Policy: uint8(2),
+		},
+	})
+	encoded, err := protocol.Handle(request)
+	if err != nil {
+		t.Fatalf("Handle(Set scheduler policy) error = %v", err)
+	}
+	response := decodeResponse(t, encoded).Layer(omci.LayerTypeSetResponse).(*omci.SetResponse)
+	if response.Result != me.Success {
+		t.Fatalf("Set scheduler policy result = %v, want Success", response.Result)
+	}
+	assertStoredAttribute(t, store, schedulerKey, 0x2000, me.TrafficScheduler_Policy, uint8(2))
+	if got := store.DataSync(); got != 1 {
+		t.Fatalf("data sync after scheduler policy Set = %d, want 1", got)
+	}
+
+	tests := []struct {
+		name       string
+		key        mib.Key
+		mask       uint16
+		attribute  string
+		value      interface{}
+		wantStored interface{}
+	}{
+		{
+			name: "T-CONT policy", key: mib.Key{ClassID: me.TContClassID, EntityID: 0x8001},
+			mask: 0x2000, attribute: me.TCont_Policy, value: uint8(1), wantStored: uint8(0),
+		},
+		{
+			name: "scheduler T-CONT pointer", key: schedulerKey,
+			mask: 0x8000, attribute: me.TrafficScheduler_TContPointer,
+			value: uint16(0x8002), wantStored: uint16(0x8001),
+		},
+		{
+			name: "priority queue related port",
+			key:  mib.Key{ClassID: me.PriorityQueueClassID, EntityID: 0x8000},
+			mask: 0x0400, attribute: me.PriorityQueue_RelatedPort,
+			value: uint32(0x8002) << 16, wantStored: uint32(0x8001) << 16,
+		},
+		{
+			name: "priority queue scheduler pointer",
+			key:  mib.Key{ClassID: me.PriorityQueueClassID, EntityID: 0x8000},
+			mask: 0x0200, attribute: me.PriorityQueue_TrafficSchedulerPointer,
+			value: uint16(0x8002), wantStored: uint16(0x8001),
+		},
+	}
+	for index, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request := encodeRequest(t, uint16(0x161+index), omci.SetRequestType, &omci.SetRequest{
+				MeBasePacket: omci.MeBasePacket{
+					EntityClass:    test.key.ClassID,
+					EntityInstance: test.key.EntityID,
+				},
+				AttributeMask: test.mask,
+				Attributes: me.AttributeValueMap{
+					test.attribute: test.value,
+				},
+			})
+			encoded, err := protocol.Handle(request)
+			if err != nil {
+				t.Fatalf("Handle(Set) error = %v", err)
+			}
+			response := decodeResponse(t, encoded).Layer(omci.LayerTypeSetResponse).(*omci.SetResponse)
+			if response.Result != me.ParameterError {
+				t.Fatalf("Set result = %v, want ParameterError", response.Result)
+			}
+			assertStoredAttribute(t, store, test.key, test.mask, test.attribute, test.wantStored)
+			if got := store.DataSync(); got != 1 {
+				t.Fatalf("rejected Set changed data sync to %d, want 1", got)
 			}
 		})
 	}
@@ -1206,6 +1274,40 @@ func newTestEngine(t *testing.T) (*Engine, *mib.Store) {
 		t.Fatalf("mib.New() error = %v", err)
 	}
 	return New(store), store
+}
+
+func newXG2010GTestEngine(t *testing.T) (*Engine, *mib.Store) {
+	t.Helper()
+	factory, err := model.XG2010G(model.Identity{SerialNumber: "TEST01020304", PONMode: pon.GPON})
+	if err != nil {
+		t.Fatal(err)
+	}
+	masks, err := model.XG2010GSupportedAttributeMasks(pon.GPON, factory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := mib.NewWithOptions(factory, mib.Options{
+		SupportedClasses:        model.XG2010GSupportedClasses(pon.GPON),
+		SupportedAttributeMasks: masks,
+		ValidateInstance:        model.XG2010GInstanceValidator(pon.GPON),
+		AttributeCapabilities:   model.XG2010GAttributeCapabilities(pon.GPON),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return New(store), store
+}
+
+func assertStoredAttribute(t *testing.T, store *mib.Store, key mib.Key, mask uint16,
+	name string, want interface{}) {
+	t.Helper()
+	instance, err := store.Get(key, mask)
+	if err != nil {
+		t.Fatalf("Get(%v/%#x, %#x) error = %v", key.ClassID, key.EntityID, mask, err)
+	}
+	if got := instance.Attributes[name]; got != want {
+		t.Fatalf("stored %s = %#v, want %#v", name, got, want)
+	}
 }
 
 func encodeRequest(t *testing.T, transactionID uint16, messageType omci.MessageType, payload gopacket.SerializableLayer) []byte {

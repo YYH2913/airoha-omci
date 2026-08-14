@@ -8,9 +8,9 @@ import (
 )
 
 const (
-	deviceABIVersion = 1
+	deviceABIVersion = 3
 	deviceMagic      = 0x584f4d43 // "XOMC"
-	deviceHeaderSize = 12
+	deviceHeaderSize = 28
 
 	deviceDirectionRX = 1
 	deviceDirectionTX = 2
@@ -65,17 +65,19 @@ func decodeDeviceRX(record []byte) (Frame, error) {
 	if binary.BigEndian.Uint16(record[10:12]) != 0 {
 		return Frame{}, fmt.Errorf("secure OMCC record reserved field is non-zero")
 	}
-	if length < 4 || length > MaxFrameSize || len(record) != deviceHeaderSize+length {
+	if length < 4 || length > MaxDeviceContentSize || len(record) != deviceHeaderSize+length {
 		return Frame{}, fmt.Errorf("invalid secure OMCC frame length %d in %d-byte record", length, len(record))
 	}
 	return Frame{
-		Contents:    append([]byte(nil), record[deviceHeaderSize:]...),
-		MICVerified: true,
+		Contents:           append([]byte(nil), record[deviceHeaderSize:]...),
+		MICVerified:        true,
+		InstanceGeneration: binary.BigEndian.Uint64(record[12:20]),
+		SessionGeneration:  binary.BigEndian.Uint64(record[20:28]),
 	}, nil
 }
 
 func encodeDeviceTX(frame []byte) ([]byte, error) {
-	if len(frame) < 4 || len(frame) > MaxFrameSize {
+	if len(frame) < 4 || len(frame) > MaxDeviceContentSize {
 		return nil, fmt.Errorf("invalid OMCI frame length %d", len(frame))
 	}
 	record := make([]byte, deviceHeaderSize+len(frame))

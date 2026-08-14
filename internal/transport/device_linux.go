@@ -51,7 +51,7 @@ func OpenDevice(path string) (Conn, error) {
 }
 
 func (c *DeviceConn) ReadFrame(ctx context.Context) (Frame, error) {
-	record := make([]byte, deviceHeaderSize+MaxFrameSize)
+	record := make([]byte, deviceHeaderSize+MaxDeviceContentSize)
 	for {
 		if err := waitDevice(ctx, c.fd, unix.POLLIN); err != nil {
 			return Frame{}, err

@@ -40,6 +40,23 @@ type Snapshot struct {
 	LastError            string    `json:"last_error,omitempty"`
 }
 
+// XGSOMCIEvidence is a runtime-only diagnostic snapshot of downstream OMCI
+// frames accepted by the application after trusted XGS OMCC validation. It is
+// deliberately not a G.988 performance-management counter backend.
+type XGSOMCIEvidence struct {
+	Version                  uint8     `json:"version"`
+	Complete                 bool      `json:"complete"`
+	Semantics                string    `json:"semantics"`
+	PONMode                  pon.Mode  `json:"pon_mode"`
+	StartedAt                time.Time `json:"started_at"`
+	UpdatedAt                time.Time `json:"updated_at"`
+	KernelInstanceGeneration uint64    `json:"kernel_instance_generation"`
+	KernelSessionGeneration  uint64    `json:"kernel_session_generation"`
+	DispatcherGeneration     uint64    `json:"dispatcher_generation"`
+	BaselineMessages         uint64    `json:"baseline_messages"`
+	ExtendedMessages         uint64    `json:"extended_messages"`
+}
+
 type Writer struct {
 	path string
 }
@@ -50,13 +67,30 @@ func NewWriter(path string) *Writer {
 
 func (w *Writer) Write(snapshot Snapshot) error {
 	snapshot.UpdatedAt = time.Now().UTC()
-	encoded, err := json.Marshal(snapshot)
+	return writeJSONAtomically(w.path, snapshot)
+}
+
+type XGSOMCIEvidenceWriter struct {
+	path string
+}
+
+func NewXGSOMCIEvidenceWriter(path string) *XGSOMCIEvidenceWriter {
+	return &XGSOMCIEvidenceWriter{path: path}
+}
+
+func (w *XGSOMCIEvidenceWriter) Write(snapshot XGSOMCIEvidence) error {
+	snapshot.UpdatedAt = time.Now().UTC()
+	return writeJSONAtomically(w.path, snapshot)
+}
+
+func writeJSONAtomically(path string, value any) error {
+	encoded, err := json.Marshal(value)
 	if err != nil {
 		return fmt.Errorf("encode OMCI status: %w", err)
 	}
 	encoded = append(encoded, '\n')
 
-	directory := filepath.Dir(w.path)
+	directory := filepath.Dir(path)
 	if err := os.MkdirAll(directory, 0o755); err != nil {
 		return fmt.Errorf("create OMCI status directory: %w", err)
 	}
@@ -78,7 +112,7 @@ func (w *Writer) Write(snapshot Snapshot) error {
 	if err := temporary.Close(); err != nil {
 		return fmt.Errorf("close OMCI status: %w", err)
 	}
-	if err := os.Rename(temporaryPath, w.path); err != nil {
+	if err := os.Rename(temporaryPath, path); err != nil {
 		return fmt.Errorf("publish OMCI status: %w", err)
 	}
 	return nil

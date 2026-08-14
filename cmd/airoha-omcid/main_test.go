@@ -17,9 +17,41 @@ import (
 	"github.com/xg2010g/airoha-omci/internal/model"
 	"github.com/xg2010g/airoha-omci/internal/platform"
 	"github.com/xg2010g/airoha-omci/internal/pon"
+	"github.com/xg2010g/airoha-omci/internal/status"
 )
 
 const daemonTestStateDomain = "xg2010g:gpon"
+
+func TestObserveXGSOMCIKernelSession(t *testing.T) {
+	evidence := status.XGSOMCIEvidence{BaselineMessages: 9, ExtendedMessages: 10}
+	known := false
+	if action := observeXGSOMCIKernelSession(&evidence, &known, 100, 7); action != xgsOMCIKernelSessionAccept ||
+		!known || evidence.KernelSessionGeneration != 7 ||
+		evidence.KernelInstanceGeneration != 100 ||
+		evidence.BaselineMessages != 9 || evidence.ExtendedMessages != 10 {
+		t.Fatalf("initial session action=%d evidence=%+v known=%t", action, evidence, known)
+	}
+	if action := observeXGSOMCIKernelSession(&evidence, &known, 100, 7); action != xgsOMCIKernelSessionAccept {
+		t.Fatalf("same session action=%d", action)
+	}
+	if action := observeXGSOMCIKernelSession(&evidence, &known, 100, 6); action != xgsOMCIKernelSessionStale ||
+		evidence.KernelSessionGeneration != 7 || evidence.BaselineMessages != 9 ||
+		evidence.ExtendedMessages != 10 {
+		t.Fatalf("stale session action=%d evidence=%+v", action, evidence)
+	}
+	if action := observeXGSOMCIKernelSession(&evidence, &known, 100, 8); action != xgsOMCIKernelSessionAdvance ||
+		evidence.KernelSessionGeneration != 8 || evidence.BaselineMessages != 0 ||
+		evidence.ExtendedMessages != 0 {
+		t.Fatalf("advanced session action=%d evidence=%+v", action, evidence)
+	}
+	evidence.BaselineMessages = 11
+	evidence.ExtendedMessages = 12
+	if action := observeXGSOMCIKernelSession(&evidence, &known, 200, 1); action != xgsOMCIKernelSessionAdvance ||
+		evidence.KernelInstanceGeneration != 200 || evidence.KernelSessionGeneration != 1 ||
+		evidence.BaselineMessages != 0 || evidence.ExtendedMessages != 0 {
+		t.Fatalf("new instance action=%d evidence=%+v", action, evidence)
+	}
+}
 
 func TestRuntimeStateWriterPublishesOnlyChangesAndRestores(t *testing.T) {
 	protocol, key := daemonRuntimeEngine(t)

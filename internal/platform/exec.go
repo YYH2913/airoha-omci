@@ -14,6 +14,7 @@ import (
 
 	"github.com/xg2010g/airoha-omci/internal/mib"
 	"github.com/xg2010g/airoha-omci/internal/multicast"
+	"github.com/xg2010g/airoha-omci/internal/pon"
 )
 
 const defaultApplyTimeout = 10 * time.Second
@@ -76,6 +77,16 @@ func DecodeApplyRequest(reader io.Reader) (ApplyRequest, error) {
 		return ApplyRequest{}, fmt.Errorf("platform MIB data sync %d does not match state %d",
 			request.MIBDataSync, request.MIBState.MIBDataSync)
 	}
+	mode, err := modeFromStateDomain(request.StateDomain)
+	if err != nil {
+		return ApplyRequest{}, err
+	}
+	if mode == pon.XGSPON && request.Service.PONMode != pon.XGSPON {
+		return ApplyRequest{}, fmt.Errorf("XGS-PON platform request has no explicit xgspon service graph")
+	}
+	if mode == pon.GPON && request.Service.PONMode != "" && request.Service.PONMode != pon.GPON {
+		return ApplyRequest{}, fmt.Errorf("GPON platform request has mismatched service graph mode %q", request.Service.PONMode)
+	}
 	policy, err := request.Service.MulticastPolicy()
 	if err != nil {
 		return ApplyRequest{}, err
@@ -98,7 +109,11 @@ func (a ExecApplier) Apply(change mib.Change) error {
 	if a.Path == "" {
 		return fmt.Errorf("platform apply helper is empty")
 	}
-	graph, err := BuildServiceGraph(change.Snapshot)
+	mode, err := modeFromStateDomain(change.StateDomain)
+	if err != nil {
+		return err
+	}
+	graph, err := graphForMode(change.Snapshot, mode)
 	if err != nil {
 		return err
 	}
@@ -152,4 +167,19 @@ func (a ExecApplier) Apply(change mib.Change) error {
 		return fmt.Errorf("platform helper: %w: %s", err, detail)
 	}
 	return nil
+}
+
+func modeFromStateDomain(domain string) (pon.Mode, error) {
+	const prefix = "xg2010g:"
+	if !strings.HasPrefix(domain, prefix) {
+		return "", fmt.Errorf("unsupported platform state domain %q", domain)
+	}
+	return pon.ParseMode(strings.TrimPrefix(domain, prefix))
+}
+
+func graphForMode(snapshot []mib.Instance, mode pon.Mode) (ServiceGraph, error) {
+	if mode == pon.GPON {
+		return BuildServiceGraph(snapshot)
+	}
+	return BuildServiceGraphForMode(snapshot, mode)
 }

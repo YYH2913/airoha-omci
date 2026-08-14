@@ -42,7 +42,9 @@ func TestDeviceRecordRoundTripAndTrustValidation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decodeDeviceRX() error=%v", err)
 	}
-	if !frame.MICVerified || string(frame.Contents) != string(payload) {
+	if !frame.MICVerified || frame.InstanceGeneration != 0 ||
+		frame.SessionGeneration != 0 ||
+		string(frame.Contents) != string(payload) {
 		t.Fatalf("decoded frame=%+v", frame)
 	}
 	rx[6], rx[7] = 0, 0
@@ -75,5 +77,26 @@ func TestDeviceRecordRejectsMalformedHeaders(t *testing.T) {
 		if _, err := decodeDeviceRX(invalid); err == nil {
 			t.Fatalf("decodeDeviceRX(invalid %d) error=nil", index)
 		}
+	}
+}
+
+func TestDeviceRecordPreservesTrustedInstanceAndSessionGeneration(t *testing.T) {
+	payload := []byte{0, 1, 2, 0x0a}
+	record, err := encodeDeviceTX(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record[5] = deviceDirectionRX
+	binary.BigEndian.PutUint16(record[6:8], deviceFlagMICVerified|deviceFlagTrailerStripped)
+	binary.BigEndian.PutUint64(record[12:20], 0x0102030405060708)
+	binary.BigEndian.PutUint64(record[20:28], 0x1112131415161718)
+	frame, err := decodeDeviceRX(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if frame.InstanceGeneration != 0x0102030405060708 ||
+		frame.SessionGeneration != 0x1112131415161718 {
+		t.Fatalf("instance/session generation=%#x/%#x",
+			frame.InstanceGeneration, frame.SessionGeneration)
 	}
 }
