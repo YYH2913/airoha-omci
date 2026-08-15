@@ -148,6 +148,69 @@ func TestExecControllerRejectsIncompleteFECCounters(t *testing.T) {
 	}
 }
 
+func validXGSPONCountersResponse() string {
+	return `{"ani_entity_id":32769,"version":2,"complete":false,"semantics":"cross-layer-instance-session-consistent-partial","kernel_instance_generation":100,"kernel_session_generation":2,"dispatcher_generation":3,"sequence":4,"sampling":{"interval_ms":10,"assumption":"single-wrap-no-reset-per-interval-unverified"},"valid":{"tc":8191,"tc_required":8191,"downstream_management":16383,"downstream_required":16383,"upstream_management":63,"upstream_required":63},"tc":{"psbd_hec_errors":1,"xgtc_hec_errors":2,"unknown_profiles":3,"transmitted_xgem_frames":4,"fragment_xgem_frames":5,"xgem_hec_lost_words":6,"xgem_key_errors":7,"xgem_hec_errors":8,"transmitted_non_idle_bytes":9,"received_non_idle_bytes":10,"lods_events":11,"lods_restored":12,"onu_reactivations_by_lods":13},"downstream_management":{"ploam_mic_errors":14,"ploam_messages":15,"profile_messages":16,"ranging_time_messages":17,"deactivate_onu_id_messages":18,"disable_serial_number_messages":19,"request_registration_messages":20,"assign_alloc_id_messages":21,"key_control_messages":22,"sleep_allow_messages":23,"baseline_omci_messages":24,"extended_omci_messages":25,"assign_onu_id_messages":26,"omci_mic_errors":27},"upstream_management":{"ploam_messages":28,"serial_number_messages":29,"registration_messages":30,"key_report_messages":31,"acknowledge_messages":32,"sleep_request_messages":0}}`
+}
+
+func TestExecControllerReadsXGSPONCounters(t *testing.T) {
+	directory := t.TempDir()
+	requestPath := filepath.Join(directory, "request.json")
+	helper := filepath.Join(directory, "control")
+	script := "#!/bin/sh\ncat > " + requestPath + "\n" +
+		"printf '%s\\n' '" + validXGSPONCountersResponse() + "'\n"
+	if err := os.WriteFile(helper, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile(helper) error = %v", err)
+	}
+	counters, err := (ExecController{Path: helper}).XGSPONCounters(0x8001)
+	if err != nil {
+		t.Fatalf("XGSPONCounters() error = %v", err)
+	}
+	if counters.KernelInstanceGeneration != 100 || counters.KernelSessionGeneration != 2 ||
+		counters.DispatcherGeneration != 3 || counters.Sequence != 4 ||
+		counters.TC.PSBdHECErrors != 1 || counters.TC.ONUReactivationsByLODS != 13 ||
+		counters.Downstream.RangingTimeMessages != 17 ||
+		counters.Downstream.OMCIMICErrors != 27 ||
+		counters.Upstream.PLOAMMessages != 28 || counters.Upstream.AcknowledgeMessages != 32 ||
+		counters.Upstream.SleepRequestMessages != 0 {
+		t.Fatalf("XGS-PON counters = %#v", counters)
+	}
+	payload, err := os.ReadFile(requestPath)
+	if err != nil {
+		t.Fatalf("ReadFile(request) error = %v", err)
+	}
+	if !strings.Contains(string(payload), `"action":"xgs-pm-evidence"`) ||
+		!strings.Contains(string(payload), `"ani_entity_id":32769`) {
+		t.Fatalf("request = %s", payload)
+	}
+}
+
+func TestExecControllerRejectsInvalidXGSPONCounters(t *testing.T) {
+	valid := validXGSPONCountersResponse()
+	for name, response := range map[string]string{
+		"mismatched ANI": strings.Replace(valid, `"ani_entity_id":32769`,
+			`"ani_entity_id":32770`, 1),
+		"unsupported version": strings.Replace(valid, `"version":2`, `"version":3`, 1),
+		"false completion claim": strings.Replace(valid, `"complete":false`,
+			`"complete":true`, 1),
+		"odd snapshot sequence":   strings.Replace(valid, `"sequence":4`, `"sequence":5`, 1),
+		"incomplete counter mask": strings.Replace(valid, `"tc":8191`, `"tc":8190`, 1),
+		"missing counter field":   strings.Replace(valid, `,"sleep_request_messages":0`, "", 1),
+		"unknown counter field": strings.Replace(valid, `"sleep_request_messages":0`,
+			`"sleep_request_messages":0,"invented":1`, 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			helper := filepath.Join(t.TempDir(), "control")
+			script := "#!/bin/sh\nprintf '%s\\n' '" + response + "'\n"
+			if err := os.WriteFile(helper, []byte(script), 0o755); err != nil {
+				t.Fatalf("WriteFile(helper) error = %v", err)
+			}
+			if _, err := (ExecController{Path: helper}).XGSPONCounters(0x8001); err == nil {
+				t.Fatal("XGSPONCounters() unexpectedly accepted invalid evidence")
+			}
+		})
+	}
+}
+
 func TestExecControllerReadsEthernetCounters(t *testing.T) {
 	directory := t.TempDir()
 	requestPath := filepath.Join(directory, "request.json")

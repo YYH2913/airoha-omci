@@ -80,6 +80,55 @@ type multicastStateResponse struct {
 	AllowedPreviews   *[]multicastPreviewResponse `json:"allowed_previews"`
 }
 
+type xgsPMSamplingResponse struct {
+	IntervalMS uint64 `json:"interval_ms"`
+	Assumption string `json:"assumption"`
+}
+
+type xgsPMValidResponse struct {
+	TC                   uint64 `json:"tc"`
+	TCRequired           uint64 `json:"tc_required"`
+	DownstreamManagement uint64 `json:"downstream_management"`
+	DownstreamRequired   uint64 `json:"downstream_required"`
+	UpstreamManagement   uint64 `json:"upstream_management"`
+	UpstreamRequired     uint64 `json:"upstream_required"`
+}
+
+type xgsPMResponse struct {
+	ANIEntityID              uint16                                         `json:"ani_entity_id"`
+	Version                  uint8                                          `json:"version"`
+	Complete                 bool                                           `json:"complete"`
+	Semantics                string                                         `json:"semantics"`
+	KernelInstanceGeneration uint64                                         `json:"kernel_instance_generation"`
+	KernelSessionGeneration  uint64                                         `json:"kernel_session_generation"`
+	DispatcherGeneration     uint64                                         `json:"dispatcher_generation"`
+	Sequence                 uint64                                         `json:"sequence"`
+	Sampling                 xgsPMSamplingResponse                          `json:"sampling"`
+	Valid                    xgsPMValidResponse                             `json:"valid"`
+	TC                       performance.XGSPONTCCounters                   `json:"tc"`
+	Downstream               performance.XGSPONDownstreamManagementCounters `json:"downstream_management"`
+	Upstream                 performance.XGSPONUpstreamManagementCounters   `json:"upstream_management"`
+}
+
+func requiredJSONObject(name string, input []byte,
+	required ...string) (map[string]json.RawMessage, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(input, &fields); err != nil {
+		return nil, fmt.Errorf("decode XGS-PON counters %s: %w", name, err)
+	}
+	if len(fields) != len(required) {
+		return nil, fmt.Errorf("decode XGS-PON counters %s: expected %d fields, got %d",
+			name, len(required), len(fields))
+	}
+	for _, field := range required {
+		if _, present := fields[field]; !present {
+			return nil, fmt.Errorf("decode XGS-PON counters %s: required field %q is missing",
+				name, field)
+		}
+	}
+	return fields, nil
+}
+
 func (c ExecController) GEMPortCounters(portID uint16) (performance.GEMPortCounters, error) {
 	output, err := c.execute(controlRequest{Action: "gem-port-counters", GEMPortID: &portID})
 	if err != nil {
@@ -157,6 +206,112 @@ func (c ExecController) FECCounters(entityID uint16) (performance.FECCounters, e
 		UncorrectableCodeWords: *value.UncorrectableCodeWords,
 		TotalCodeWords:         *value.TotalCodeWords,
 		FECSeconds:             *value.FECSeconds,
+	}, nil
+}
+
+func (c ExecController) XGSPONCounters(entityID uint16) (performance.XGSPONCounters, error) {
+	output, err := c.execute(controlRequest{Action: "xgs-pm-evidence", ANIEntityID: &entityID})
+	if err != nil {
+		return performance.XGSPONCounters{}, err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(output))
+	decoder.DisallowUnknownFields()
+	var value xgsPMResponse
+	if err := decoder.Decode(&value); err != nil {
+		return performance.XGSPONCounters{}, fmt.Errorf("decode XGS-PON counters: %w", err)
+	}
+	var trailing interface{}
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return performance.XGSPONCounters{}, fmt.Errorf("decode XGS-PON counters: trailing JSON value")
+		}
+		return performance.XGSPONCounters{}, fmt.Errorf("decode XGS-PON counters: %w", err)
+	}
+
+	fields, err := requiredJSONObject("response", output,
+		"ani_entity_id", "version", "complete", "semantics",
+		"kernel_instance_generation", "kernel_session_generation",
+		"dispatcher_generation", "sequence", "sampling", "valid", "tc",
+		"downstream_management", "upstream_management")
+	if err != nil {
+		return performance.XGSPONCounters{}, err
+	}
+	if _, err := requiredJSONObject("sampling", fields["sampling"],
+		"interval_ms", "assumption"); err != nil {
+		return performance.XGSPONCounters{}, err
+	}
+	if _, err := requiredJSONObject("valid", fields["valid"],
+		"tc", "tc_required", "downstream_management", "downstream_required",
+		"upstream_management", "upstream_required"); err != nil {
+		return performance.XGSPONCounters{}, err
+	}
+	if _, err := requiredJSONObject("tc", fields["tc"],
+		"psbd_hec_errors", "xgtc_hec_errors", "unknown_profiles",
+		"transmitted_xgem_frames", "fragment_xgem_frames", "xgem_hec_lost_words",
+		"xgem_key_errors", "xgem_hec_errors", "transmitted_non_idle_bytes",
+		"received_non_idle_bytes", "lods_events", "lods_restored",
+		"onu_reactivations_by_lods"); err != nil {
+		return performance.XGSPONCounters{}, err
+	}
+	if _, err := requiredJSONObject("downstream_management", fields["downstream_management"],
+		"ploam_mic_errors", "ploam_messages", "profile_messages",
+		"ranging_time_messages", "deactivate_onu_id_messages",
+		"disable_serial_number_messages", "request_registration_messages",
+		"assign_alloc_id_messages", "key_control_messages", "sleep_allow_messages",
+		"baseline_omci_messages", "extended_omci_messages", "assign_onu_id_messages",
+		"omci_mic_errors"); err != nil {
+		return performance.XGSPONCounters{}, err
+	}
+	if _, err := requiredJSONObject("upstream_management", fields["upstream_management"],
+		"ploam_messages", "serial_number_messages", "registration_messages",
+		"key_report_messages", "acknowledge_messages", "sleep_request_messages"); err != nil {
+		return performance.XGSPONCounters{}, err
+	}
+
+	const (
+		expectedVersion          = 2
+		expectedSemantics        = "cross-layer-instance-session-consistent-partial"
+		expectedSamplingInterval = 10
+		expectedAssumption       = "single-wrap-no-reset-per-interval-unverified"
+		expectedTCMask           = 8191
+		expectedDownstreamMask   = 16383
+		expectedUpstreamMask     = 63
+	)
+	if value.ANIEntityID != entityID {
+		return performance.XGSPONCounters{}, fmt.Errorf(
+			"decode XGS-PON counters: ANI entity ID %#x does not match %#x",
+			value.ANIEntityID, entityID)
+	}
+	if value.Version != expectedVersion || value.Complete || value.Semantics != expectedSemantics {
+		return performance.XGSPONCounters{}, fmt.Errorf(
+			"decode XGS-PON counters: unsupported evidence contract version=%d complete=%t semantics=%q",
+			value.Version, value.Complete, value.Semantics)
+	}
+	if value.Sequence&1 != 0 || value.Sampling.IntervalMS != expectedSamplingInterval ||
+		value.Sampling.Assumption != expectedAssumption {
+		return performance.XGSPONCounters{}, fmt.Errorf(
+			"decode XGS-PON counters: unsupported sampling sequence=%d interval=%d assumption=%q",
+			value.Sequence, value.Sampling.IntervalMS, value.Sampling.Assumption)
+	}
+	if value.Valid.TC != expectedTCMask || value.Valid.TCRequired != expectedTCMask ||
+		value.Valid.DownstreamManagement != expectedDownstreamMask ||
+		value.Valid.DownstreamRequired != expectedDownstreamMask ||
+		value.Valid.UpstreamManagement != expectedUpstreamMask ||
+		value.Valid.UpstreamRequired != expectedUpstreamMask {
+		return performance.XGSPONCounters{}, fmt.Errorf(
+			"decode XGS-PON counters: incomplete field masks tc=%d/%d downstream=%d/%d upstream=%d/%d",
+			value.Valid.TC, value.Valid.TCRequired,
+			value.Valid.DownstreamManagement, value.Valid.DownstreamRequired,
+			value.Valid.UpstreamManagement, value.Valid.UpstreamRequired)
+	}
+	return performance.XGSPONCounters{
+		KernelInstanceGeneration: value.KernelInstanceGeneration,
+		KernelSessionGeneration:  value.KernelSessionGeneration,
+		DispatcherGeneration:     value.DispatcherGeneration,
+		Sequence:                 value.Sequence,
+		TC:                       value.TC,
+		Downstream:               value.Downstream,
+		Upstream:                 value.Upstream,
 	}, nil
 }
 

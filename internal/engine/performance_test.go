@@ -79,6 +79,38 @@ func (c *recordingPerformanceController) XGSPONCounters(entityID uint16) (perfor
 	return c.xgsCounters, c.err
 }
 
+func TestDeltaXGSPONCountersDoesNotMixSessions(t *testing.T) {
+	baseline := performance.XGSPONCounters{
+		KernelInstanceGeneration: 10,
+		KernelSessionGeneration:  20,
+		DispatcherGeneration:     30,
+		TC: performance.XGSPONTCCounters{
+			PSBdHECErrors: 100,
+		},
+		Downstream: performance.XGSPONDownstreamManagementCounters{
+			BaselineOMCIMessages: 200,
+		},
+	}
+	current := baseline
+	current.KernelSessionGeneration++
+	current.Sequence = 8
+	current.TC.PSBdHECErrors = 7
+	current.Downstream.BaselineOMCIMessages = 9
+	delta := deltaXGSPONCounters(baseline, current)
+	if delta.TC.PSBdHECErrors != 7 || delta.Downstream.BaselineOMCIMessages != 9 ||
+		delta.KernelSessionGeneration != current.KernelSessionGeneration || delta.Sequence != 8 {
+		t.Fatalf("cross-session delta = %#v", delta)
+	}
+
+	current.KernelSessionGeneration = baseline.KernelSessionGeneration
+	current.TC.PSBdHECErrors = 107
+	current.Downstream.BaselineOMCIMessages = 209
+	delta = deltaXGSPONCounters(baseline, current)
+	if delta.TC.PSBdHECErrors != 7 || delta.Downstream.BaselineOMCIMessages != 9 {
+		t.Fatalf("same-session delta = %#v", delta)
+	}
+}
+
 func TestXGSPONPerformanceClassesRequireDedicatedBackend(t *testing.T) {
 	factory, err := model.XG2010G(model.Identity{
 		SerialNumber: "TEST01020304", PONMode: pon.XGSPON,

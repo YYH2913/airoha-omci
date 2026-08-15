@@ -372,6 +372,29 @@ func TestRuntimeStateRejectsXGSPONCounterResetWithoutPartialRestore(t *testing.T
 	}
 }
 
+func TestRuntimeStateRejectsXGSPONSessionChange(t *testing.T) {
+	baseline := performance.XGSPONCounters{
+		KernelInstanceGeneration: 10,
+		KernelSessionGeneration:  20,
+		DispatcherGeneration:     30,
+		TC: performance.XGSPONTCCounters{
+			XGEMKeyErrors: 100,
+		},
+	}
+	before, store, controller := newXGSPerformanceEngine(t, baseline)
+	state, err := before.ExportRuntimeState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller.xgsCounters.KernelSessionGeneration++
+	controller.xgsCounters.TC.XGEMKeyErrors = 1000
+	after := NewForMode(store, controller, nil, pon.XGSPON)
+	err = after.RestoreRuntimeState(state)
+	if err == nil || !strings.Contains(err.Error(), "reset below") {
+		t.Fatalf("RestoreRuntimeState(XGS-PON session change) error = %v", err)
+	}
+}
+
 func TestRuntimeStateRejectsDifferentMIB(t *testing.T) {
 	before, store := newNotificationEngine(t)
 	state, err := before.ExportRuntimeState()

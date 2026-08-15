@@ -62,9 +62,13 @@ type XGSPONUpstreamManagementCounters struct {
 }
 
 type XGSPONCounters struct {
-	TC         XGSPONTCCounters                   `json:"tc"`
-	Downstream XGSPONDownstreamManagementCounters `json:"downstream_management"`
-	Upstream   XGSPONUpstreamManagementCounters   `json:"upstream_management"`
+	KernelInstanceGeneration uint64                             `json:"kernel_instance_generation"`
+	KernelSessionGeneration  uint64                             `json:"kernel_session_generation"`
+	DispatcherGeneration     uint64                             `json:"dispatcher_generation"`
+	Sequence                 uint64                             `json:"sequence"`
+	TC                       XGSPONTCCounters                   `json:"tc"`
+	Downstream               XGSPONDownstreamManagementCounters `json:"downstream_management"`
+	Upstream                 XGSPONUpstreamManagementCounters   `json:"upstream_management"`
 }
 
 type EthernetDirectionCounters struct {

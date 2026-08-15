@@ -713,6 +713,9 @@ func fecCountersAtLeast(current, baseline performance.FECCounters) bool {
 }
 
 func xgsCountersAtLeast(current, baseline performance.XGSPONCounters) bool {
+	if !sameXGSPONCounterSession(current, baseline) {
+		return false
+	}
 	currentValues := xgsCounterValues(current)
 	baselineValues := xgsCounterValues(baseline)
 	for index := range currentValues {

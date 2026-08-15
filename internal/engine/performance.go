@@ -961,7 +961,14 @@ func deltaEthernetDirection(start, current performance.EthernetDirectionCounters
 }
 
 func deltaXGSPONCounters(start, current performance.XGSPONCounters) performance.XGSPONCounters {
+	if !sameXGSPONCounterSession(start, current) {
+		return current
+	}
 	return performance.XGSPONCounters{
+		KernelInstanceGeneration: current.KernelInstanceGeneration,
+		KernelSessionGeneration:  current.KernelSessionGeneration,
+		DispatcherGeneration:     current.DispatcherGeneration,
+		Sequence:                 current.Sequence,
 		TC: performance.XGSPONTCCounters{
 			PSBdHECErrors:           counterDelta(start.TC.PSBdHECErrors, current.TC.PSBdHECErrors),
 			XGTCHECErrors:           counterDelta(start.TC.XGTCHECErrors, current.TC.XGTCHECErrors),
@@ -1002,6 +1009,12 @@ func deltaXGSPONCounters(start, current performance.XGSPONCounters) performance.
 			SleepRequestMessages: counterDelta(start.Upstream.SleepRequestMessages, current.Upstream.SleepRequestMessages),
 		},
 	}
+}
+
+func sameXGSPONCounterSession(a, b performance.XGSPONCounters) bool {
+	return a.KernelInstanceGeneration == b.KernelInstanceGeneration &&
+		a.KernelSessionGeneration == b.KernelSessionGeneration &&
+		a.DispatcherGeneration == b.DispatcherGeneration
 }
 
 func counterDelta(start, current uint64) uint64 {
