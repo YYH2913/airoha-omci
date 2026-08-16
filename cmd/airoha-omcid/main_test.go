@@ -53,6 +53,23 @@ func TestObserveXGSOMCIKernelSession(t *testing.T) {
 	}
 }
 
+func TestRecordXGSOMCIFrameAtTrustedTransportBoundary(t *testing.T) {
+	evidence := status.XGSOMCIEvidence{}
+	baseline := []byte{0, 1, 2, byte(omci.BaselineIdent)}
+	extended := []byte{0, 1, 2, byte(omci.ExtendedIdent)}
+	unknown := []byte{0, 1, 2, 0xff}
+
+	if !recordXGSOMCIFrame(&evidence, baseline) ||
+		!recordXGSOMCIFrame(&evidence, extended) ||
+		recordXGSOMCIFrame(&evidence, unknown) ||
+		recordXGSOMCIFrame(&evidence, baseline[:3]) {
+		t.Fatal("trusted transport frame classification failed")
+	}
+	if evidence.BaselineMessages != 1 || evidence.ExtendedMessages != 1 {
+		t.Fatalf("trusted transport counters = %+v", evidence)
+	}
+}
+
 func TestRuntimeStateWriterPublishesOnlyChangesAndRestores(t *testing.T) {
 	protocol, key := daemonRuntimeEngine(t)
 	path := filepath.Join(t.TempDir(), "persistent", "runtime.json")

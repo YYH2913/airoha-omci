@@ -31,11 +31,11 @@ func TestWriterPublishesJSONAtomically(t *testing.T) {
 	}
 }
 
-func TestXGSOMCIEvidenceWriterPublishesIncompleteRuntimeSnapshot(t *testing.T) {
+func TestXGSOMCIEvidenceWriterPublishesTrustedTransportSnapshot(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "run", "xgs-omci-evidence.json")
 	writer := NewXGSOMCIEvidenceWriter(path)
 	want := XGSOMCIEvidence{
-		Version: 3, Complete: false, Semantics: "application-accepted-kernel-instance-session",
+		Version: 4, Complete: false, Semantics: "trusted-transport-kernel-instance-session",
 		PONMode: "xgspon", StartedAt: time.Unix(1, 0).UTC(),
 		KernelInstanceGeneration: 6, KernelSessionGeneration: 7,
 		DispatcherGeneration: 8,

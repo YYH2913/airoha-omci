@@ -41,8 +41,9 @@ type Snapshot struct {
 }
 
 // XGSOMCIEvidence is a runtime-only diagnostic snapshot of downstream OMCI
-// frames accepted by the application after trusted XGS OMCC validation. It is
-// deliberately not a G.988 performance-management counter backend.
+// frames delivered to the application after trusted XGS OMCC validation. It
+// counts the SDK receive boundary independently of the request result and is
+// deliberately not a standalone G.988 performance-management counter backend.
 type XGSOMCIEvidence struct {
 	Version                  uint8     `json:"version"`
 	Complete                 bool      `json:"complete"`

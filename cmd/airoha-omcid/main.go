@@ -69,6 +69,24 @@ func observeXGSOMCIKernelSession(evidence *status.XGSOMCIEvidence,
 	return xgsOMCIKernelSessionAdvance
 }
 
+// recordXGSOMCIFrame matches the SDK receive-counter boundary: the secure
+// transport has accepted the frame for the current OMCC session, but the OMCI
+// application has not interpreted the request yet.
+func recordXGSOMCIFrame(evidence *status.XGSOMCIEvidence, contents []byte) bool {
+	if len(contents) < 4 {
+		return false
+	}
+	switch omci.DeviceIdent(contents[3]) {
+	case omci.BaselineIdent:
+		evidence.BaselineMessages++
+	case omci.ExtendedIdent:
+		evidence.ExtendedMessages++
+	default:
+		return false
+	}
+	return true
+}
+
 type options struct {
 	interfaceName       string
 	serialNumber        string
@@ -216,8 +234,8 @@ func run(opts options) error {
 	xgsOMCIKernelSessionKnown := false
 	if mode == pon.XGSPON && opts.xgsOMCIEvidencePath != "" {
 		xgsOMCIEvidence = status.XGSOMCIEvidence{
-			Version: 3, Complete: false,
-			Semantics: "application-accepted-kernel-instance-session",
+			Version: 4, Complete: false,
+			Semantics: "trusted-transport-kernel-instance-session",
 			PONMode:   mode, StartedAt: started,
 		}
 		xgsOMCIEvidenceWriter = status.NewXGSOMCIEvidenceWriter(opts.xgsOMCIEvidencePath)
@@ -455,7 +473,7 @@ func run(opts options) error {
 					frame.SessionGeneration)
 				if sessionAction == xgsOMCIKernelSessionStale {
 					// The kernel supplies this trusted monotonic session generation.
-					// Never let a stale queued frame enter the application counter.
+					// Never let a stale queued frame enter the transport counter.
 					continue
 				}
 				if sessionAction == xgsOMCIKernelSessionAdvance {
@@ -469,6 +487,9 @@ func run(opts options) error {
 					}
 					protocol.ResetCommunicationSession()
 					xgsOMCIEvidence.DispatcherGeneration = dispatcher.Generation()
+					publishXGSOMCIEvidence()
+				}
+				if recordXGSOMCIFrame(&xgsOMCIEvidence, contents) {
 					publishXGSOMCIEvidence()
 				}
 			}
@@ -489,15 +510,6 @@ func run(opts options) error {
 				_ = statusWriter.Write(state)
 				log.Printf("OMCI request rejected: %v", err)
 				continue
-			}
-			if xgsOMCIEvidenceWriter != nil {
-				switch omci.DeviceIdent(contents[3]) {
-				case omci.BaselineIdent:
-					xgsOMCIEvidence.BaselineMessages++
-				case omci.ExtendedIdent:
-					xgsOMCIEvidence.ExtendedMessages++
-				}
-				publishXGSOMCIEvidence()
 			}
 			if len(response) != 0 {
 				if err := conn.WriteFrame(ctx, response); err != nil {
